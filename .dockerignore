@@ -1,0 +1,16 @@
+.git
+.gitignore
+.pytest_cache
+.tooling
+__pycache__
+*.pyc
+*.db
+*.sqlite3
+*.log
+.env
+.env.*
+.venv
+node_modules
+apps/web-ui/dist
+*.egg-info
+*.tsbuildinfo

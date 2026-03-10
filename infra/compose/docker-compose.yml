@@ -1,0 +1,26 @@
+services:
+  edge-api:
+    build:
+      context: ../..
+      dockerfile: infra/docker/edge-api.Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      HELIOS_DATABASE_URL: sqlite:////app/data/helios_home.db
+    volumes:
+      - helios-data:/app/data
+
+  web-ui:
+    build:
+      context: ../..
+      dockerfile: infra/docker/web-ui.Dockerfile
+      args:
+        VITE_API_BASE: http://localhost:8000/api/v1
+    ports:
+      - "4173:4173"
+    depends_on:
+      - edge-api
+
+volumes:
+  helios-data:
+

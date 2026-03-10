@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "helios-home-edge"
+version = "0.1.0"
+description = "Helios Home MVP local runtime for energy-device discovery and integration."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115,<1.0",
+  "httpx>=0.28,<1.0",
+  "paho-mqtt>=2.1,<3.0",
+  "pydantic-settings>=2.6,<3.0",
+  "sqlalchemy>=2.0,<3.0",
+  "uvicorn>=0.34,<1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx>=0.28,<1.0",
+  "pytest>=8.3,<9.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "apps/edge-api"}
+
+[tool.setuptools.packages.find]
+where = ["apps/edge-api"]
+
+[tool.pytest.ini_options]
+testpaths = ["apps/edge-api/tests"]
