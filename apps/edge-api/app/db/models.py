@@ -71,6 +71,16 @@ class Site(Base):
         cascade="all, delete-orphan",
         order_by="KnowledgeEntry.updated_at.desc()",
     )
+    hems_policy: Mapped["HemsPolicy | None"] = relationship(
+        back_populates="site",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
+    hems_plan_runs: Mapped[list["HemsPlanRun"]] = relationship(
+        back_populates="site",
+        cascade="all, delete-orphan",
+        order_by="HemsPlanRun.created_at.desc()",
+    )
 
 
 class DeviceCandidate(Base):
@@ -409,6 +419,124 @@ class KnowledgeEntry(Base):
 
     site: Mapped[Site] = relationship(back_populates="knowledge_entries")
     source_case: Mapped[DebugCase | None] = relationship(back_populates="knowledge_entries")
+
+
+class HemsPolicy(Base):
+    __tablename__ = "hems_policies"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"), unique=True)
+    execution_mode: Mapped[str] = mapped_column(String(40), default="guarded_auto")
+    battery_reserve_pct: Mapped[float] = mapped_column(default=20.0)
+    ev_default_target_soc_pct: Mapped[float] = mapped_column(default=80.0)
+    ev_default_departure_time: Mapped[str] = mapped_column(String(16), default="07:00")
+    heat_comfort_min_c: Mapped[float] = mapped_column(default=20.0)
+    heat_comfort_max_c: Mapped[float] = mapped_column(default=22.5)
+    grid_import_limit_kw: Mapped[float] = mapped_column(default=12.0)
+    grid_export_limit_kw: Mapped[float] = mapped_column(default=12.0)
+    allow_price_arbitrage: Mapped[bool] = mapped_column(default=True)
+    allow_heat_precharge: Mapped[bool] = mapped_column(default=True)
+    allow_ev_load_shifting: Mapped[bool] = mapped_column(default=True)
+    horizon_hours: Mapped[int] = mapped_column(default=24)
+    step_minutes: Mapped[int] = mapped_column(default=15)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        onupdate=utcnow,
+    )
+
+    site: Mapped[Site] = relationship(back_populates="hems_policy")
+
+
+class HemsPlanRun(Base):
+    __tablename__ = "hems_plan_runs"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"))
+    status: Mapped[str] = mapped_column(String(40), default="running")
+    execution_mode: Mapped[str] = mapped_column(String(40), default="guarded_auto")
+    triggered_by: Mapped[str] = mapped_column(String(80), default="manual")
+    solver_name: Mapped[str] = mapped_column(String(80), default="cvxpy-highs")
+    objective_value: Mapped[float | None] = mapped_column(nullable=True)
+    summary: Mapped[str] = mapped_column(Text, default="")
+    input_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    output_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    horizon_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    horizon_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    site: Mapped[Site] = relationship(back_populates="hems_plan_runs")
+    intervals: Mapped[list["HemsPlanInterval"]] = relationship(
+        back_populates="plan_run",
+        cascade="all, delete-orphan",
+        order_by="HemsPlanInterval.starts_at.asc()",
+    )
+    dispatch_events: Mapped[list["HemsDispatchEvent"]] = relationship(
+        back_populates="plan_run",
+        cascade="all, delete-orphan",
+        order_by="HemsDispatchEvent.executed_at.asc()",
+    )
+    violations: Mapped[list["HemsViolation"]] = relationship(
+        back_populates="plan_run",
+        cascade="all, delete-orphan",
+        order_by="HemsViolation.created_at.asc()",
+    )
+
+
+class HemsPlanInterval(Base):
+    __tablename__ = "hems_plan_intervals"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    plan_run_id: Mapped[str] = mapped_column(ForeignKey("hems_plan_runs.id"))
+    asset_key: Mapped[str] = mapped_column(String(120))
+    asset_type: Mapped[str] = mapped_column(String(80))
+    device_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    command: Mapped[dict] = mapped_column(JSON, default=dict)
+    predicted_state: Mapped[dict] = mapped_column(JSON, default=dict)
+
+    plan_run: Mapped[HemsPlanRun] = relationship(back_populates="intervals")
+
+
+class HemsDispatchEvent(Base):
+    __tablename__ = "hems_dispatch_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    plan_run_id: Mapped[str] = mapped_column(ForeignKey("hems_plan_runs.id"))
+    asset_key: Mapped[str] = mapped_column(String(120))
+    asset_type: Mapped[str] = mapped_column(String(80))
+    device_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(40), default="skipped")
+    requested_command: Mapped[dict] = mapped_column(JSON, default=dict)
+    applied_command: Mapped[dict] = mapped_column(JSON, default=dict)
+    summary: Mapped[str] = mapped_column(Text, default="")
+    planned_for: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    executed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    details: Mapped[dict] = mapped_column(JSON, default=dict)
+
+    plan_run: Mapped[HemsPlanRun] = relationship(back_populates="dispatch_events")
+
+
+class HemsViolation(Base):
+    __tablename__ = "hems_violations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    plan_run_id: Mapped[str] = mapped_column(ForeignKey("hems_plan_runs.id"))
+    asset_key: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    severity: Mapped[str] = mapped_column(String(40), default="warning")
+    violation_type: Mapped[str] = mapped_column(String(80))
+    message: Mapped[str] = mapped_column(Text)
+    details: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    plan_run: Mapped[HemsPlanRun] = relationship(back_populates="violations")
 
 
 class AuditEvent(Base):

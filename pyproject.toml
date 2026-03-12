@@ -9,7 +9,9 @@ description = "Helios Home MVP local runtime for energy-device discovery and int
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+  "cvxpy>=1.6,<2.0",
   "fastapi>=0.115,<1.0",
+  "highspy>=1.9,<2.0",
   "httpx>=0.28,<1.0",
   "paho-mqtt>=2.1,<3.0",
   "pydantic-settings>=2.6,<3.0",

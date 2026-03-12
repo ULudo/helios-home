@@ -223,11 +223,12 @@ def test_build_candidate_from_sunspec_inverter_probe_promotes_monitoring():
             product_code="GEN24 Plus",
             revision="1.28.4",
             sunspec_base_register=40000,
-            sunspec_model_ids=[101, 103],
+            sunspec_model_ids=[101, 103, 702, 704],
             telemetry={
                 "power_kw": 5.432,
                 "energy_total_kwh": 123.456,
                 "voltage_v": 230.0,
+                "power_rating_kw": 10.0,
             },
         )
     )
@@ -236,8 +237,10 @@ def test_build_candidate_from_sunspec_inverter_probe_promotes_monitoring():
     assert candidate.device_type == "pv_inverter"
     assert candidate.protocols == ["modbus_tcp"]
     assert candidate.capabilities_hint["monitorable"] is True
+    assert candidate.capabilities_hint["controllable"] is True
     assert candidate.telemetry["power_kw"] == 5.432
-    assert candidate.evidence["validated_metrics"] == ["energy_total_kwh", "power_kw", "voltage_v"]
+    assert candidate.evidence["dispatch_profile"] == "sunspec_der_wmax_pct"
+    assert candidate.evidence["validated_metrics"] == ["energy_total_kwh", "power_kw", "power_rating_kw", "voltage_v"]
 
 
 def test_build_candidate_from_generic_der_probe_stays_unclassified_without_storage_signals():
@@ -256,6 +259,29 @@ def test_build_candidate_from_generic_der_probe_stays_unclassified_without_stora
 
     assert candidate.device_type == "unclassified_energy_device"
     assert candidate.capabilities_hint["monitorable"] is True
+
+
+def test_build_candidate_from_storage_probe_marks_sunspec_storage_dispatch_profile():
+    candidate = build_candidate_from_modbus_probe(
+        ModbusProbeResult(
+            host="198.51.100.92",
+            unit_id=1,
+            vendor_name="BYD",
+            product_code="Battery-Box",
+            revision="1.0.0",
+            sunspec_base_register=40000,
+            sunspec_model_ids=[124, 713],
+            telemetry={
+                "soc_pct": 56.0,
+                "available_capacity_kwh": 8.4,
+                "max_charge_power_kw": 4.6,
+            },
+        )
+    )
+
+    assert candidate.device_type == "battery"
+    assert candidate.capabilities_hint["controllable"] is True
+    assert candidate.evidence["dispatch_profile"] == "sunspec_storage_basic_rate"
 
 
 def test_discover_modbus_site_reports_monitorable_candidates(monkeypatch):

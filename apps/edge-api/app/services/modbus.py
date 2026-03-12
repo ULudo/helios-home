@@ -20,6 +20,8 @@ SUNSPEC_INVERTER_MODELS = {101, 102, 103}
 SUNSPEC_METER_MODELS = {201, 202, 203, 204, 211, 212, 213}
 SUNSPEC_STORAGE_MODELS = {124, 713}
 SUNSPEC_GENERIC_DER_MODELS = {701}
+SUNSPEC_DER_CAPACITY_MODELS = {702}
+SUNSPEC_DER_CONTROL_MODELS = {704}
 SUNSPEC_TERMINATOR_IDS = {0x0000, 0xFFFF}
 
 
@@ -315,6 +317,116 @@ STORAGE_CAPACITY_POINTS = [
     _point("Pct_SF", "sunssf"),
 ]
 
+DER_CAPACITY_POINTS = [
+    _point("ID", "uint16"),
+    _point("L", "uint16"),
+    _point("WMaxRtg", "uint16", scale_factor="W_SF"),
+    _point("WOvrExtRtg", "uint16", scale_factor="W_SF"),
+    _point("WOvrExtRtgPF", "uint16", scale_factor="PF_SF"),
+    _point("WUndExtRtg", "uint16", scale_factor="W_SF"),
+    _point("WUndExtRtgPF", "uint16", scale_factor="PF_SF"),
+    _point("VAMaxRtg", "uint16", scale_factor="VA_SF"),
+    _point("VarMaxInjRtg", "uint16", scale_factor="Var_SF"),
+    _point("VarMaxAbsRtg", "uint16", scale_factor="Var_SF"),
+    _point("WChaRteMaxRtg", "uint16", scale_factor="W_SF"),
+    _point("WDisChaRteMaxRtg", "uint16", scale_factor="W_SF"),
+    _point("VAChaRteMaxRtg", "uint16", scale_factor="VA_SF"),
+    _point("VADisChaRteMaxRtg", "uint16", scale_factor="VA_SF"),
+    _point("VNomRtg", "uint16", scale_factor="V_SF"),
+    _point("VMaxRtg", "uint16", scale_factor="V_SF"),
+    _point("VMinRtg", "uint16", scale_factor="V_SF"),
+    _point("AMaxRtg", "uint16", scale_factor="A_SF"),
+    _point("PFOvrExtRtg", "uint16", scale_factor="PF_SF"),
+    _point("PFUndExtRtg", "uint16", scale_factor="PF_SF"),
+    _point("ReactSusceptRtg", "uint16", scale_factor="S_SF"),
+    _point("NorOpCatRtg", "enum16"),
+    _point("AbnOpCatRtg", "enum16"),
+    _point("CtrlModes", "bitfield32", size=2),
+    _point("IntIslandCatRtg", "bitfield16"),
+    _point("WMax", "uint16", scale_factor="W_SF"),
+    _point("WMaxOvrExt", "uint16", scale_factor="W_SF"),
+    _point("WOvrExtPF", "uint16", scale_factor="PF_SF"),
+    _point("WMaxUndExt", "uint16", scale_factor="W_SF"),
+    _point("WUndExtPF", "uint16", scale_factor="PF_SF"),
+    _point("VAMax", "uint16", scale_factor="VA_SF"),
+    _point("VarMaxInj", "uint16", scale_factor="Var_SF"),
+    _point("VarMaxAbs", "uint16", scale_factor="Var_SF"),
+    _point("WChaRteMax", "uint16", scale_factor="W_SF"),
+    _point("WDisChaRteMax", "uint16", scale_factor="W_SF"),
+    _point("VAChaRteMax", "uint16", scale_factor="VA_SF"),
+    _point("VADisChaRteMax", "uint16", scale_factor="VA_SF"),
+    _point("VNom", "uint16", scale_factor="V_SF"),
+    _point("VMax", "uint16", scale_factor="V_SF"),
+    _point("VMin", "uint16", scale_factor="V_SF"),
+    _point("AMax", "uint16", scale_factor="A_SF"),
+    _point("PFOvrExt", "uint16", scale_factor="PF_SF"),
+    _point("PFUndExt", "uint16", scale_factor="PF_SF"),
+    _point("IntIslandCat", "bitfield16"),
+    _point("W_SF", "sunssf"),
+    _point("PF_SF", "sunssf"),
+    _point("VA_SF", "sunssf"),
+    _point("Var_SF", "sunssf"),
+    _point("V_SF", "sunssf"),
+    _point("A_SF", "sunssf"),
+    _point("S_SF", "sunssf"),
+]
+
+DER_CONTROL_POINTS = [
+    _point("ID", "uint16"),
+    _point("L", "uint16"),
+    _point("PFWInjEna", "enum16"),
+    _point("PFWInjEnaRvrt", "enum16"),
+    _point("PFWInjRvrtTms", "uint32", size=2),
+    _point("PFWInjRvrtRem", "uint32", size=2),
+    _point("PFWAbsEna", "enum16"),
+    _point("PFWAbsEnaRvrt", "enum16"),
+    _point("PFWAbsRvrtTms", "uint32", size=2),
+    _point("PFWAbsRvrtRem", "uint32", size=2),
+    _point("WMaxLimPctEna", "enum16"),
+    _point("WMaxLimPct", "uint16", scale_factor="WMaxLimPct_SF"),
+    _point("WMaxLimPctRvrt", "uint16", scale_factor="WMaxLimPct_SF"),
+    _point("WMaxLimPctEnaRvrt", "enum16"),
+    _point("WMaxLimPctRvrtTms", "uint32", size=2),
+    _point("WMaxLimPctRvrtRem", "uint32", size=2),
+    _point("WSetEna", "enum16"),
+    _point("WSetMod", "enum16"),
+    _point("WSet", "int32", size=2, scale_factor="WSet_SF"),
+    _point("WSetRvrt", "int32", size=2, scale_factor="WSet_SF"),
+    _point("WSetPct", "int16", scale_factor="WSetPct_SF"),
+    _point("WSetPctRvrt", "int16", scale_factor="WSetPct_SF"),
+    _point("WSetEnaRvrt", "enum16"),
+    _point("WSetRvrtTms", "uint32", size=2),
+    _point("WSetRvrtRem", "uint32", size=2),
+    _point("VarSetEna", "enum16"),
+    _point("VarSetMod", "enum16"),
+    _point("VarSetPri", "enum16"),
+    _point("VarSet", "int32", size=2, scale_factor="VarSet_SF"),
+    _point("VarSetRvrt", "int32", size=2, scale_factor="VarSet_SF"),
+    _point("VarSetPct", "int16", scale_factor="VarSetPct_SF"),
+    _point("VarSetPctRvrt", "int16", scale_factor="VarSetPct_SF"),
+    _point("VarSetEnaRvrt", "enum16"),
+    _point("VarSetRvrtTms", "uint32", size=2),
+    _point("VarSetRvrtRem", "uint32", size=2),
+    _point("WRmp", "uint16"),
+    _point("WRmpRef", "enum16"),
+    _point("VarRmp", "uint16"),
+    _point("AntiIslEna", "enum16"),
+    _point("PF_SF", "sunssf"),
+    _point("WMaxLimPct_SF", "sunssf"),
+    _point("WSet_SF", "sunssf"),
+    _point("WSetPct_SF", "sunssf"),
+    _point("VarSet_SF", "sunssf"),
+    _point("VarSetPct_SF", "sunssf"),
+    _point("PFWInj.PF", "uint16", scale_factor="PF_SF"),
+    _point("PFWInj.Ext", "enum16"),
+    _point("PFWInjRvrt.PF", "uint16", scale_factor="PF_SF"),
+    _point("PFWInjRvrt.Ext", "enum16"),
+    _point("PFWAbs.PF", "uint16", scale_factor="PF_SF"),
+    _point("PFWAbs.Ext", "enum16"),
+    _point("PFWAbsRvrt.PF", "uint16", scale_factor="PF_SF"),
+    _point("PFWAbsRvrt.Ext", "enum16"),
+]
+
 MODEL_POINT_DEFINITIONS: dict[int, list[SunSpecPoint]] = {
     101: INVERTER_POINTS,
     102: INVERTER_POINTS,
@@ -328,6 +440,8 @@ MODEL_POINT_DEFINITIONS: dict[int, list[SunSpecPoint]] = {
     212: METER_FLOAT_POINTS,
     213: METER_FLOAT_POINTS,
     701: DER_MEASURE_POINTS,
+    702: DER_CAPACITY_POINTS,
+    704: DER_CONTROL_POINTS,
     713: STORAGE_CAPACITY_POINTS,
 }
 
@@ -504,6 +618,34 @@ def read_holding_registers(host: str, unit_id: int, address: int, count: int, ti
     return list(struct.unpack(f"!{len(register_payload) // 2}H", register_payload))
 
 
+def write_multiple_registers(host: str, unit_id: int, address: int, values: list[int], timeout_seconds: float) -> bool:
+    if not values:
+        raise ModbusSourceError("Modbus write requires at least one register value.")
+    register_values = [int(value) & 0xFFFF for value in values]
+    try:
+        response = _send_modbus_request(
+            host,
+            unit_id,
+            struct.pack(
+                f"!BHHB{len(register_values)}H",
+                0x10,
+                address,
+                len(register_values),
+                len(register_values) * 2,
+                *register_values,
+            ),
+            timeout_seconds,
+            transaction_id=4000 + (address % 1000),
+        )
+    except (OSError, ModbusSourceError):
+        return False
+
+    if len(response) != 5 or response[0] != 0x10:
+        return False
+    written_address, written_count = struct.unpack("!HH", response[1:5])
+    return written_address == address and written_count == len(register_values)
+
+
 def read_register_window(host: str, unit_id: int, address: int, count: int, timeout_seconds: float) -> list[int] | None:
     registers: list[int] = []
     remaining = count
@@ -566,6 +708,20 @@ def _decode_sunssf(register: int) -> int | None:
     return _decode_signed_16(register)
 
 
+def _encode_signed_16(value: int) -> int:
+    return struct.unpack("!H", struct.pack("!h", int(value)))[0]
+
+
+def _encode_signed_32(value: int) -> list[int]:
+    packed = struct.pack("!i", int(value))
+    return list(struct.unpack("!HH", packed))
+
+
+def _encode_unsigned_32(value: int) -> list[int]:
+    packed = struct.pack("!I", int(value))
+    return list(struct.unpack("!HH", packed))
+
+
 def _apply_scale_factor(value: float | int | None, scale_factor: int | None) -> float | None:
     if value is None:
         return None
@@ -575,6 +731,13 @@ def _apply_scale_factor(value: float | int | None, scale_factor: int | None) -> 
     if not math.isfinite(scaled):
         return None
     return scaled
+
+
+def _remove_scale_factor(value: float | int, scale_factor: int | None) -> float:
+    raw_value = float(value)
+    if scale_factor is not None:
+        raw_value /= 10 ** scale_factor
+    return raw_value
 
 
 def _decode_point_value(point: SunSpecPoint, registers: list[int]) -> Any:
@@ -593,6 +756,22 @@ def _decode_point_value(point: SunSpecPoint, registers: list[int]) -> Any:
     if point.point_type == "sunssf":
         return _decode_sunssf(registers[0])
     return None
+
+
+def _encode_point_registers(point: SunSpecPoint, value: Any, scale_factor: int | None) -> list[int]:
+    normalized_value = value
+    if point.scale_factor is not None and value is not None:
+        normalized_value = round(_remove_scale_factor(float(value), scale_factor))
+
+    if point.point_type in {"uint16", "enum16", "bitfield16"}:
+        return [int(normalized_value)]
+    if point.point_type == "int16":
+        return [_encode_signed_16(int(normalized_value))]
+    if point.point_type in {"uint32", "acc32", "bitfield32"}:
+        return _encode_unsigned_32(int(normalized_value))
+    if point.point_type == "int32":
+        return _encode_signed_32(int(normalized_value))
+    raise ModbusSourceError(f"SunSpec point type {point.point_type} is not supported for writes.")
 
 
 def parse_sunspec_model_blocks(registers: list[int], start_register: int = 0) -> list[SunSpecModelBlock]:
@@ -817,6 +996,32 @@ def _extract_storage_capacity_telemetry(values: dict[str, Any]) -> dict[str, Any
     return telemetry
 
 
+def _extract_der_capacity_telemetry(values: dict[str, Any]) -> dict[str, Any]:
+    telemetry: dict[str, Any] = {}
+    _set_metric(telemetry, "power_rating_kw", None if (value := _metric_with_sf(values, "WMax", "W_SF")) is None else value / 1000.0)
+    _set_metric(
+        telemetry,
+        "max_charge_power_kw",
+        None if (value := _metric_with_sf(values, "WChaRteMax", "W_SF")) is None else value / 1000.0,
+    )
+    _set_metric(
+        telemetry,
+        "max_discharge_power_kw",
+        None if (value := _metric_with_sf(values, "WDisChaRteMax", "W_SF")) is None else value / 1000.0,
+    )
+    if values.get("CtrlModes") is not None:
+        telemetry["control_modes"] = values["CtrlModes"]
+    return telemetry
+
+
+def _extract_der_control_telemetry(values: dict[str, Any]) -> dict[str, Any]:
+    telemetry: dict[str, Any] = {"curtailment_supported": True}
+    _set_metric(telemetry, "curtailment_limit_pct", _metric_with_sf(values, "WMaxLimPct", "WMaxLimPct_SF"))
+    if values.get("WMaxLimPctEna") is not None:
+        telemetry["curtailment_enabled"] = values["WMaxLimPctEna"] == 1
+    return telemetry
+
+
 MODEL_TELEMETRY_EXTRACTORS = {
     101: _extract_inverter_telemetry,
     102: _extract_inverter_telemetry,
@@ -830,6 +1035,8 @@ MODEL_TELEMETRY_EXTRACTORS = {
     212: _extract_meter_float_telemetry,
     213: _extract_meter_float_telemetry,
     701: _extract_der_measure_telemetry,
+    702: _extract_der_capacity_telemetry,
+    704: _extract_der_control_telemetry,
     713: _extract_storage_capacity_telemetry,
 }
 
@@ -876,6 +1083,100 @@ def _extract_probe_telemetry(host: str, unit_id: int, model_blocks: list[SunSpec
         parsed = _parse_sunspec_register_block(registers, point_definitions)
         telemetry.update(extractor(parsed))
     return telemetry
+
+
+def get_sunspec_model_block(
+    model_blocks: list[SunSpecModelBlock] | list[dict[str, Any]] | None,
+    model_id: int,
+) -> SunSpecModelBlock | None:
+    if not model_blocks:
+        return None
+    for model_block in model_blocks:
+        if isinstance(model_block, SunSpecModelBlock):
+            candidate = model_block
+        elif isinstance(model_block, dict):
+            try:
+                candidate = SunSpecModelBlock(
+                    model_id=int(model_block["model_id"]),
+                    length=int(model_block["length"]),
+                    start_register=int(model_block["start_register"]),
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+        else:
+            continue
+        if candidate.model_id == model_id:
+            return candidate
+    return None
+
+
+def read_sunspec_model_values(
+    host: str,
+    unit_id: int,
+    model_block: SunSpecModelBlock,
+    timeout_seconds: float,
+) -> dict[str, Any] | None:
+    point_definitions = MODEL_POINT_DEFINITIONS.get(model_block.model_id)
+    if point_definitions is None:
+        return None
+    registers = read_register_window(host, unit_id, model_block.start_register, model_block.length + 2, timeout_seconds)
+    if not registers or len(registers) < 2:
+        return None
+    return _parse_sunspec_register_block(registers, point_definitions)
+
+
+def _point_offsets(point_definitions: list[SunSpecPoint]) -> dict[str, tuple[SunSpecPoint, int]]:
+    offsets: dict[str, tuple[SunSpecPoint, int]] = {}
+    cursor = 0
+    for point in point_definitions:
+        offsets[point.name] = (point, cursor)
+        cursor += point.size
+    return offsets
+
+
+def write_sunspec_model_points(
+    host: str,
+    unit_id: int,
+    model_block: SunSpecModelBlock,
+    current_values: dict[str, Any],
+    point_values: dict[str, Any],
+    timeout_seconds: float,
+) -> bool:
+    point_definitions = MODEL_POINT_DEFINITIONS.get(model_block.model_id)
+    if point_definitions is None:
+        raise ModbusSourceError(f"Unsupported SunSpec model {model_block.model_id} for writes.")
+
+    offsets = _point_offsets(point_definitions)
+    for point_name in point_values:
+        if point_name not in offsets:
+            raise ModbusSourceError(f"SunSpec point {point_name} is not present in model {model_block.model_id}.")
+    write_chunks: list[tuple[int, list[int]]] = []
+    current_address: int | None = None
+    current_payload: list[int] = []
+
+    for point_name in sorted(point_values, key=lambda item: offsets[item][1]):
+        point, offset = offsets[point_name]
+        register_address = model_block.start_register + offset
+        scale_factor = current_values.get(point.scale_factor) if point.scale_factor else None
+        encoded = _encode_point_registers(point, point_values[point_name], scale_factor)
+
+        if current_address is None:
+            current_address = register_address
+            current_payload = list(encoded)
+            continue
+
+        expected_next = current_address + len(current_payload)
+        if register_address == expected_next:
+            current_payload.extend(encoded)
+        else:
+            write_chunks.append((current_address, current_payload))
+            current_address = register_address
+            current_payload = list(encoded)
+
+    if current_address is not None and current_payload:
+        write_chunks.append((current_address, current_payload))
+
+    return all(write_multiple_registers(host, unit_id, address, payload, timeout_seconds) for address, payload in write_chunks)
 
 
 def probe_modbus_host(host: str, timeout_seconds: float) -> ModbusProbeResult | None:
@@ -986,6 +1287,27 @@ def build_candidate_from_modbus_probe(probe: ModbusProbeResult) -> RawCandidate:
         "classification_reasoning": reasoning,
         "classification_confidence": confidence,
     }
+    capabilities_hint = {
+        "visible": True,
+        "monitorable": monitorable,
+        "controllable": False,
+        "optimizable": False,
+    }
+    if device_type == "battery" and 124 in probe.sunspec_model_ids and monitorable:
+        evidence["dispatch_profile"] = "sunspec_storage_basic_rate"
+        evidence["dispatch_model_id"] = 124
+        evidence["dispatch_capabilities"] = ["set_power_kw"]
+        capabilities_hint["controllable"] = True
+        capabilities_hint["optimizable"] = True
+        telemetry["storage_rate_control_supported"] = True
+    elif device_type == "pv_inverter" and 704 in probe.sunspec_model_ids and telemetry.get("power_rating_kw") is not None:
+        evidence["dispatch_profile"] = "sunspec_der_wmax_pct"
+        evidence["dispatch_model_id"] = 704
+        evidence["dispatch_capabilities"] = ["set_power_kw"]
+        capabilities_hint["controllable"] = True
+        capabilities_hint["optimizable"] = True
+        telemetry["curtailment_supported"] = True
+
     explanation_hint = (
         "Helios validated a native Modbus/TCP endpoint and mapped standardized SunSpec telemetry."
         if monitorable
@@ -996,6 +1318,12 @@ def build_candidate_from_modbus_probe(probe: ModbusProbeResult) -> RawCandidate:
         if monitorable
         else "Promote the validated Modbus endpoint into a device-specific telemetry profile."
     )
+    if evidence.get("dispatch_profile") == "sunspec_storage_basic_rate":
+        explanation_hint = "Helios validated native SunSpec storage telemetry and a guarded battery rate-control profile through model 124."
+        next_step_hint = "The battery can now participate in guarded local charge and discharge control through validated SunSpec storage points."
+    elif evidence.get("dispatch_profile") == "sunspec_der_wmax_pct":
+        explanation_hint = "Helios validated native SunSpec inverter telemetry and a guarded active-power curtailment profile through IEEE 1547 model 704."
+        next_step_hint = "The inverter can now participate in guarded local active-power limiting through validated SunSpec DER control points."
     return RawCandidate(
         candidate_id=f"cand-modbus-{_slugify(probe.host)}-u{probe.unit_id}",
         device_id=f"dev-modbus-{_slugify(probe.host)}-u{probe.unit_id}",
@@ -1014,12 +1342,7 @@ def build_candidate_from_modbus_probe(probe: ModbusProbeResult) -> RawCandidate:
         issue_code=None,
         explanation_hint=explanation_hint,
         next_step_hint=next_step_hint,
-        capabilities_hint={
-            "visible": True,
-            "monitorable": monitorable,
-            "controllable": False,
-            "optimizable": False,
-        },
+        capabilities_hint=capabilities_hint,
     )
 
 

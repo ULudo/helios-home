@@ -2,16 +2,18 @@
 
 ## Product stance
 
-Helios Home is currently a local discovery and device-inspection runtime.
+Helios Home is currently a local discovery and device-inspection runtime with a backend-first HEMS core.
 
 The system is built to:
 
 - discover network-reachable energy devices locally
 - reconcile overlapping evidence from multiple local sources
 - materialize a clean device inventory
+- map integrated assets into a canonical HEMS model
+- plan and audit guarded local energy-management decisions
 - keep the runtime offline-capable and low-overhead
 
-Control, optimization and user-facing debugging flows are intentionally deferred from the current public UI.
+Control and optimization remain deferred from the current public UI, but the backend core for HEMS planning now exists behind the API.
 
 ## Current runtime shape
 
@@ -69,6 +71,30 @@ Each device exposes:
 - explanation
 - next step
 
+### 6. HEMS backend
+
+Above discovery, Helios now builds a canonical site model for:
+
+- `pv_inverter`
+- `battery`
+- `grid_meter`
+- `ev_charger`
+- `heat_pump`
+- `uncontrolled_load`
+
+The HEMS backend then:
+
+- determines execution eligibility per asset
+- generates a plan over a configurable horizon
+- dispatches the current interval only through guarded paths
+- persists plans, dispatch events and violations
+
+Current native write support is intentionally narrow and opt-in:
+
+- telemetry simulation for validated test assets
+- Shelly local HTTP relay control
+- Tasmota local HTTP power control
+
 ## Current boundaries
 
 The current milestone intentionally excludes:
@@ -78,3 +104,4 @@ The current milestone intentionally excludes:
 - shared multi-user knowledge sync
 - production credential management
 - public control/optimization workflows
+- production-grade device actuation coverage

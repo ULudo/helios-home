@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     mqtt_live_enabled: bool = False
     mqtt_timeout_seconds: float = 5.0
     mqtt_probe_window_seconds: float = 2.0
+    native_writes_enabled: bool = False
+    write_http_timeout_seconds: float = 3.0
     cors_origins: list[str] = [
         "http://localhost:5173",
         "http://127.0.0.1:5173",

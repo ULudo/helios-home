@@ -2,7 +2,9 @@
 
 Base URL: `/api/v1`
 
-The current stable public API is intentionally small and aligned with the current UI.
+The current stable frontend-facing API is intentionally small and aligned with the Devices page.
+
+The backend also exposes a first HEMS control API for local development and backend validation.
 
 ## Health
 
@@ -54,3 +56,52 @@ Runs a discovery cycle against the currently configured subnet scope and returns
 - new device ids
 - candidate count
 - integrated device count
+
+## HEMS
+
+### `GET /hems/summary`
+
+Returns:
+
+- current HEMS policy
+- current canonical asset counts
+- latest persisted plan header, if present
+
+### `GET /hems/assets`
+
+Returns the canonical HEMS asset view used by the planner, including:
+
+- canonical asset type
+- control capability
+- execution eligibility
+- extracted constraints
+- latest telemetry snapshot
+
+### `GET /hems/plans/latest`
+
+Returns the latest persisted HEMS plan, including:
+
+- plan header
+- policy snapshot
+- interval schedule
+- dispatch events
+- persisted violations
+
+Returns `404` if no plan has been created yet.
+
+### `PATCH /hems/policy`
+
+Updates the site HEMS policy.
+
+Example body:
+
+```json
+{
+  "grid_import_limit_kw": 9.5,
+  "battery_reserve_pct": 25.0
+}
+```
+
+### `POST /hems/replan`
+
+Builds the current canonical site model, solves a new plan and runs guarded dispatch for the current interval.

@@ -220,6 +220,24 @@ def test_discovery_materializes_candidates_devices_and_runs(tmp_path, monkeypatc
         session.close()
 
 
+def test_discovery_rerun_preserves_materialized_devices_and_assets(tmp_path, monkeypatch):
+    session = _build_session(tmp_path, monkeypatch)
+    try:
+        first_run = run_discovery(session)
+        first_overview = build_overview(session)
+        second_run = run_discovery(session)
+
+        overview = build_overview(session)
+
+        assert first_run.candidate_count == 5
+        assert second_run.candidate_count == 5
+        assert len(overview.devices) == 5
+        assert {device.id for device in overview.devices} == {device.id for device in first_overview.devices}
+        assert len(list_device_candidates(session)) == 5
+    finally:
+        session.close()
+
+
 def test_discovery_reconciles_candidates_across_native_live_sources(tmp_path, monkeypatch):
     session = _build_session(tmp_path, monkeypatch)
     try:

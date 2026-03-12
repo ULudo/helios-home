@@ -39,6 +39,8 @@ def test_build_candidate_from_tasmota_http_context():
     assert candidate.device_type == "smart_appliance"
     assert candidate.telemetry["power_w"] == 112
     assert candidate.capabilities_hint["monitorable"] is True
+    assert candidate.capabilities_hint["controllable"] is True
+    assert candidate.evidence["dispatch_profile"] == "tasmota_http_power"
 
 
 def test_build_candidate_from_shelly_http_context():
@@ -84,6 +86,47 @@ def test_build_candidate_from_shelly_http_context():
     assert candidate.device_type == "grid_meter"
     assert candidate.telemetry["phase_0_power_w"] == -820.4
     assert candidate.capabilities_hint["monitorable"] is True
+
+
+def test_build_candidate_from_shelly_relay_http_context_marks_dispatch_profile():
+    candidate = build_candidate_from_http_context(
+        HttpDeviceContext(
+            host="198.51.100.41",
+            base_url="http://198.51.100.41",
+            root=HttpDocument(
+                path="/",
+                status_code=200,
+                headers={"server": "ShellyHTTP/1.0.0"},
+                text="<html><title>Shelly Plug</title></html>",
+                json_body=None,
+            ),
+            documents={
+                "/rpc/Shelly.GetDeviceInfo": HttpDocument(
+                    path="/rpc/Shelly.GetDeviceInfo",
+                    status_code=200,
+                    headers={"content-type": "application/json"},
+                    text="{}",
+                    json_body={"id": "shellyplusplug-001", "model": "SNSN-001X16EU", "gen": 2},
+                ),
+                "/rpc/Shelly.GetStatus": HttpDocument(
+                    path="/rpc/Shelly.GetStatus",
+                    status_code=200,
+                    headers={"content-type": "application/json"},
+                    text="{}",
+                    json_body={
+                        "switch:0": {"apower": 422.7, "current": 1.82, "voltage": 231.1},
+                    },
+                ),
+            },
+        )
+    )
+
+    assert candidate is not None
+    assert candidate.manufacturer == "Shelly"
+    assert candidate.device_type == "smart_appliance"
+    assert candidate.capabilities_hint["controllable"] is True
+    assert candidate.evidence["dispatch_profile"] == "shelly_http_relay"
+    assert candidate.evidence["dispatch_generation"] == 2
 
 
 def test_build_candidate_from_generic_energy_http_context_is_visible_only():

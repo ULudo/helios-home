@@ -104,3 +104,55 @@ class IntegrationFeasibility(str, Enum):
     METER_ONLY_POSSIBLE = "meter_only_possible"
     NOT_REASONABLY_INTEGRABLE = "not_reasonably_integrable"
     UNKNOWN = "unknown"
+
+
+class HemsExecutionMode(str, Enum):
+    GUARDED_AUTO = "guarded_auto"
+    PLAN_ONLY = "plan_only"
+
+
+class HemsAssetType(str, Enum):
+    GRID_METER = "grid_meter"
+    PV_INVERTER = "pv_inverter"
+    BATTERY = "battery"
+    EV_CHARGER = "ev_charger"
+    HEAT_PUMP = "heat_pump"
+    UNCONTROLLED_LOAD = "uncontrolled_load"
+    TARIFF_SOURCE = "tariff_source"
+    WEATHER_SOURCE = "weather_source"
+
+
+class HemsControlCapability(str, Enum):
+    MONITOR_ONLY = "monitor_only"
+    SET_POWER = "set_power"
+    SET_CURRENT = "set_current"
+    SET_MODE = "set_mode"
+    START_STOP = "start_stop"
+
+
+class HemsEligibility(str, Enum):
+    READ_ONLY = "read_only"
+    PLAN_ONLY = "plan_only"
+    DISPATCHABLE = "dispatchable"
+    BLOCKED = "blocked"
+
+
+class HemsPlanStatus(str, Enum):
+    RUNNING = "running"
+    COMPLETED = "completed"
+    DEGRADED = "degraded"
+    FAILED = "failed"
+
+
+class HemsDispatchStatus(str, Enum):
+    APPLIED = "applied"
+    SIMULATED = "simulated"
+    SKIPPED = "skipped"
+    BLOCKED = "blocked"
+    FAILED = "failed"
+
+
+class HemsViolationSeverity(str, Enum):
+    INFO = "info"
+    WARNING = "warning"
+    HIGH = "high"

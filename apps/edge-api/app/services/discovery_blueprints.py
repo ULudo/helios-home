@@ -274,6 +274,9 @@ def assess_connectors(candidate: RawCandidate) -> list[ConnectorAssessment]:
             if candidate.issue_code == "modbus_unit_id_mismatch":
                 outcome = ConnectorOutcome.PARTIAL.value
                 detail = "Read-only registers responded, but the write mapping appears to have shifted."
+            elif candidate.capabilities_hint.get("controllable"):
+                outcome = ConnectorOutcome.SUCCESS.value
+                detail = "Validated standardized SunSpec telemetry and a guarded native write profile through Modbus/TCP."
             elif candidate.capabilities_hint.get("monitorable"):
                 outcome = ConnectorOutcome.SUCCESS.value
                 detail = "Validated standardized SunSpec telemetry through the native Modbus/TCP path."
@@ -294,11 +297,12 @@ def assess_connectors(candidate: RawCandidate) -> list[ConnectorAssessment]:
                 if candidate.capabilities_hint.get("monitorable")
                 else ConnectorOutcome.INFO.value
             )
-            detail = (
-                "Validated a local HTTP read path for telemetry."
-                if candidate.capabilities_hint.get("monitorable")
-                else "Identified a local HTTP interface, but telemetry still needs a device-specific adapter."
-            )
+            if candidate.capabilities_hint.get("controllable"):
+                detail = "Validated a local HTTP telemetry path and a guarded write profile for device actuation."
+            elif candidate.capabilities_hint.get("monitorable"):
+                detail = "Validated a local HTTP read path for telemetry."
+            else:
+                detail = "Identified a local HTTP interface, but telemetry still needs a device-specific adapter."
             assessments.append(
                 ConnectorAssessment(
                     connector_name="Local HTTP probe",

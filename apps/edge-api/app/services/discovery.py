@@ -397,37 +397,47 @@ def _upsert_device(session: Session, site: Site, raw_candidate: RawCandidate, di
 def _remove_materialization_for_sources(
     session: Session,
     source_names: set[str],
+    keep_candidate_ids: set[str],
     keep_device_ids: set[str],
+    keep_asset_ids: set[str],
 ) -> None:
     if not source_names:
         return
 
     candidates = session.scalars(select(DeviceCandidate).order_by(DeviceCandidate.created_at)).all()
     assets = session.scalars(select(Asset).order_by(Asset.created_at)).all()
+    stale_device_ids: set[str] = set()
 
     for candidate in candidates:
         candidate_sources = set(candidate.discovery_sources or [])
         if not (candidate_sources & source_names):
             continue
 
-        device_id = candidate.matched_device_id
-        if device_id in keep_device_ids:
+        if candidate.id in keep_candidate_ids:
             continue
 
-        for asset in assets:
-            device_ids = list(asset.device_ids or [])
-            if device_id not in device_ids:
-                continue
-            remaining = [current_id for current_id in device_ids if current_id != device_id]
-            if remaining:
-                asset.device_ids = remaining
-            else:
-                session.delete(asset)
+        device_id = candidate.matched_device_id
+        if device_id and device_id not in keep_device_ids:
+            stale_device_ids.add(device_id)
+        session.delete(candidate)
 
+    for asset in assets:
+        asset_device_ids = list(asset.device_ids or [])
+        remaining_device_ids = [device_id for device_id in asset_device_ids if device_id in keep_device_ids]
+        if remaining_device_ids != asset_device_ids:
+            if remaining_device_ids:
+                asset.device_ids = remaining_device_ids
+            elif asset.id not in keep_asset_ids:
+                session.delete(asset)
+        elif asset.id not in keep_asset_ids and not remaining_device_ids:
+            session.delete(asset)
+
+    for device_id in stale_device_ids:
+        if device_id in keep_device_ids:
+            continue
         device = session.get(Device, device_id)
         if device is not None:
             session.delete(device)
-        session.delete(candidate)
 
 
 def _build_discovery_status(batches: list[SourceDiscoveryBatch], candidate_count: int) -> str:
@@ -468,10 +478,19 @@ def run_discovery(session: Session) -> DiscoveryRunRead:
     session.add(discovery_run)
 
     existing_device_ids = {device_id for device_id in session.scalars(select(Device.id)).all()}
-    _remove_materialization_for_sources(session, MANAGED_SOURCE_NAMES, keep_device_ids=set())
-
     raw_candidates = [candidate for batch in selected_batches for candidate in batch.candidates]
     all_candidates = reconcile_candidates(raw_candidates)
+    keep_candidate_ids = {candidate.candidate_id for candidate in all_candidates}
+    keep_device_ids = {candidate.device_id for candidate in all_candidates}
+    keep_asset_ids = {candidate.asset_id for candidate in all_candidates}
+
+    _remove_materialization_for_sources(
+        session,
+        MANAGED_SOURCE_NAMES,
+        keep_candidate_ids=keep_candidate_ids,
+        keep_device_ids=keep_device_ids,
+        keep_asset_ids=keep_asset_ids,
+    )
 
     for raw_candidate in all_candidates:
         classification = classify_candidate(raw_candidate)

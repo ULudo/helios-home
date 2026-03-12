@@ -343,6 +343,9 @@ def _build_candidate(
         "controllable": False,
         "optimizable": False,
     }
+    if evidence.get("dispatch_profile") and telemetry:
+        capabilities_hint["controllable"] = True
+        capabilities_hint["optimizable"] = True
     stable_slug = _slugify(stable_identifier)
     return RawCandidate(
         candidate_id=f"cand-local-http-{stable_slug}",
@@ -419,6 +422,31 @@ def _build_tasmota_candidate(context: HttpDeviceContext) -> RawCandidate | None:
     identity_keys = []
     if hostname:
         identity_keys.append(f"mqtt-slug:{_slugify(str(hostname))}")
+    evidence = (
+        {
+            "tasmota_status": status_payload,
+            "network_macs": [network_mac] if network_mac else [],
+            "hostnames": [value for value in [hostname, friendly_name] if value],
+            "identity_keys": identity_keys,
+        }
+        if status_payload
+        else {"fingerprint_profile": "tasmota_http", "hostnames": [value for value in [hostname] if value], "identity_keys": identity_keys}
+    )
+    explanation_hint = (
+        "Helios identified a Tasmota HTTP interface and validated a read-only telemetry path."
+        if telemetry
+        else "Helios identified a Tasmota HTTP interface, but no validated energy telemetry path is available yet."
+    )
+    next_step_hint = (
+        "Keep the device monitorable through the local HTTP status endpoint."
+        if telemetry
+        else "Probe the local status endpoint again or add a more specific adapter profile."
+    )
+    if device_type == "smart_appliance":
+        evidence["dispatch_profile"] = "tasmota_http_power"
+        evidence["dispatch_capabilities"] = ["binary_switch"]
+        explanation_hint = "Helios validated local Tasmota telemetry and the native HTTP power command path for binary switching."
+        next_step_hint = "The device can now participate in guarded local actuation through the validated Tasmota HTTP command path."
     return _build_candidate(
         context=context,
         stable_identifier=stable_identifier,
@@ -430,26 +458,9 @@ def _build_tasmota_candidate(context: HttpDeviceContext) -> RawCandidate | None:
         telemetry=telemetry,
         reasoning=reasoning,
         confidence=max(confidence, 0.86 if telemetry else 0.8),
-        explanation_hint=(
-            "Helios identified a Tasmota HTTP interface on the local network and validated a read-only status path."
-            if telemetry
-            else "Helios identified a Tasmota HTTP interface, but no validated energy telemetry path is available yet."
-        ),
-        next_step_hint=(
-            "Keep the device monitorable through the local HTTP status endpoint."
-            if telemetry
-            else "Probe the local status endpoint again or add a more specific adapter profile."
-        ),
-        evidence=(
-            {
-                "tasmota_status": status_payload,
-                "network_macs": [network_mac] if network_mac else [],
-                "hostnames": [value for value in [hostname, friendly_name] if value],
-                "identity_keys": identity_keys,
-            }
-            if status_payload
-            else {"fingerprint_profile": "tasmota_http", "hostnames": [value for value in [hostname] if value], "identity_keys": identity_keys}
-        ),
+        explanation_hint=explanation_hint,
+        next_step_hint=next_step_hint,
+        evidence=evidence,
     )
 
 
@@ -540,6 +551,29 @@ def _build_shelly_candidate(context: HttpDeviceContext) -> RawCandidate | None:
         evidence["hostnames"] = [display_name]
     if identity_keys:
         evidence["identity_keys"] = identity_keys
+    shelly_generation = (
+        _parse_numeric((device_info or {}).get("gen"))
+        or _parse_numeric((status_payload or {}).get("gen"))
+        or (2 if "/rpc/Shelly.GetStatus" in context.documents else 1 if "/status" in context.documents else None)
+    )
+    explanation_hint = (
+        "Helios identified a Shelly local interface and validated a read-only telemetry path."
+        if telemetry
+        else "Helios identified a Shelly local interface, but no validated telemetry endpoint is available yet."
+    )
+    next_step_hint = (
+        "Keep the device monitorable through the Shelly local API."
+        if telemetry
+        else "Probe the local Shelly API again or add a more specific adapter profile."
+    )
+    if device_type == "smart_appliance":
+        evidence["dispatch_profile"] = "shelly_http_relay"
+        evidence["dispatch_capabilities"] = ["binary_switch"]
+        evidence["dispatch_channel"] = 0
+        if shelly_generation is not None:
+            evidence["dispatch_generation"] = int(shelly_generation)
+        explanation_hint = "Helios validated local Shelly telemetry and a native relay control path for guarded binary switching."
+        next_step_hint = "The device can now participate in guarded local actuation through the validated Shelly relay API."
     return _build_candidate(
         context=context,
         stable_identifier=stable_identifier,
@@ -551,16 +585,8 @@ def _build_shelly_candidate(context: HttpDeviceContext) -> RawCandidate | None:
         telemetry=telemetry,
         reasoning=reasoning,
         confidence=confidence,
-        explanation_hint=(
-            "Helios identified a Shelly local interface and validated a read-only telemetry path."
-            if telemetry
-            else "Helios identified a Shelly local interface, but no validated telemetry endpoint is available yet."
-        ),
-        next_step_hint=(
-            "Keep the device monitorable through the Shelly local API."
-            if telemetry
-            else "Probe the local Shelly API again or add a more specific adapter profile."
-        ),
+        explanation_hint=explanation_hint,
+        next_step_hint=next_step_hint,
         evidence=evidence,
     )
 
