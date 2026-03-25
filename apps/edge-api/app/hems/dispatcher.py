@@ -16,8 +16,30 @@ class DispatchRecord:
     outcome: DispatchOutcome
 
 
-def _clamped_command(asset: CanonicalAsset, interval: PlannedInterval) -> dict[str, float]:
+def _clamped_command(asset: CanonicalAsset, interval: PlannedInterval) -> dict[str, object]:
     command_key, raw_value = next(iter(interval.command.items()))
+    contract = asset.command_contract
+    if contract is not None and contract.value_type == "boolean":
+        if isinstance(raw_value, bool):
+            return {command_key: raw_value}
+        if isinstance(raw_value, (int, float)):
+            return {command_key: float(raw_value) >= 0.5}
+        lowered = str(raw_value).strip().lower()
+        if lowered in {"on", "start", "true", "1"}:
+            return {command_key: True}
+        if lowered in {"off", "stop", "false", "0"}:
+            return {command_key: False}
+        return {command_key: False}
+    if contract is not None and contract.value_type == "number":
+        value = float(raw_value)
+        minimum = float(contract.minimum) if contract.minimum is not None else value
+        maximum = float(contract.maximum) if contract.maximum is not None else value
+        value = max(minimum, min(maximum, value))
+        return {command_key: round(value, 4)}
+
+    if isinstance(raw_value, bool):
+        return {command_key: raw_value}
+
     value = float(raw_value)
     if asset.asset_type == "battery":
         max_charge = float(asset.constraints.get("max_charge_kw", 0.0))

@@ -40,6 +40,19 @@ class HemsPolicyUpdate(BaseModel):
     step_minutes: int | None = None
 
 
+class HemsCommandContractRead(BaseModel):
+    command_key: str
+    value_type: str
+    unit: str | None = None
+    minimum: float | None = None
+    maximum: float | None = None
+    allowed_values: list[str] = Field(default_factory=list)
+    adapter_name: str | None = None
+    validation_state: str
+    requires_native_writes: bool = False
+    safety_checks: list[str] = Field(default_factory=list)
+
+
 class HemsAssetRead(BaseModel):
     asset_key: str
     asset_type: str
@@ -49,6 +62,7 @@ class HemsAssetRead(BaseModel):
     eligibility: str
     telemetry: dict[str, Any] = Field(default_factory=dict)
     constraints: dict[str, Any] = Field(default_factory=dict)
+    command_contract: HemsCommandContractRead | None = None
     reasons: list[str] = Field(default_factory=list)
 
 

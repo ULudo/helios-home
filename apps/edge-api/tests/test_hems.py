@@ -3,9 +3,10 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 from app.core.config import get_settings
-from app.db.models import Asset, Device
+from app.db.models import Asset, Device, DeviceCandidate, Site
 from app.db.seed import seed_demo_data
 from app.db.session import get_engine, get_session_factory, init_database
 from app.hems.models import ForecastBundle
@@ -102,6 +103,79 @@ def _make_dispatchable(session):
     session.commit()
 
 
+def _add_controllable_load(
+    session,
+    *,
+    simulation_supported: bool = False,
+    dispatch_profile: str | None = None,
+) -> tuple[Device, Asset, DeviceCandidate]:
+    site = session.scalar(select(Site).limit(1))
+    assert site is not None
+
+    device = Device(
+        id="dev-laundry-relay",
+        site_id=site.id,
+        name="Laundry Relay",
+        manufacturer="Shelly",
+        model="Plug S Gen3",
+        firmware="1.0.0",
+        device_type="smart_appliance",
+        primary_status="controllable",
+        status_tags=["discovered", "connected", "monitorable", "controllable"],
+        confidence=0.93,
+        recovery_zone="auto_apply",
+        protocols=["http_local"],
+        capabilities={
+            "visible": True,
+            "monitorable": True,
+            "controllable": True,
+            "optimizable": True,
+        },
+        telemetry={
+            "power_w": 95.0,
+            "runtime_target_hours": 1.0,
+            "minimum_runtime_minutes": 30,
+            **({"simulation_supported": True} if simulation_supported else {}),
+        },
+        problem_summary="",
+        explanation="Validated smart load",
+        next_step="No action required.",
+    )
+    asset = Asset(
+        id="asset-laundry-relay",
+        site_id=site.id,
+        name="Laundry Smart Load",
+        asset_type="smart_appliance",
+        status="controllable",
+        health="healthy",
+        device_ids=[device.id],
+        metrics=dict(device.telemetry),
+    )
+    candidate = DeviceCandidate(
+        id="cand-laundry-relay",
+        site_id=site.id,
+        stable_key="dev-laundry-relay",
+        display_name=device.name,
+        manufacturer=device.manufacturer,
+        model=device.model,
+        firmware=device.firmware,
+        device_type="smart_appliance",
+        discovery_sources=["local_network_live"],
+        protocols=["http_local"],
+        evidence={
+            "http_base_url": "http://192.0.2.88",
+            **({"dispatch_profile": dispatch_profile} if dispatch_profile else {}),
+        },
+        classification_confidence=0.93,
+        classification_reasoning="Test controllable load",
+        state="classified",
+        matched_device_id=device.id,
+    )
+    session.add_all([device, asset, candidate])
+    session.commit()
+    return device, asset, candidate
+
+
 def test_site_model_maps_current_discovery_assets_into_canonical_hems_assets(tmp_path, monkeypatch):
     session = _build_session(tmp_path, monkeypatch)
     try:
@@ -114,6 +188,11 @@ def test_site_model_maps_current_discovery_assets_into_canonical_hems_assets(tmp
         assert assets_by_type["battery"].eligibility == "plan_only"
         assert assets_by_type["ev_charger"].eligibility == "blocked"
         assert assets_by_type["heat_pump"].eligibility == "plan_only"
+        assert assets_by_type["battery"].command_contract is not None
+        assert assets_by_type["battery"].command_contract.command_key == "set_power_kw"
+        assert assets_by_type["battery"].command_contract.validation_state == "unavailable"
+        assert assets_by_type["heat_pump"].command_contract is not None
+        assert assets_by_type["heat_pump"].command_contract.maximum == 2.5
     finally:
         session.close()
 
@@ -138,6 +217,87 @@ def test_hems_replan_persists_intervals_and_simulated_dispatch(tmp_path, monkeyp
 
         assets = list_hems_assets(session, forecast_override=_deterministic_forecast())
         assert any(asset.asset_type == "battery" and asset.eligibility == "dispatchable" for asset in assets)
+        assert any(
+            asset.asset_type == "battery"
+            and asset.command_contract is not None
+            and asset.command_contract.validation_state == "simulation"
+            for asset in assets
+        )
+    finally:
+        session.close()
+
+
+def test_native_write_runtime_gate_demotes_native_contracts_to_plan_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("HELIOS_NATIVE_WRITES_ENABLED", "false")
+    get_settings.cache_clear()
+    session = _build_session(tmp_path, monkeypatch, name="native-disabled.db")
+    try:
+        run_discovery(session)
+        _make_dispatchable(session)
+        battery_candidate = session.get(DeviceCandidate, "cand-byd-battery")
+        assert battery_candidate is not None
+        battery_candidate.evidence = {
+            **dict(battery_candidate.evidence or {}),
+            "dispatch_profile": "sunspec_storage_basic_rate",
+        }
+        session.add(battery_candidate)
+        session.commit()
+
+        site_model = build_site_model(session)
+        assets_by_type = {asset.asset_type: asset for asset in site_model.assets}
+
+        assert assets_by_type["battery"].eligibility == "plan_only"
+        assert assets_by_type["battery"].command_contract is not None
+        assert assets_by_type["battery"].command_contract.validation_state == "native_disabled"
+        assert "Native writes are currently disabled in the runtime." in assets_by_type["battery"].reasons
+        assert assets_by_type["heat_pump"].eligibility == "dispatchable"
+        assert assets_by_type["heat_pump"].command_contract is not None
+        assert assets_by_type["heat_pump"].command_contract.validation_state == "simulation"
+    finally:
+        session.close()
+        get_settings.cache_clear()
+
+
+def test_site_model_maps_controllable_smart_appliance_into_dispatchable_load(tmp_path, monkeypatch):
+    monkeypatch.setenv("HELIOS_NATIVE_WRITES_ENABLED", "true")
+    get_settings.cache_clear()
+    session = _build_session(tmp_path, monkeypatch, name="controllable-load.db")
+    try:
+        _add_controllable_load(session, dispatch_profile="shelly_http_relay")
+
+        site_model = build_site_model(session)
+        controllable_load = next(asset for asset in site_model.assets if asset.asset_key == "asset-laundry-relay")
+
+        assert controllable_load.asset_type == "controllable_load"
+        assert controllable_load.control_capability == "start_stop"
+        assert controllable_load.eligibility == "dispatchable"
+        assert controllable_load.command_contract is not None
+        assert controllable_load.command_contract.command_key == "start_stop"
+        assert controllable_load.command_contract.value_type == "boolean"
+        assert controllable_load.command_contract.validation_state == "native"
+    finally:
+        session.close()
+        get_settings.cache_clear()
+
+
+def test_hems_replan_dispatches_controllable_load_binary_commands(tmp_path, monkeypatch):
+    session = _build_session(tmp_path, monkeypatch, name="controllable-load-plan.db")
+    try:
+        _add_controllable_load(session, simulation_supported=True)
+
+        plan = run_hems_replan(session, forecast_override=_deterministic_forecast())
+
+        load_intervals = [interval for interval in plan.intervals if interval.asset_key == "asset-laundry-relay"]
+        assert load_intervals
+        assert all(isinstance(interval.command["start_stop"], bool) for interval in load_intervals)
+        assert any(interval.command["start_stop"] for interval in load_intervals)
+        assert any(asset.asset_type == "controllable_load" and asset.eligibility == "dispatchable" for asset in plan.assets)
+        assert any(
+            event.asset_key == "asset-laundry-relay"
+            and event.status == "simulated"
+            and isinstance(event.applied_command.get("start_stop"), bool)
+            for event in plan.dispatch_events
+        )
     finally:
         session.close()
 

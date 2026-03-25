@@ -6,8 +6,10 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.db.models import Asset, Device, Site
-from app.domain.enums import HemsAssetType, HemsControlCapability, HemsEligibility
+from app.core.config import get_settings
+from app.db.models import Asset, Device, DeviceCandidate, Site
+from app.domain.enums import HemsAssetType, HemsControlCapability
+from app.hems.dispatchability import assess_dispatchability
 from app.hems.forecast import build_default_forecast
 from app.hems.models import CanonicalAsset, ForecastBundle, SiteModel
 from app.hems.policy import get_or_create_hems_policy
@@ -40,10 +42,14 @@ def _bool_value(payload: dict[str, Any], *keys: str) -> bool | None:
     return None
 
 
-def _map_asset_type(asset_type: str) -> str:
+def _map_asset_type(asset_type: str, *, device: Device | None, evidence: dict[str, Any]) -> str:
     if asset_type == "wallbox":
         return HemsAssetType.EV_CHARGER.value
     if asset_type == "smart_appliance":
+        capabilities = dict(device.capabilities or {}) if device is not None else {}
+        telemetry = dict(device.telemetry or {}) if device is not None else {}
+        if bool(capabilities.get("controllable")) or bool(evidence.get("dispatch_profile")) or bool(telemetry.get("simulation_supported")):
+            return HemsAssetType.CONTROLLABLE_LOAD.value
         return HemsAssetType.UNCONTROLLED_LOAD.value
     if asset_type in {item.value for item in HemsAssetType}:
         return asset_type
@@ -63,36 +69,9 @@ def _control_capability(asset_type: str, telemetry: dict[str, Any], controllable
         if any(key in telemetry for key in ("sg_ready_mode", "operating_mode", "mode")):
             return HemsControlCapability.SET_MODE.value
         return HemsControlCapability.START_STOP.value
+    if asset_type == HemsAssetType.CONTROLLABLE_LOAD.value:
+        return HemsControlCapability.START_STOP.value
     return HemsControlCapability.MONITOR_ONLY.value
-
-
-def _dispatch_eligibility(device: Device | None, asset_type: str) -> tuple[str, list[str]]:
-    reasons: list[str] = []
-    if device is None:
-        return HemsEligibility.BLOCKED.value, ["No device is linked to this asset."]
-
-    capabilities = device.capabilities or {}
-    if not bool(capabilities.get("visible")):
-        return HemsEligibility.BLOCKED.value, ["The asset is not visible in the local runtime."]
-    if not bool(capabilities.get("monitorable")):
-        return HemsEligibility.BLOCKED.value, ["No validated telemetry path is available for this asset."]
-    if device.primary_status in {"authentication_required", "manufacturer_access_required", "not_integratable"}:
-        return HemsEligibility.BLOCKED.value, [device.explanation or "The device is blocked by authentication or unsupported access."]
-    if asset_type not in {
-        HemsAssetType.BATTERY.value,
-        HemsAssetType.EV_CHARGER.value,
-        HemsAssetType.HEAT_PUMP.value,
-        HemsAssetType.PV_INVERTER.value,
-    }:
-        return HemsEligibility.READ_ONLY.value, ["This asset type is not dispatchable in the current HEMS scope."]
-    if not bool(capabilities.get("controllable")):
-        return HemsEligibility.PLAN_ONLY.value, ["The asset has no validated write path yet."]
-    if asset_type == HemsAssetType.PV_INVERTER.value and not bool((device.telemetry or {}).get("curtailment_supported")):
-        return HemsEligibility.PLAN_ONLY.value, ["PV generation is currently modeled as an exogenous source unless curtailment support is validated separately."]
-    if device.primary_status not in {"connected", "controllable", "optimizable"}:
-        reasons.append("The write path is not validated strongly enough for guarded auto execution.")
-        return HemsEligibility.PLAN_ONLY.value, reasons
-    return HemsEligibility.DISPATCHABLE.value, reasons
 
 
 def _next_departure_datetime(now: datetime, departure_time: str) -> datetime:
@@ -171,6 +150,23 @@ def _pv_constraints(telemetry: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _controllable_load_constraints(telemetry: dict[str, Any], step_minutes: int) -> dict[str, Any]:
+    power_kw = _numeric_value(telemetry, "power_kw")
+    if power_kw is None:
+        power_w = _numeric_value(telemetry, "power_w")
+        power_kw = power_w / 1000.0 if power_w is not None else None
+    runtime_target_steps = int(_numeric_value(telemetry, "runtime_target_steps") or 0)
+    runtime_target_hours = _numeric_value(telemetry, "runtime_target_hours", "preferred_runtime_hours")
+    if runtime_target_steps <= 0 and runtime_target_hours is not None and runtime_target_hours > 0:
+        runtime_target_steps = max(1, int(round(runtime_target_hours * 60.0 / step_minutes)))
+    minimum_on_minutes = _numeric_value(telemetry, "minimum_on_minutes", "minimum_runtime_minutes")
+    return {
+        "nominal_power_kw": round(max(power_kw or 0.25, 0.25), 4),
+        "runtime_target_steps": runtime_target_steps,
+        "minimum_on_minutes": int(max(minimum_on_minutes or step_minutes, step_minutes)),
+    }
+
+
 def _asset_constraints(asset_type: str, telemetry: dict[str, Any], policy, now: datetime) -> dict[str, Any]:
     if asset_type == HemsAssetType.BATTERY.value:
         return _battery_constraints(telemetry, policy.battery_reserve_pct)
@@ -180,29 +176,44 @@ def _asset_constraints(asset_type: str, telemetry: dict[str, Any], policy, now: 
         return _heat_pump_constraints(telemetry, policy.heat_comfort_min_c, policy.heat_comfort_max_c)
     if asset_type == HemsAssetType.PV_INVERTER.value:
         return _pv_constraints(telemetry)
+    if asset_type == HemsAssetType.CONTROLLABLE_LOAD.value:
+        return _controllable_load_constraints(telemetry, policy.step_minutes)
     return {}
 
 
-def _canonical_asset(asset: Asset, device: Device | None, policy, now: datetime) -> CanonicalAsset:
-    asset_type = _map_asset_type(asset.asset_type)
+def _canonical_asset(
+    asset: Asset,
+    device: Device | None,
+    evidence: dict[str, Any],
+    policy,
+    now: datetime,
+    *,
+    native_writes_enabled: bool,
+) -> CanonicalAsset:
+    asset_type = _map_asset_type(asset.asset_type, device=device, evidence=evidence)
     telemetry = dict(device.telemetry if device is not None else asset.metrics or {})
-    eligibility, reasons = _dispatch_eligibility(device, asset_type)
     constraints = _asset_constraints(asset_type, telemetry, policy, now)
-    if asset_type == HemsAssetType.HEAT_PUMP.value and constraints.get("current_temperature_c") is None:
-        if eligibility == HemsEligibility.DISPATCHABLE.value:
-            eligibility = HemsEligibility.PLAN_ONLY.value
-        reasons.append("No temperature proxy is available for heat-pump comfort-band control.")
     control_capability = _control_capability(asset_type, telemetry, bool(device and device.capabilities.get("controllable")))
+    dispatchability = assess_dispatchability(
+        device=device,
+        asset_type=asset_type,
+        control_capability=control_capability,
+        telemetry=telemetry,
+        constraints=constraints,
+        evidence=evidence,
+        native_writes_enabled=native_writes_enabled,
+    )
     return CanonicalAsset(
         asset_key=asset.id,
         asset_type=asset_type,
         label=device.name if device is not None else asset.name,
         device_id=device.id if device is not None else None,
         control_capability=control_capability,
-        eligibility=eligibility,
+        eligibility=dispatchability.eligibility,
         telemetry=telemetry,
         constraints=constraints,
-        reasons=reasons,
+        command_contract=dispatchability.command_contract,
+        reasons=dispatchability.reasons,
     )
 
 
@@ -216,10 +227,16 @@ def build_site_model(
         raise RuntimeError("Site has not been seeded.")
     policy = get_or_create_hems_policy(session)
     current_time = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    native_writes_enabled = get_settings().native_writes_enabled
 
     assets = session.scalars(select(Asset).order_by(Asset.asset_type, Asset.name)).all()
     devices = session.scalars(select(Device).order_by(Device.name)).all()
     devices_by_id = {device.id: device for device in devices}
+    candidate_evidence_by_device_id = {
+        candidate.matched_device_id: dict(candidate.evidence or {})
+        for candidate in session.scalars(select(DeviceCandidate).order_by(DeviceCandidate.updated_at.desc())).all()
+        if candidate.matched_device_id
+    }
 
     canonical_assets: list[CanonicalAsset] = []
     for asset in assets:
@@ -228,7 +245,17 @@ def build_site_model(
             device = devices_by_id.get(device_id)
             if device is not None:
                 break
-        canonical_assets.append(_canonical_asset(asset, device, policy, current_time))
+        evidence = dict(candidate_evidence_by_device_id.get(device.id, {}) if device is not None else {})
+        canonical_assets.append(
+            _canonical_asset(
+                asset,
+                device,
+                evidence,
+                policy,
+                current_time,
+                native_writes_enabled=native_writes_enabled,
+            )
+        )
 
     forecast = forecast_override or build_default_forecast(
         canonical_assets,

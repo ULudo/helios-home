@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.db.models import Asset, Device, DeviceCandidate
 from app.domain.enums import HemsDispatchStatus
+from app.hems.adapter_registry import SIMULATION_ADAPTER_NAME
 from app.hems.models import CanonicalAsset, DispatchOutcome, PlannedInterval
 from app.services.modbus import (
     ModbusSourceError,
@@ -130,12 +131,15 @@ def _update_applied_state(
 
 
 class TelemetrySimulationAdapter:
-    adapter_name = "telemetry_simulation"
+    adapter_name = SIMULATION_ADAPTER_NAME
 
     def __init__(self, session: Session):
         self.session = session
 
     def supports(self, target: DispatchTarget, interval: PlannedInterval) -> bool:
+        contract = target.canonical_asset.command_contract
+        if contract is not None and contract.adapter_name:
+            return contract.adapter_name == self.adapter_name
         return bool(target.canonical_asset.telemetry.get("simulation_supported"))
 
     def apply(self, target: DispatchTarget, interval: PlannedInterval) -> DispatchOutcome:
@@ -160,13 +164,34 @@ class TelemetrySimulationAdapter:
         elif target.canonical_asset.asset_type in {"heat_pump", "pv_inverter"}:
             target.device.telemetry["scheduled_power_kw"] = float(raw_value)
             target.linked_asset.metrics["scheduled_power_kw"] = float(raw_value)
+        elif target.canonical_asset.asset_type == "controllable_load":
+            desired_state = _coerce_binary_switch_state(interval)
+            if desired_state is None:
+                return DispatchOutcome(
+                    status=HemsDispatchStatus.FAILED.value,
+                    requested_command=interval.command,
+                    applied_command={},
+                    summary="The telemetry simulation adapter requires a binary command for controllable loads.",
+                )
+            nominal_power_kw = float(target.canonical_asset.constraints.get("nominal_power_kw", 0.25))
+            scheduled_power_kw = nominal_power_kw if desired_state else 0.0
+            target.device.telemetry["relay_output_on"] = desired_state
+            target.linked_asset.metrics["relay_output_on"] = desired_state
+            target.device.telemetry["scheduled_power_kw"] = scheduled_power_kw
+            target.linked_asset.metrics["scheduled_power_kw"] = scheduled_power_kw
 
         self.session.add(target.device)
         self.session.add(target.linked_asset)
         return DispatchOutcome(
             status=HemsDispatchStatus.SIMULATED.value,
             requested_command=interval.command,
-            applied_command={command_key: float(raw_value)},
+            applied_command={
+                command_key: (
+                    raw_value
+                    if isinstance(raw_value, bool)
+                    else float(raw_value)
+                )
+            },
             summary="Applied the command through the telemetry simulation adapter.",
             details={"adapter": self.adapter_name},
         )
@@ -576,7 +601,14 @@ def resolve_write_adapter(session: Session, target: DispatchTarget, interval: Pl
             ]
         )
 
+    preferred_adapter_name = (
+        target.canonical_asset.command_contract.adapter_name
+        if target.canonical_asset.command_contract is not None and target.canonical_asset.command_contract.adapter_name
+        else None
+    )
     for adapter in adapters:
+        if preferred_adapter_name is not None and adapter.adapter_name != preferred_adapter_name:
+            continue
         if adapter.supports(target, interval):
             return adapter
     return None

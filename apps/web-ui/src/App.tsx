@@ -216,6 +216,25 @@ function commandSummary(command: Record<string, string | number | boolean>): str
   return entries.map(([key, value]) => `${humanize(key)} ${formatValue(value)}`).join(" • ");
 }
 
+function commandContractSummary(asset: HemsAssetRead): string {
+  const contract = asset.command_contract;
+  if (!contract) {
+    return "No HEMS command contract is validated for this asset yet.";
+  }
+
+  const parts = [humanize(contract.command_key), humanize(contract.validation_state)];
+  if (contract.minimum !== null || contract.maximum !== null) {
+    const minText = contract.minimum !== null ? formatNumber(contract.minimum) : "open";
+    const maxText = contract.maximum !== null ? formatNumber(contract.maximum) : "open";
+    const unitText = contract.unit ? ` ${contract.unit}` : "";
+    parts.push(`${minText} to ${maxText}${unitText}`);
+  }
+  if (contract.adapter_name) {
+    parts.push(humanize(contract.adapter_name));
+  }
+  return parts.join(" • ");
+}
+
 function toneForEligibility(eligibility: string): string {
   if (eligibility === "dispatchable") {
     return "tone-positive";
@@ -1108,6 +1127,10 @@ export default function App() {
                           </div>
                         ) : null}
                         <div className="detail-pairs">
+                          <div>
+                            <small>Dispatch contract</small>
+                            <p>{commandContractSummary(asset)}</p>
+                          </div>
                           <div>
                             <small>Telemetry</small>
                             <p>

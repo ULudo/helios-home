@@ -117,6 +117,7 @@ class HemsAssetType(str, Enum):
     BATTERY = "battery"
     EV_CHARGER = "ev_charger"
     HEAT_PUMP = "heat_pump"
+    CONTROLLABLE_LOAD = "controllable_load"
     UNCONTROLLED_LOAD = "uncontrolled_load"
     TARIFF_SOURCE = "tariff_source"
     WEATHER_SOURCE = "weather_source"

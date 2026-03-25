@@ -6,6 +6,20 @@ from typing import Any
 
 
 @dataclass(slots=True)
+class CommandContract:
+    command_key: str
+    value_type: str
+    unit: str | None
+    minimum: float | None = None
+    maximum: float | None = None
+    allowed_values: list[str] = field(default_factory=list)
+    adapter_name: str | None = None
+    validation_state: str = "unavailable"
+    requires_native_writes: bool = False
+    safety_checks: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
 class CanonicalAsset:
     asset_key: str
     asset_type: str
@@ -15,6 +29,7 @@ class CanonicalAsset:
     eligibility: str
     telemetry: dict[str, Any]
     constraints: dict[str, Any]
+    command_contract: CommandContract | None = None
     reasons: list[str] = field(default_factory=list)
 
 

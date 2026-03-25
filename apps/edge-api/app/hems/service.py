@@ -12,6 +12,7 @@ from app.hems.planner import solve_site_plan
 from app.hems.policy import get_hems_policy, get_or_create_hems_policy, update_hems_policy
 from app.hems.schemas import (
     HemsAssetRead,
+    HemsCommandContractRead,
     HemsDispatchEventRead,
     HemsPlanHeaderRead,
     HemsPlanIntervalRead,
@@ -41,6 +42,22 @@ def _serialize_asset(asset) -> HemsAssetRead:
         eligibility=asset.eligibility,
         telemetry=asset.telemetry,
         constraints=asset.constraints,
+        command_contract=(
+            HemsCommandContractRead(
+                command_key=asset.command_contract.command_key,
+                value_type=asset.command_contract.value_type,
+                unit=asset.command_contract.unit,
+                minimum=asset.command_contract.minimum,
+                maximum=asset.command_contract.maximum,
+                allowed_values=asset.command_contract.allowed_values,
+                adapter_name=asset.command_contract.adapter_name,
+                validation_state=asset.command_contract.validation_state,
+                requires_native_writes=asset.command_contract.requires_native_writes,
+                safety_checks=asset.command_contract.safety_checks,
+            )
+            if asset.command_contract is not None
+            else None
+        ),
         reasons=asset.reasons,
     )
 

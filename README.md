@@ -8,14 +8,16 @@ The current public milestone is intentionally narrow:
 - discovery across configured subnets
 - device inventory with inline details
 - session-based monitoring views
+- a first HEMS page for plan, policy and asset inspection
 - local-only runtime with no cloud dependency
 
-The backend now also contains a first backend-only HEMS core with:
+The runtime now also contains a first HEMS core with:
 
 - canonical asset mapping
 - guarded planning eligibility
 - day-ahead / rolling-horizon optimization
-- simulated dispatch and audit persistence
+- guarded dispatch, including generic controllable loads
+- audit persistence
 
 The stable public UI remains centered on discovery and device inspection for now.
 
@@ -80,12 +82,12 @@ Implemented now:
 - candidate reconciliation across native live sources
 - device inventory materialization into the local SQLite store
 - inline device details and session-based monitoring charts
-- backend-only HEMS canonical asset model
-- backend-only HEMS policy, planner, dispatch and audit records
+- HEMS page with policy, canonical assets, latest plan, dispatch and violations
+- backend HEMS canonical asset model
+- backend HEMS policy, planner, dispatch and audit records
 
 Not in current public UI scope:
 
-- HEMS control and optimization pages
 - end-user debugging workflows
 - cloud sync
 - shared knowledge base
@@ -97,6 +99,7 @@ The first HEMS backend milestone is now available through the API. It is intenti
 
 - `PV`
 - `battery`
+- `controllable load`
 - `EV charger`
 - `heat pump`
 

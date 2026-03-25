@@ -80,6 +80,7 @@ Above discovery, Helios now builds a canonical site model for:
 - `grid_meter`
 - `ev_charger`
 - `heat_pump`
+- `controllable_load`
 - `uncontrolled_load`
 
 The HEMS backend then:

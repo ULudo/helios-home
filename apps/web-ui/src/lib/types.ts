@@ -96,6 +96,19 @@ export interface HemsPolicyUpdate {
   step_minutes?: number;
 }
 
+export interface HemsCommandContractRead {
+  command_key: string;
+  value_type: string;
+  unit: string | null;
+  minimum: number | null;
+  maximum: number | null;
+  allowed_values: string[];
+  adapter_name: string | null;
+  validation_state: string;
+  requires_native_writes: boolean;
+  safety_checks: string[];
+}
+
 export interface HemsAssetRead {
   asset_key: string;
   asset_type: string;
@@ -105,6 +118,7 @@ export interface HemsAssetRead {
   eligibility: string;
   telemetry: Record<string, string | number | boolean>;
   constraints: Record<string, string | number | boolean>;
+  command_contract: HemsCommandContractRead | null;
   reasons: string[];
 }
 

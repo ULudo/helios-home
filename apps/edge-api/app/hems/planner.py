@@ -21,6 +21,8 @@ def _require_solver() -> tuple[object, object]:
 
 
 def _asset_command_key(asset: CanonicalAsset) -> str:
+    if asset.command_contract is not None and asset.command_contract.command_key:
+        return asset.command_contract.command_key
     if asset.asset_type == "battery":
         return "set_power_kw"
     if asset.asset_type == "ev_charger":
@@ -109,6 +111,7 @@ def solve_site_plan(site_model: SiteModel) -> PlanningResult:
     battery_outputs: dict[str, dict[str, object]] = {}
     ev_outputs: dict[str, dict[str, object]] = {}
     heat_outputs: dict[str, dict[str, object]] = {}
+    load_outputs: dict[str, dict[str, object]] = {}
     pv_outputs: dict[str, dict[str, object]] = {}
 
     for asset in dispatchable_assets:
@@ -202,6 +205,46 @@ def solve_site_plan(site_model: SiteModel) -> PlanningResult:
                 "temperature_c": temperature_c,
                 "lower_slack": lower_slack,
                 "upper_slack": upper_slack,
+            }
+
+        elif asset.asset_type == "controllable_load":
+            constraint_set = asset.constraints
+            nominal_power_kw = float(constraint_set.get("nominal_power_kw", 0.25))
+            runtime_target_steps = max(0, int(constraint_set.get("runtime_target_steps", 0)))
+            minimum_on_steps = max(1, ceil(float(constraint_set.get("minimum_on_minutes", forecast.step_minutes)) / forecast.step_minutes))
+
+            on_state = cvxpy.Variable(steps, boolean=True, name=f"{asset.asset_key}_on_state")
+            start_state = cvxpy.Variable(steps, boolean=True, name=f"{asset.asset_key}_start_state")
+            power_kw = nominal_power_kw * on_state
+            constraints += [
+                start_state[0] >= on_state[0],
+                start_state[0] <= on_state[0],
+            ]
+            for step in range(1, steps):
+                constraints.append(start_state[step] >= on_state[step] - on_state[step - 1])
+                constraints.append(start_state[step] <= 1 - on_state[step - 1])
+                constraints.append(start_state[step] <= on_state[step])
+
+            for step in range(steps):
+                if step + minimum_on_steps > steps:
+                    constraints.append(start_state[step] == 0)
+                    continue
+                for hold_step in range(step, min(steps, step + minimum_on_steps)):
+                    constraints.append(on_state[hold_step] >= start_state[step])
+
+            runtime_shortfall = None
+            if runtime_target_steps > 0:
+                runtime_shortfall = cvxpy.Variable(nonneg=True, name=f"{asset.asset_key}_runtime_shortfall")
+                constraints.append(cvxpy.sum(on_state) + runtime_shortfall >= runtime_target_steps)
+                objective_terms.append(20.0 * runtime_shortfall)
+            objective_terms.append(0.02 * cvxpy.sum(start_state))
+            net_demand_terms.append(power_kw)
+            load_outputs[asset.asset_key] = {
+                "on_state": on_state,
+                "power_kw": power_kw,
+                "start_state": start_state,
+                "runtime_shortfall": runtime_shortfall,
+                "runtime_target_steps": runtime_target_steps,
             }
 
         elif asset.asset_type == "pv_inverter":
@@ -359,6 +402,43 @@ def solve_site_plan(site_model: SiteModel) -> PlanningResult:
                         ends_at=ends_at,
                         command={_asset_command_key(asset): round(heat_series[step], 4)},
                         predicted_state={"temperature_c": round(temperature_series[step + 1], 3)},
+                    )
+                )
+
+        elif asset.asset_key in load_outputs:
+            output = load_outputs[asset.asset_key]
+            on_series = _float_series(output["on_state"].value)
+            power_series = _float_series(output["power_kw"].value)
+            runtime_shortfall = output["runtime_shortfall"]
+            if runtime_shortfall is not None and float(runtime_shortfall.value) > 0.05:
+                violations.append(
+                    {
+                        "asset_key": asset.asset_key,
+                        "severity": HemsViolationSeverity.WARNING.value,
+                        "violation_type": "runtime_target_soft_violation",
+                        "message": "The controllable load could not satisfy its requested runtime target within the planning horizon.",
+                        "details": {
+                            "runtime_shortfall_steps": round(float(runtime_shortfall.value), 3),
+                            "runtime_target_steps": int(output["runtime_target_steps"]),
+                        },
+                    }
+                )
+            for step in range(steps):
+                starts_at = forecast.horizon_start + timedelta(minutes=step * forecast.step_minutes)
+                ends_at = starts_at + timedelta(minutes=forecast.step_minutes)
+                is_on = on_series[step] >= 0.5
+                intervals.append(
+                    PlannedInterval(
+                        asset_key=asset.asset_key,
+                        asset_type=asset.asset_type,
+                        device_id=asset.device_id,
+                        starts_at=starts_at,
+                        ends_at=ends_at,
+                        command={_asset_command_key(asset): is_on},
+                        predicted_state={
+                            "scheduled_power_kw": round(power_series[step], 4),
+                            "relay_output_on": is_on,
+                        },
                     )
                 )
 

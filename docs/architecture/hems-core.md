@@ -26,6 +26,7 @@ It produces:
 The optimizer does not see vendor-specific device metadata directly. Discovery assets are mapped into a canonical site model with:
 
 - `battery`
+- `controllable_load`
 - `ev_charger`
 - `grid_meter`
 - `heat_pump`
@@ -72,6 +73,7 @@ The V1 optimization horizon is policy-driven and defaults to:
 V1 models included now:
 
 - battery charge / discharge with SOC dynamics and reserve floor
+- binary controllable loads with runtime targets and minimum-on windows
 - EV charging with deadline and target-SOC fulfillment pressure
 - heat-pump comfort-band shifting with a simple thermal proxy
 - exogenous PV generation and base-load forecast
@@ -137,7 +139,7 @@ This makes every plan, interval and dispatch outcome inspectable after the fact.
 
 The current HEMS core intentionally does not yet include:
 
-- frontend HEMS pages
+- rich end-user control workflows
 - production device write adapters
 - advanced building physics models
 - shared cloud coordination
