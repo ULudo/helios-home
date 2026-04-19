@@ -2,9 +2,9 @@
 
 Base URL: `/api/v1`
 
-The current stable frontend-facing API is intentionally small and aligned with the Devices page.
+The current stable frontend-facing API is centered on the Helios assistant workspace.
 
-The backend also exposes a first HEMS control API for local development and backend validation.
+The backend also exposes HEMS inspection and planning endpoints for advanced use and runtime validation.
 
 ## Health
 
@@ -20,7 +20,7 @@ Returns a minimal liveness payload:
 
 ### `GET /overview`
 
-Returns the full payload used by the Devices page:
+Returns the device inventory and current site scope used by the advanced runtime view:
 
 - current site scope
 - integrated devices
@@ -56,6 +56,80 @@ Runs a discovery cycle against the currently configured subnet scope and returns
 - new device ids
 - candidate count
 - integrated device count
+
+## Agent workspace
+
+### `GET /agent/thread`
+
+Returns the current conversation thread, including:
+
+- persisted user and assistant messages
+- pending confirmation proposals
+- current setup profile
+- latest debug case summary, if present
+
+### `GET /agent/provider-config`
+
+Returns the current assistant model-provider configuration state:
+
+- selected provider
+- effective provider used at runtime
+- readiness status and message
+- configured provider options
+
+The response never returns stored credentials.
+
+### `PATCH /agent/provider-config`
+
+Updates the local assistant model-provider configuration.
+
+Example body:
+
+```json
+{
+  "provider_id": "openai",
+  "model": "your-model-id",
+  "base_url": "https://api.openai.com/v1",
+  "api_key": "sk-..."
+}
+```
+
+### `GET /agent/setup-profile`
+
+Returns the current setup memory:
+
+- confirmed systems
+- unresolved setup questions
+- saved user notes
+
+### `POST /agent/messages`
+
+Creates a user message and starts a new assistant turn.
+
+Request body:
+
+```json
+{
+  "content": "I want to integrate my heat pump."
+}
+```
+
+### `GET /agent/turns/{turn_id}/events`
+
+Streams the turn as Server-Sent Events, including:
+
+- assistant text deltas
+- tool start/finish events
+- proposal creation events
+- final assistant message
+
+### `POST /agent/proposals/{proposal_id}/confirm`
+
+Confirms a pending action proposal and applies the associated setup change.
+
+### `POST /agent/proposals/{proposal_id}/reject`
+
+Rejects a pending action proposal and leaves the current setup unchanged.
 
 ## HEMS
 

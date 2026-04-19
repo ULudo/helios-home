@@ -1,60 +1,34 @@
-import { useEffect, useRef, useState, type ChangeEvent, type TouchEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 import { CapabilityPill } from "./components/CapabilityPill";
 import { StatusBadge } from "./components/StatusBadge";
 import { api } from "./lib/api";
 import type {
+  ActionProposalRead,
+  AgentMessageRead,
+  AgentProviderConfigRead,
+  AgentProviderOptionRead,
+  AgentThreadRead,
+  AgentTurnEventRead,
   DeviceRead,
-  HemsAssetRead,
-  HemsDispatchEventRead,
-  HemsPlanIntervalRead,
   HemsPlanRead,
-  HemsPolicyRead,
   HemsSummaryRead,
   OverviewResponse,
   ReachableSubnetRead,
 } from "./lib/types";
 
-type PageKey = "devices" | "hems";
-type DevicePanelView = "details" | "monitoring";
-
-type TelemetrySample = {
-  recordedAt: string;
-  metrics: Record<string, number>;
+type ActivityEntry = {
+  id: string;
+  tone: "neutral" | "positive" | "critical";
+  title: string;
+  detail: string;
+  createdAt: string;
 };
-
-const MAX_TELEMETRY_SAMPLES = 48;
 
 function humanize(value: string): string {
   return value.split("_").join(" ");
-}
-
-function humanizeLabel(value: string): string {
-  const text = humanize(value);
-  return text.charAt(0).toUpperCase() + text.slice(1);
-}
-
-function formatNumber(value: number): string {
-  if (Math.abs(value) >= 100) {
-    return value.toFixed(0);
-  }
-  if (Math.abs(value) >= 10) {
-    return value.toFixed(1);
-  }
-  return value.toFixed(2).replace(/\.?0+$/, "");
-}
-
-function formatValue(value: string | number | boolean | null | undefined): string {
-  if (value === null || value === undefined || value === "") {
-    return "—";
-  }
-  if (typeof value === "boolean") {
-    return value ? "Yes" : "No";
-  }
-  if (typeof value === "number") {
-    return formatNumber(value);
-  }
-  return String(value);
 }
 
 function formatDateTime(value: string | null | undefined): string {
@@ -73,21 +47,6 @@ function formatDateTime(value: string | null | undefined): string {
   }).format(parsed);
 }
 
-function formatClockTime(value: string): string {
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) {
-    return value;
-  }
-  return new Intl.DateTimeFormat(undefined, {
-    hour: "2-digit",
-    minute: "2-digit",
-  }).format(parsed);
-}
-
-function formatTimeRange(startsAt: string, endsAt: string): string {
-  return `${formatClockTime(startsAt)} - ${formatClockTime(endsAt)}`;
-}
-
 function parseConfiguredSubnets(rawValue: string): string[] {
   return rawValue
     .split(/[\n,;]+/)
@@ -95,380 +54,155 @@ function parseConfiguredSubnets(rawValue: string): string[] {
     .filter(Boolean);
 }
 
-function serializeSubnets(subnets: string[]): string {
-  return subnets.join(", ");
+function trimMessagePreview(value: string, maxLength = 180): string {
+  const normalized = value.trim();
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+  return `${normalized.slice(0, maxLength - 1)}…`;
 }
 
-function toNumber(value: string | number | boolean): number | null {
-  if (typeof value === "number" && Number.isFinite(value)) {
-    return value;
+function activityFromEvent(event: AgentTurnEventRead): ActivityEntry | null {
+  if (event.event_type === "tool_started") {
+    return {
+      id: `${event.turn_id}-${event.event_type}-${event.created_at}`,
+      tone: "neutral",
+      title: `Running ${humanize(String(event.payload.tool_name ?? "tool"))}`,
+      detail: "Helios is gathering more context.",
+      createdAt: event.created_at,
+    };
   }
-  if (typeof value === "string") {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : null;
+  if (event.event_type === "tool_finished") {
+    return {
+      id: `${event.turn_id}-${event.event_type}-${event.created_at}`,
+      tone: "positive",
+      title: `${humanize(String(event.payload.tool_name ?? "tool"))} finished`,
+      detail: trimMessagePreview(JSON.stringify(event.payload.result ?? {}), 140),
+      createdAt: event.created_at,
+    };
+  }
+  if (event.event_type === "proposal_created") {
+    return {
+      id: `${event.turn_id}-${event.event_type}-${event.created_at}`,
+      tone: "neutral",
+      title: "Confirmation needed",
+      detail: String(event.payload.summary ?? "Helios prepared the next setup action."),
+      createdAt: event.created_at,
+    };
+  }
+  if (event.event_type === "error") {
+    return {
+      id: `${event.turn_id}-${event.event_type}-${event.created_at}`,
+      tone: "critical",
+      title: "Agent turn failed",
+      detail: String(event.payload.message ?? "Unknown error."),
+      createdAt: event.created_at,
+    };
   }
   return null;
 }
 
-function extractNumericTelemetry(device: DeviceRead): Record<string, number> {
-  const metrics: Record<string, number> = {};
-  Object.entries(device.telemetry).forEach(([key, value]) => {
-    const numericValue = toNumber(value);
-    if (numericValue !== null) {
-      metrics[key] = numericValue;
-    }
-  });
-  return metrics;
+function messageTone(role: string): string {
+  if (role === "user") {
+    return "message-user";
+  }
+  if (role === "assistant") {
+    return "message-assistant";
+  }
+  return "message-system";
 }
 
-function appendTelemetrySamples(
-  previous: Record<string, TelemetrySample[]>,
-  devices: DeviceRead[],
-): Record<string, TelemetrySample[]> {
-  const nextHistory = { ...previous };
-
-  devices.forEach((device) => {
-    const metrics = extractNumericTelemetry(device);
-    if (Object.keys(metrics).length === 0) {
-      return;
-    }
-
-    const sample: TelemetrySample = {
-      recordedAt: device.last_seen_at ?? new Date().toISOString(),
-      metrics,
-    };
-    const existingSamples = nextHistory[device.id] ?? [];
-    const lastSample = existingSamples[existingSamples.length - 1];
-
-    if (lastSample && lastSample.recordedAt === sample.recordedAt) {
-      return;
-    }
-
-    nextHistory[device.id] = [...existingSamples, sample].slice(-MAX_TELEMETRY_SAMPLES);
-  });
-
-  return nextHistory;
-}
-
-function metricKeysForDevice(device: DeviceRead, samples: TelemetrySample[]): string[] {
-  const metricKeys = new Set<string>(Object.keys(extractNumericTelemetry(device)));
-  samples.forEach((sample) => {
-    Object.keys(sample.metrics).forEach((key) => metricKeys.add(key));
-  });
-  return Array.from(metricKeys).sort();
-}
-
-function buildChartGeometry(samples: TelemetrySample[], metricKey: string) {
-  const width = 680;
-  const height = 210;
-  const paddingX = 16;
-  const paddingTop = 12;
-  const paddingBottom = 18;
-  const values = samples
-    .map((sample) => sample.metrics[metricKey])
-    .filter((value): value is number => typeof value === "number" && Number.isFinite(value));
-
-  if (values.length === 0) {
-    return null;
+function renderProposalSummary(proposal: ActionProposalRead): string {
+  if (proposal.action_type === "confirm_system_binding") {
+    return String(proposal.payload.label ?? proposal.summary);
   }
-
-  const minValue = Math.min(...values);
-  const maxValue = Math.max(...values);
-  const range = maxValue - minValue || 1;
-  const stepX = values.length === 1 ? 0 : (width - paddingX * 2) / (values.length - 1);
-  const chartHeight = height - paddingTop - paddingBottom;
-
-  const points = values.map((value, index) => {
-    const x = paddingX + stepX * index;
-    const normalized = (value - minValue) / range;
-    const y = paddingTop + (1 - normalized) * chartHeight;
-    return { x, y, value };
-  });
-
-  const linePath = points
-    .map((point, index) => `${index === 0 ? "M" : "L"} ${point.x.toFixed(2)} ${point.y.toFixed(2)}`)
-    .join(" ");
-  const areaPath = `${linePath} L ${points[points.length - 1]?.x.toFixed(2)} ${(height - paddingBottom).toFixed(2)} L ${points[0]?.x.toFixed(2)} ${(height - paddingBottom).toFixed(2)} Z`;
-
-  return {
-    width,
-    height,
-    minValue,
-    maxValue,
-    points,
-    linePath,
-    areaPath,
-  };
-}
-
-function summarizeEntries(
-  values: Record<string, string | number | boolean>,
-  limit = 4,
-): Array<[string, string | number | boolean]> {
-  return Object.entries(values).slice(0, limit);
-}
-
-function commandSummary(command: Record<string, string | number | boolean>): string {
-  const entries = summarizeEntries(command, 3);
-  if (entries.length === 0) {
-    return "Idle";
+  if (proposal.action_type === "update_site_scope") {
+    return String(proposal.payload.local_subnet ?? proposal.summary);
   }
-  return entries.map(([key, value]) => `${humanize(key)} ${formatValue(value)}`).join(" • ");
-}
-
-function commandContractSummary(asset: HemsAssetRead): string {
-  const contract = asset.command_contract;
-  if (!contract) {
-    return "No HEMS command contract is validated for this asset yet.";
-  }
-
-  const parts = [humanize(contract.command_key), humanize(contract.validation_state)];
-  if (contract.minimum !== null || contract.maximum !== null) {
-    const minText = contract.minimum !== null ? formatNumber(contract.minimum) : "open";
-    const maxText = contract.maximum !== null ? formatNumber(contract.maximum) : "open";
-    const unitText = contract.unit ? ` ${contract.unit}` : "";
-    parts.push(`${minText} to ${maxText}${unitText}`);
-  }
-  if (contract.adapter_name) {
-    parts.push(humanize(contract.adapter_name));
-  }
-  return parts.join(" • ");
-}
-
-function toneForEligibility(eligibility: string): string {
-  if (eligibility === "dispatchable") {
-    return "tone-positive";
-  }
-  if (eligibility === "plan_only") {
-    return "tone-caution";
-  }
-  if (eligibility === "blocked") {
-    return "tone-critical";
-  }
-  return "tone-muted";
-}
-
-function toneForDispatchStatus(status: string): string {
-  if (status === "applied") {
-    return "tone-positive";
-  }
-  if (status === "simulated") {
-    return "tone-neutral";
-  }
-  if (status === "blocked" || status === "failed") {
-    return "tone-critical";
-  }
-  return "tone-caution";
-}
-
-function toneForViolationSeverity(severity: string): string {
-  if (severity === "info") {
-    return "tone-neutral";
-  }
-  if (severity === "warning") {
-    return "tone-caution";
-  }
-  return "tone-critical";
-}
-
-function buildPolicyPayload(policy: HemsPolicyRead) {
-  return {
-    execution_mode: policy.execution_mode,
-    battery_reserve_pct: policy.battery_reserve_pct,
-    ev_default_target_soc_pct: policy.ev_default_target_soc_pct,
-    ev_default_departure_time: policy.ev_default_departure_time,
-    heat_comfort_min_c: policy.heat_comfort_min_c,
-    heat_comfort_max_c: policy.heat_comfort_max_c,
-    grid_import_limit_kw: policy.grid_import_limit_kw,
-    grid_export_limit_kw: policy.grid_export_limit_kw,
-    allow_price_arbitrage: policy.allow_price_arbitrage,
-    allow_heat_precharge: policy.allow_heat_precharge,
-    allow_ev_load_shifting: policy.allow_ev_load_shifting,
-    horizon_hours: policy.horizon_hours,
-    step_minutes: policy.step_minutes,
-  };
-}
-
-function planIntervalsByAsset(plan: HemsPlanRead | null, assets: HemsAssetRead[]) {
-  if (!plan) {
-    return [];
-  }
-
-  const assetsByKey = new Map(assets.map((asset) => [asset.asset_key, asset]));
-  const grouped = new Map<string, HemsPlanIntervalRead[]>();
-  plan.intervals.forEach((interval) => {
-    const current = grouped.get(interval.asset_key) ?? [];
-    current.push(interval);
-    grouped.set(interval.asset_key, current);
-  });
-
-  return Array.from(grouped.entries())
-    .map(([assetKey, intervals]) => ({
-      assetKey,
-      asset: assetsByKey.get(assetKey) ?? null,
-      intervals: intervals.sort((left, right) => left.starts_at.localeCompare(right.starts_at)),
-    }))
-    .sort((left, right) => left.assetKey.localeCompare(right.assetKey));
-}
-
-function MonitoringPanel({
-  device,
-  samples,
-  selectedMetric,
-  onSelectMetric,
-}: {
-  device: DeviceRead;
-  samples: TelemetrySample[];
-  selectedMetric: string | null;
-  onSelectMetric: (metricKey: string) => void;
-}) {
-  const metrics = metricKeysForDevice(device, samples);
-  const activeMetric = selectedMetric && metrics.includes(selectedMetric) ? selectedMetric : metrics[0] ?? null;
-  const chart = activeMetric ? buildChartGeometry(samples, activeMetric) : null;
-
-  if (metrics.length === 0 || activeMetric === null) {
-    return (
-      <div className="monitoring-panel">
-        <div className="monitoring-header">
-          <div>
-            <h4>Monitoring</h4>
-            <p className="inline-note">No numeric telemetry history has been recorded for this device yet.</p>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <div className="monitoring-panel">
-      <div className="monitoring-header">
-        <div>
-          <h4>Monitoring</h4>
-          <p className="inline-note">Session-based history built from repeated refreshes and discovery runs.</p>
-        </div>
-        <div className="monitoring-stats">
-          <span className="soft-tag">{humanize(activeMetric)}</span>
-          <span className="soft-tag">{samples.length} samples</span>
-        </div>
-      </div>
-
-      <div className="device-detail-tabs monitoring-metric-picker">
-        {metrics.map((metricKey) => (
-          <button
-            key={metricKey}
-            type="button"
-            className={`metric-chip ${metricKey === activeMetric ? "active" : ""}`}
-            onClick={() => onSelectMetric(metricKey)}
-          >
-            {humanize(metricKey)}
-          </button>
-        ))}
-      </div>
-
-      {chart ? (
-        <>
-          <svg className="monitoring-chart" viewBox={`0 0 ${chart.width} ${chart.height}`} preserveAspectRatio="none">
-            <defs>
-              <linearGradient id={`monitoring-fill-${device.id}`} x1="0" x2="0" y1="0" y2="1">
-                <stop offset="0%" stopColor="rgba(45, 120, 96, 0.24)" />
-                <stop offset="100%" stopColor="rgba(45, 120, 96, 0.02)" />
-              </linearGradient>
-            </defs>
-            <path
-              className="monitoring-area"
-              d={chart.areaPath}
-              fill={`url(#monitoring-fill-${device.id})`}
-            />
-            <path className="monitoring-line" d={chart.linePath} fill="none" />
-            {chart.points.map((point, index) => (
-              <circle
-                key={`${activeMetric}-${index}`}
-                className="monitoring-dot"
-                cx={point.x}
-                cy={point.y}
-                r="4"
-              />
-            ))}
-          </svg>
-          <div className="monitoring-footer">
-            <span>
-              Range {formatNumber(chart.minValue)} - {formatNumber(chart.maxValue)}
-            </span>
-            <span>
-              Latest {formatValue(samples[samples.length - 1]?.metrics[activeMetric])} at{" "}
-              {formatDateTime(samples[samples.length - 1]?.recordedAt)}
-            </span>
-          </div>
-        </>
-      ) : null}
-    </div>
-  );
+  return proposal.summary;
 }
 
 export default function App() {
-  const [currentPage, setCurrentPage] = useState<PageKey>("devices");
+  const [thread, setThread] = useState<AgentThreadRead | null>(null);
+  const [agentProviderConfig, setAgentProviderConfig] = useState<AgentProviderConfigRead | null>(null);
   const [overview, setOverview] = useState<OverviewResponse | null>(null);
   const [reachableSubnets, setReachableSubnets] = useState<ReachableSubnetRead[]>([]);
-  const [selectedSubnets, setSelectedSubnets] = useState<string[]>([]);
-  const [selectedDeviceId, setSelectedDeviceId] = useState<string | null>(null);
-  const [devicePanelViews, setDevicePanelViews] = useState<Record<string, DevicePanelView>>({});
-  const [deviceMetricSelection, setDeviceMetricSelection] = useState<Record<string, string>>({});
-  const [telemetryHistory, setTelemetryHistory] = useState<Record<string, TelemetrySample[]>>({});
   const [hemsSummary, setHemsSummary] = useState<HemsSummaryRead | null>(null);
-  const [hemsAssets, setHemsAssets] = useState<HemsAssetRead[]>([]);
   const [hemsPlan, setHemsPlan] = useState<HemsPlanRead | null>(null);
-  const [policyDraft, setPolicyDraft] = useState<HemsPolicyRead | null>(null);
-  const [policyDirty, setPolicyDirty] = useState(false);
+  const [draft, setDraft] = useState("");
   const [loading, setLoading] = useState(true);
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const touchStartX = useRef<Record<string, number>>({});
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [activities, setActivities] = useState<ActivityEntry[]>([]);
+  const [activeTurnId, setActiveTurnId] = useState<string | null>(null);
+  const [streamingAssistant, setStreamingAssistant] = useState<AgentMessageRead | null>(null);
+  const [providerForm, setProviderForm] = useState({
+    providerId: "stub",
+    model: "",
+    baseUrl: "",
+    apiKey: "",
+  });
+  const streamRef = useRef<EventSource | null>(null);
+  const timelineRef = useRef<HTMLDivElement | null>(null);
 
-  async function refreshOverviewSnapshot(silent = false) {
-    if (!silent) {
-      setBusyAction("refresh-devices");
-    }
+  const currentScope = useMemo(
+    () => parseConfiguredSubnets(overview?.site.local_subnet ?? ""),
+    [overview?.site.local_subnet],
+  );
 
-    try {
-      const nextOverview = await api.getOverview();
-      setOverview(nextOverview);
-      setSelectedSubnets(parseConfiguredSubnets(nextOverview.site.local_subnet));
-      setTelemetryHistory((previous) => appendTelemetrySamples(previous, nextOverview.devices));
-    } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "Unable to refresh devices.");
-    } finally {
-      if (!silent) {
-        setBusyAction(null);
-      }
+  const timelineMessages = useMemo(() => {
+    const persisted = thread?.messages ?? [];
+    if (streamingAssistant === null) {
+      return persisted;
     }
+    return [...persisted, streamingAssistant];
+  }, [thread?.messages, streamingAssistant]);
+
+  const selectedProviderOption = useMemo<AgentProviderOptionRead | null>(() => {
+    if (agentProviderConfig === null) {
+      return null;
+    }
+    return (
+      agentProviderConfig.provider_options.find((option) => option.provider_id === providerForm.providerId) ??
+      agentProviderConfig.provider_options.find((option) => option.selected) ??
+      null
+    );
+  }, [agentProviderConfig, providerForm.providerId]);
+
+  function syncProviderForm(config: AgentProviderConfigRead, providerId?: string) {
+    const option =
+      config.provider_options.find((entry) => entry.provider_id === (providerId ?? config.selected_provider)) ??
+      config.provider_options.find((entry) => entry.selected) ??
+      config.provider_options[0];
+    if (!option) {
+      return;
+    }
+    setProviderForm({
+      providerId: option.provider_id,
+      model: option.model ?? "",
+      baseUrl: option.base_url ?? option.base_url_default ?? "",
+      apiKey: "",
+    });
   }
 
-  async function refreshHemsData(options?: { preserveDraft?: boolean; silent?: boolean }) {
-    if (!options?.silent) {
-      setBusyAction("refresh-hems");
-    }
-
-    try {
-      const [summary, assets, latestPlan] = await Promise.all([
-        api.getHemsSummary(),
-        api.listHemsAssets(),
-        api.getLatestHemsPlan(),
-      ]);
-      setHemsSummary(summary);
-      setHemsAssets(assets);
-      setHemsPlan(latestPlan);
-      if (!options?.preserveDraft || policyDraft === null || !policyDirty) {
-        setPolicyDraft(summary.policy);
-        setPolicyDirty(false);
-      }
-    } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "Unable to refresh HEMS.");
-    } finally {
-      if (!options?.silent) {
-        setBusyAction(null);
-      }
-    }
+  async function refreshAll() {
+    const [nextThread, nextProviderConfig, nextOverview, nextSubnets, nextHemsSummary, nextPlan] = await Promise.all([
+      api.getAgentThread(),
+      api.getAgentProviderConfig(),
+      api.getOverview(),
+      api.listReachableSubnets(),
+      api.getHemsSummary(),
+      api.getLatestHemsPlan(),
+    ]);
+    setThread(nextThread);
+    setAgentProviderConfig(nextProviderConfig);
+    setOverview(nextOverview);
+    setReachableSubnets(nextSubnets);
+    setHemsSummary(nextHemsSummary);
+    setHemsPlan(nextPlan);
+    syncProviderForm(nextProviderConfig);
   }
 
   useEffect(() => {
@@ -476,22 +210,7 @@ export default function App() {
       setLoading(true);
       setError(null);
       try {
-        const [nextOverview, nextSubnets, summary, assets, latestPlan] = await Promise.all([
-          api.getOverview(),
-          api.listReachableSubnets(),
-          api.getHemsSummary(),
-          api.listHemsAssets(),
-          api.getLatestHemsPlan(),
-        ]);
-
-        setOverview(nextOverview);
-        setReachableSubnets(nextSubnets);
-        setSelectedSubnets(parseConfiguredSubnets(nextOverview.site.local_subnet));
-        setTelemetryHistory((previous) => appendTelemetrySamples(previous, nextOverview.devices));
-        setHemsSummary(summary);
-        setHemsAssets(assets);
-        setHemsPlan(latestPlan);
-        setPolicyDraft(summary.policy);
+        await refreshAll();
       } catch (requestError) {
         setError(requestError instanceof Error ? requestError.message : "Unable to load Helios Home.");
       } finally {
@@ -500,808 +219,627 @@ export default function App() {
     }
 
     void bootstrap();
+
+    return () => {
+      streamRef.current?.close();
+    };
   }, []);
 
   useEffect(() => {
-    if (currentPage !== "devices") {
-      return undefined;
-    }
-
-    const intervalId = window.setInterval(() => {
-      void refreshOverviewSnapshot(true);
-    }, 20000);
-
-    return () => window.clearInterval(intervalId);
-  }, [currentPage]);
-
-  function toggleSubnet(cidr: string) {
-    setSelectedSubnets((previous) =>
-      previous.includes(cidr) ? previous.filter((entry) => entry !== cidr) : [...previous, cidr],
-    );
-  }
-
-  async function handleDiscoveryRun() {
-    if (overview === null) {
+    if (!timelineRef.current) {
       return;
     }
+    timelineRef.current.scrollTop = timelineRef.current.scrollHeight;
+  }, [timelineMessages, activities]);
 
-    setBusyAction("run-discovery");
-    setError(null);
-    setNotice(null);
+  function startStream(turnId: string) {
+    streamRef.current?.close();
+    streamRef.current = api.streamAgentTurn(turnId, {
+      onEvent: (event) => {
+        if (event.event_type === "assistant_delta") {
+          const delta = String(event.payload.delta ?? "");
+          setStreamingAssistant((current) => {
+            if (current === null) {
+              return {
+                id: `stream-${turnId}`,
+                role: "assistant",
+                content: delta,
+                status: "streaming",
+                created_at: event.created_at,
+                turn_id: turnId,
+              };
+            }
+            return { ...current, content: `${current.content}${delta}` };
+          });
+        }
 
-    try {
-      const nextScope = serializeSubnets(selectedSubnets);
-      if (nextScope !== overview.site.local_subnet) {
-        await api.updateSite({ local_subnet: nextScope });
-      }
+        if (event.event_type === "assistant_message_completed") {
+          const nextMessage = event.payload.message as AgentMessageRead | undefined;
+          if (nextMessage) {
+            setThread((current) => {
+              if (current === null) {
+                return current;
+              }
+              return {
+                ...current,
+                messages: [...current.messages, nextMessage],
+              };
+            });
+          }
+          setStreamingAssistant(null);
+        }
 
-      const discoveryRun = await api.runDiscovery();
-      const [nextOverview, nextSummary, nextAssets, latestPlan] = await Promise.all([
-        api.getOverview(),
-        api.getHemsSummary(),
-        api.listHemsAssets(),
-        api.getLatestHemsPlan(),
-      ]);
+        const nextActivity = activityFromEvent(event);
+        if (nextActivity !== null) {
+          setActivities((current) => [nextActivity, ...current].slice(0, 16));
+        }
 
-      setOverview(nextOverview);
-      setSelectedSubnets(parseConfiguredSubnets(nextOverview.site.local_subnet));
-      setTelemetryHistory((previous) => appendTelemetrySamples(previous, nextOverview.devices));
-      setHemsSummary(nextSummary);
-      setHemsAssets(nextAssets);
-      setHemsPlan(latestPlan);
-      if (!policyDirty) {
-        setPolicyDraft(nextSummary.policy);
-      }
-      setNotice(
-        `Discovery refreshed ${discoveryRun.refreshed_devices} devices and integrated ${discoveryRun.integrated_devices}.`,
-      );
-    } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "Unable to run discovery.");
-    } finally {
-      setBusyAction(null);
-    }
-  }
+        if (event.event_type === "proposal_created") {
+          setNotice("Helios prepared the next setup action for confirmation.");
+        }
 
-  async function handleRefreshDevices() {
-    setError(null);
-    setNotice(null);
-    await Promise.all([refreshOverviewSnapshot(), api.listReachableSubnets().then(setReachableSubnets)]);
-  }
-
-  async function handleRefreshHems() {
-    setError(null);
-    setNotice(null);
-    await refreshHemsData({ preserveDraft: true });
-  }
-
-  function updatePolicyField<K extends keyof HemsPolicyRead>(field: K, value: HemsPolicyRead[K]) {
-    setPolicyDraft((current) => {
-      if (current === null) {
-        return current;
-      }
-      return { ...current, [field]: value };
+        if (event.event_type === "error") {
+          setError(String(event.payload.message ?? "The agent turn failed."));
+        }
+      },
+      onError: (streamError) => {
+        setActiveTurnId(null);
+        setStreamingAssistant(null);
+        setError(streamError.message);
+      },
+      onEnd: () => {
+        setActiveTurnId(null);
+        setStreamingAssistant(null);
+        void refreshAll();
+      },
     });
-    setPolicyDirty(true);
   }
 
-  function handlePolicyNumberChange(field: keyof HemsPolicyRead) {
-    return (event: ChangeEvent<HTMLInputElement>) => {
-      const nextValue = Number(event.target.value);
-      updatePolicyField(field, Number.isFinite(nextValue) ? nextValue : 0);
-    };
-  }
-
-  function handlePolicyTextChange(field: keyof HemsPolicyRead) {
-    return (event: ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
-      updatePolicyField(field, event.target.value);
-    };
-  }
-
-  function handlePolicyToggle(field: keyof HemsPolicyRead) {
-    return (event: ChangeEvent<HTMLInputElement>) => {
-      updatePolicyField(field, event.target.checked);
-    };
-  }
-
-  async function handleReplan() {
-    if (policyDraft === null) {
+  async function sendMessage(content: string) {
+    const normalized = content.trim();
+    if (!normalized || activeTurnId !== null) {
       return;
     }
-
-    setBusyAction("run-replan");
+    setBusyAction("send-message");
     setError(null);
     setNotice(null);
-
     try {
-      if (policyDirty) {
-        const updatedPolicy = await api.updateHemsPolicy(buildPolicyPayload(policyDraft));
-        setPolicyDraft(updatedPolicy);
-        setPolicyDirty(false);
-      }
-
-      const nextPlan = await api.runHemsReplan();
-      const [summary, assets] = await Promise.all([api.getHemsSummary(), api.listHemsAssets()]);
-      setHemsPlan(nextPlan);
-      setHemsSummary(summary);
-      setHemsAssets(assets);
-      setPolicyDraft(summary.policy);
-      setNotice("HEMS plan refreshed from the current asset snapshot and policy.");
+      const accepted = await api.createAgentMessage({ content: normalized });
+      setThread((current) => {
+        if (current === null) {
+          return current;
+        }
+        return {
+          ...current,
+          messages: [...current.messages, accepted.user_message],
+        };
+      });
+      setDraft("");
+      setStreamingAssistant({
+        id: `stream-${accepted.turn_id}`,
+        role: "assistant",
+        content: "",
+        status: "streaming",
+        created_at: new Date().toISOString(),
+        turn_id: accepted.turn_id,
+      });
+      setActiveTurnId(accepted.turn_id);
+      startStream(accepted.turn_id);
     } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "Unable to replan HEMS.");
+      setError(requestError instanceof Error ? requestError.message : "Unable to send your message.");
+      setStreamingAssistant(null);
+      setActiveTurnId(null);
     } finally {
       setBusyAction(null);
     }
   }
 
-  function toggleDevice(deviceId: string) {
-    setSelectedDeviceId((current) => (current === deviceId ? null : deviceId));
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    await sendMessage(draft);
   }
 
-  function changeDevicePanelView(deviceId: string, view: DevicePanelView) {
-    setDevicePanelViews((current) => ({ ...current, [deviceId]: view }));
-  }
-
-  function handleDeviceTouchStart(deviceId: string, event: TouchEvent<HTMLDivElement>) {
-    touchStartX.current[deviceId] = event.touches[0]?.clientX ?? 0;
-  }
-
-  function handleDeviceTouchEnd(deviceId: string, event: TouchEvent<HTMLDivElement>) {
-    const start = touchStartX.current[deviceId];
-    const end = event.changedTouches[0]?.clientX ?? start;
-    const delta = end - start;
-
-    if (Math.abs(delta) < 40) {
-      return;
+  async function handleProposalDecision(proposalId: string, decision: "confirm" | "reject") {
+    setBusyAction(`${decision}-proposal`);
+    setError(null);
+    setNotice(null);
+    try {
+      const result =
+        decision === "confirm"
+          ? await api.confirmAgentProposal(proposalId)
+          : await api.rejectAgentProposal(proposalId);
+      setThread(result.thread);
+      setNotice(
+        decision === "confirm"
+          ? "Helios applied your confirmation."
+          : "Helios left the current setup unchanged.",
+      );
+      await refreshAll();
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Unable to apply that decision.");
+    } finally {
+      setBusyAction(null);
     }
-
-    changeDevicePanelView(deviceId, delta < 0 ? "monitoring" : "details");
   }
 
-  function renderDeviceDetails(device: DeviceRead) {
-    const panelView = devicePanelViews[device.id] ?? "details";
-    const samples = telemetryHistory[device.id] ?? [];
-    const metric = deviceMetricSelection[device.id] ?? null;
+  async function handleProviderSave() {
+    setBusyAction("save-provider");
+    setError(null);
+    setNotice(null);
+    try {
+      const nextConfig = await api.updateAgentProviderConfig({
+        provider_id: providerForm.providerId,
+        model: selectedProviderOption?.supports_model ? providerForm.model : null,
+        base_url: selectedProviderOption?.supports_base_url ? providerForm.baseUrl : null,
+        api_key: providerForm.apiKey.trim() || null,
+      });
+      setAgentProviderConfig(nextConfig);
+      syncProviderForm(nextConfig, providerForm.providerId);
+      setNotice("Helios updated the local model provider configuration.");
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Unable to update the provider configuration.");
+    } finally {
+      setBusyAction(null);
+    }
+  }
 
-    return (
-      <div className="device-inline-details">
-        <div className="device-detail-shell">
-          <div className="device-detail-tabs" role="tablist" aria-label={`${device.name} details`}>
-            <button
-              type="button"
-              className={`device-detail-tab ${panelView === "details" ? "active" : ""}`}
-              onClick={() => changeDevicePanelView(device.id, "details")}
-            >
-              Details
-            </button>
-            <button
-              type="button"
-              className={`device-detail-tab ${panelView === "monitoring" ? "active" : ""}`}
-              onClick={() => changeDevicePanelView(device.id, "monitoring")}
-            >
-              Monitoring
-            </button>
-          </div>
-
-          <div
-            className="device-detail-carousel"
-            onTouchStart={(event) => handleDeviceTouchStart(device.id, event)}
-            onTouchEnd={(event) => handleDeviceTouchEnd(device.id, event)}
-          >
-            <div className={`device-detail-track ${panelView === "monitoring" ? "show-monitoring" : "show-details"}`}>
-              <div className="device-detail-pane">
-                <div className="panel-stack">
-                  <div className="sub-block no-border">
-                    <div className="tag-row">
-                      {device.protocols.map((protocol) => (
-                        <span key={`${device.id}-${protocol}`} className="soft-tag">
-                          {protocol}
-                        </span>
-                      ))}
-                    </div>
-                    <p className="inline-note">{device.explanation}</p>
-                  </div>
-
-                  <div className="sub-block">
-                    <h4>Capabilities</h4>
-                    <div className="tag-row">
-                      <CapabilityPill label="Visible" enabled={device.capabilities.visible} />
-                      <CapabilityPill label="Monitorable" enabled={device.capabilities.monitorable} />
-                      <CapabilityPill label="Controllable" enabled={device.capabilities.controllable} />
-                      <CapabilityPill label="Optimizable" enabled={device.capabilities.optimizable} />
-                    </div>
-                  </div>
-
-                  <div className="sub-block">
-                    <h4>Live data</h4>
-                    <dl className="data-grid">
-                      {Object.entries(device.telemetry).map(([key, value]) => (
-                        <div key={`${device.id}-${key}`} className="data-point">
-                          <dt>{humanizeLabel(key)}</dt>
-                          <dd>{formatValue(value)}</dd>
-                        </div>
-                      ))}
-                    </dl>
-                  </div>
-
-                  <div className="sub-block">
-                    <h4>Next step</h4>
-                    <p className="inline-note">{device.next_step}</p>
-                    <p className="inline-note">Last seen {formatDateTime(device.last_seen_at)}</p>
-                  </div>
-                </div>
-              </div>
-
-              <div className="device-detail-pane">
-                <MonitoringPanel
-                  device={device}
-                  samples={samples}
-                  selectedMetric={metric}
-                  onSelectMetric={(metricKey) =>
-                    setDeviceMetricSelection((current) => ({ ...current, [device.id]: metricKey }))
-                  }
-                />
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-    );
+  async function handleProviderKeyClear() {
+    setBusyAction("clear-provider-key");
+    setError(null);
+    setNotice(null);
+    try {
+      const nextConfig = await api.updateAgentProviderConfig({
+        provider_id: providerForm.providerId,
+        clear_api_key: true,
+      });
+      setAgentProviderConfig(nextConfig);
+      syncProviderForm(nextConfig, providerForm.providerId);
+      setNotice("Helios removed the stored provider key from this machine.");
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Unable to clear the provider key.");
+    } finally {
+      setBusyAction(null);
+    }
   }
 
   if (loading) {
     return (
-      <div className="loading-screen">
-        <h1>Helios Home</h1>
-        <p>Loading the local device graph and HEMS runtime.</p>
+      <div className="shell loading-shell">
+        <div className="loading-card">
+          <span className="solar-mark" aria-hidden="true">
+            ☼
+          </span>
+          <p>Loading Helios Home…</p>
+        </div>
       </div>
     );
   }
 
-  const activeTitle = currentPage === "devices" ? "Devices" : "HEMS";
-  const selectedScopeText = selectedSubnets.length > 0 ? selectedSubnets.join(", ") : "No subnet selected yet.";
-  const latestPlanHeader = hemsPlan ?? hemsSummary?.latest_plan ?? null;
-  const intervalGroups = planIntervalsByAsset(hemsPlan, hemsAssets);
-
   return (
-    <div className="app-shell">
-      <aside className="sidebar">
+    <div className="shell">
+      <aside className="shell-sidebar">
         <div className="brand-lockup">
-          <span className="brand-mark" aria-hidden="true" />
-          <h1>Helios Home</h1>
+          <span className="solar-mark" aria-hidden="true">
+            ☼
+          </span>
+          <div>
+            <h1>Helios Home</h1>
+            <p>Agent-first setup for your home's energy systems.</p>
+          </div>
         </div>
 
-        <nav className="nav-list" aria-label="Primary">
-          <button
-            type="button"
-            className={`nav-link ${currentPage === "devices" ? "active" : ""}`}
-            onClick={() => setCurrentPage("devices")}
-          >
-            Devices
-          </button>
-          <button
-            type="button"
-            className={`nav-link ${currentPage === "hems" ? "active" : ""}`}
-            onClick={() => setCurrentPage("hems")}
-          >
-            HEMS
-          </button>
-        </nav>
+        <section className="sidebar-panel">
+          <div className="panel-heading">
+            <h2>Setup progress</h2>
+            <span>{thread?.setup_profile.confirmed_systems.length ?? 0} confirmed</span>
+          </div>
+          <p className="panel-copy">{thread?.setup_profile.summary ?? "No setup state yet."}</p>
+          <div className="chip-row">
+            {(thread?.setup_profile.confirmed_systems ?? []).map((binding) => (
+              <span key={`${binding.system_type}-${binding.device_id ?? binding.label}`} className="system-chip">
+                {humanize(binding.system_type)} · {binding.label}
+              </span>
+            ))}
+          </div>
+          {(thread?.setup_profile.unresolved_items ?? []).length > 0 ? (
+            <ul className="unresolved-list">
+              {thread?.setup_profile.unresolved_items.map((item) => (
+                <li key={`${item.kind}-${item.label}`}>
+                  <strong>{humanize(item.label)}</strong>
+                  <span>{item.details || "Needs confirmation."}</span>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+        </section>
 
-        <div className="sidebar-footer">© 2026 NeurHelios</div>
+        <section className="sidebar-panel">
+          <div className="panel-heading">
+            <h2>Quick actions</h2>
+          </div>
+          <div className="quick-action-grid">
+            <button type="button" onClick={() => void sendMessage("Scan the house and tell me what you find.")}>
+              Scan the house
+            </button>
+            <button type="button" onClick={() => void sendMessage("What do you see right now?")}>
+              Summarize devices
+            </button>
+            <button type="button" onClick={() => void sendMessage("I want to integrate my heat pump.")}>
+              Integrate heat pump
+            </button>
+            <button type="button" onClick={() => void sendMessage("Use all networks for discovery.")}>
+              Use all networks
+            </button>
+          </div>
+        </section>
+
+        <section className="sidebar-panel">
+          <div className="panel-heading">
+            <h2>AI provider</h2>
+            <span>{agentProviderConfig?.effective_provider === "stub" ? "Stub" : "Ready"}</span>
+          </div>
+          <p className="panel-copy">{agentProviderConfig?.message ?? "Configure a provider for model-backed responses."}</p>
+          <div className="provider-config-grid">
+            <label className="field-stack">
+              <span>Provider</span>
+              <select
+                value={providerForm.providerId}
+                onChange={(event) => syncProviderForm(agentProviderConfig!, event.target.value)}
+                disabled={busyAction !== null || agentProviderConfig === null}
+              >
+                {(agentProviderConfig?.provider_options ?? []).map((option) => (
+                  <option key={option.provider_id} value={option.provider_id}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            {selectedProviderOption?.supports_model ? (
+              <label className="field-stack">
+                <span>Model</span>
+                <input
+                  type="text"
+                  value={providerForm.model}
+                  placeholder={selectedProviderOption.model_placeholder}
+                  onChange={(event) =>
+                    setProviderForm((current) => ({
+                      ...current,
+                      model: event.target.value,
+                    }))
+                  }
+                  disabled={busyAction !== null}
+                />
+              </label>
+            ) : null}
+
+            {selectedProviderOption?.supports_base_url ? (
+              <label className="field-stack">
+                <span>Base URL</span>
+                <input
+                  type="text"
+                  value={providerForm.baseUrl}
+                  placeholder={selectedProviderOption.base_url_default ?? ""}
+                  onChange={(event) =>
+                    setProviderForm((current) => ({
+                      ...current,
+                      baseUrl: event.target.value,
+                    }))
+                  }
+                  disabled={busyAction !== null}
+                />
+              </label>
+            ) : null}
+
+            {selectedProviderOption?.auth_kind === "api_key" ? (
+              <label className="field-stack">
+                <span>API key</span>
+                <input
+                  type="password"
+                  value={providerForm.apiKey}
+                  placeholder={selectedProviderOption.api_key_configured ? "Stored locally. Leave blank to keep it." : "Paste the key once"}
+                  onChange={(event) =>
+                    setProviderForm((current) => ({
+                      ...current,
+                      apiKey: event.target.value,
+                    }))
+                  }
+                  disabled={busyAction !== null}
+                />
+              </label>
+            ) : null}
+
+            <div className="provider-actions">
+              <button type="button" onClick={() => void handleProviderSave()} disabled={busyAction !== null}>
+                Save provider
+              </button>
+              {selectedProviderOption?.auth_kind === "api_key" && selectedProviderOption.api_key_configured ? (
+                <button
+                  type="button"
+                  className="ghost-button"
+                  onClick={() => void handleProviderKeyClear()}
+                  disabled={busyAction !== null}
+                >
+                  Clear key
+                </button>
+              ) : null}
+            </div>
+
+            <p className="field-hint">Provider credentials stay on this machine and are not returned by the API after saving.</p>
+          </div>
+        </section>
+
+        <section className="sidebar-panel">
+          <div className="panel-heading">
+            <h2>Reachable networks</h2>
+            <span>{reachableSubnets.length}</span>
+          </div>
+          <div className="subnet-list">
+            {reachableSubnets.map((subnet) => {
+              const selected = currentScope.includes(subnet.cidr);
+              return (
+                <div key={subnet.cidr} className={`subnet-card ${selected ? "selected" : ""}`}>
+                  <div>
+                    <strong>{subnet.cidr}</strong>
+                    <span>{subnet.label}</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void sendMessage(`Use ${subnet.cidr} for discovery.`)}
+                    disabled={activeTurnId !== null}
+                  >
+                    {selected ? "Selected" : "Ask Helios"}
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+
+        <section className="sidebar-panel">
+          <div className="panel-heading">
+            <h2>Detected devices</h2>
+            <span>{overview?.devices.length ?? 0}</span>
+          </div>
+          <ul className="device-preview-list">
+            {(overview?.devices ?? []).slice(0, 6).map((device) => (
+              <li key={device.id}>
+                <div className="truncate-stack">
+                  <strong className="truncate-line" title={device.name}>
+                    {device.name}
+                  </strong>
+                  <span className="truncate-line" title={humanize(device.device_type)}>
+                    {humanize(device.device_type)}
+                  </span>
+                </div>
+                <StatusBadge status={device.primary_status} />
+              </li>
+            ))}
+          </ul>
+        </section>
+
+        <footer className="shell-footer">© 2026 NeurHelios</footer>
       </aside>
 
-      <main className="workspace">
-        {error ? <div className="error-banner">{error}</div> : null}
-        {notice ? <div className="notice-banner">{notice}</div> : null}
-
-        <header className="masthead">
+      <main className="conversation-shell">
+        <header className="workspace-header">
           <div>
-            <h2>{activeTitle}</h2>
+            <span className="eyebrow">Primary workspace</span>
+            <h2>Talk to Helios</h2>
+            <p>Describe what you want to set up. Helios will inspect the house, ask targeted follow-up questions, and prepare the next safe action.</p>
           </div>
-          <div className="masthead-actions">
-            {currentPage === "devices" ? (
-              <>
-                <button
-                  type="button"
-                  className="button-secondary"
-                  onClick={() => void handleRefreshDevices()}
-                  disabled={busyAction !== null}
-                >
-                  Refresh
-                </button>
-                <button
-                  type="button"
-                  className="button-primary"
-                  onClick={() => void handleDiscoveryRun()}
-                  disabled={busyAction !== null}
-                >
-                  Run discovery
-                </button>
-              </>
-            ) : (
-              <>
-                <button
-                  type="button"
-                  className="button-secondary"
-                  onClick={() => void handleRefreshHems()}
-                  disabled={busyAction !== null}
-                >
-                  Refresh
-                </button>
-                <button
-                  type="button"
-                  className="button-primary"
-                  onClick={() => void handleReplan()}
-                  disabled={busyAction !== null || policyDraft === null}
-                >
-                  Run replan
-                </button>
-              </>
-            )}
+          <div className="header-actions">
+            {activeTurnId ? <span className="live-indicator">Live</span> : null}
+            <button type="button" className="secondary-button" onClick={() => setAdvancedOpen(true)}>
+              Advanced
+            </button>
           </div>
         </header>
 
-        {currentPage === "devices" ? (
-          <div className="page-layout home-layout">
-            <section className="section-panel span-12">
-              <div className="section-title">
-                <h3>Network selection</h3>
-              </div>
-              <div className="note-lines network-hint">
-                <p>Select the reachable subnets Helios should scan. The current selection is used directly when you run discovery.</p>
-              </div>
-              {reachableSubnets.length > 0 ? (
-                <div className="checkbox-list">
-                  {reachableSubnets.map((subnet) => {
-                    const selected = selectedSubnets.includes(subnet.cidr);
-                    return (
-                      <label
-                        key={subnet.cidr}
-                        className={`checkbox-row ${selected ? "selected" : ""}`}
-                        title={`Reachable via ${subnet.interface}`}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={selected}
-                          onChange={() => toggleSubnet(subnet.cidr)}
-                        />
-                        <span>{subnet.cidr}</span>
-                        <small>{subnet.interface}</small>
-                      </label>
-                    );
-                  })}
-                </div>
-              ) : (
-                <div className="empty-state">
-                  <h4>No reachable subnets detected</h4>
-                  <p>Helios could not derive local IPv4 routes from this host.</p>
-                </div>
-              )}
-              <div className="form-foot">
-                <span className="inline-note">{selectedScopeText}</span>
-              </div>
-            </section>
+        {error ? <div className="banner banner-error">{error}</div> : null}
+        {notice ? <div className="banner banner-notice">{notice}</div> : null}
 
-            <section className="section-panel span-12">
-              <div className="section-title">
-                <h3>Found devices</h3>
-              </div>
-              {overview && overview.devices.length > 0 ? (
-                <div className="device-list">
-                  {overview.devices.map((device) => {
-                    const expanded = selectedDeviceId === device.id;
-                    return (
-                      <article
-                        key={device.id}
-                        className={`device-list-item ${expanded ? "expanded" : ""}`}
-                        title={`${device.manufacturer} ${device.model}`}
+        <div className="workspace-grid">
+          <section className="timeline-panel">
+            <div ref={timelineRef} className="timeline">
+              {timelineMessages.map((message) => (
+                <article key={message.id} className={`message-card ${messageTone(message.role)}`}>
+                  <div className="message-meta">
+                    <span>{message.role === "user" ? "You" : "Helios"}</span>
+                    <span>{formatDateTime(message.created_at)}</span>
+                  </div>
+                  <div className="message-body">
+                    {message.content ? (
+                      <ReactMarkdown
+                        remarkPlugins={[remarkGfm]}
+                        components={{
+                          a: ({ ...props }) => <a {...props} target="_blank" rel="noreferrer" />,
+                        }}
                       >
+                        {message.content}
+                      </ReactMarkdown>
+                    ) : (
+                      <p>…</p>
+                    )}
+                  </div>
+                </article>
+              ))}
+            </div>
+
+            <form className="composer" onSubmit={(event) => void handleSubmit(event)}>
+              <textarea
+                value={draft}
+                onChange={(event) => setDraft(event.target.value)}
+                placeholder="Example: I want to connect my heat pump and I am not sure which device it is."
+                rows={3}
+                disabled={activeTurnId !== null}
+              />
+              <div className="composer-actions">
+                <span className="composer-hint">Read actions run automatically. State changes still require your confirmation.</span>
+                <button type="submit" disabled={!draft.trim() || activeTurnId !== null || busyAction === "send-message"}>
+                  {activeTurnId ? "Helios is working…" : "Send"}
+                </button>
+              </div>
+            </form>
+          </section>
+
+          <aside className="helper-rail">
+            <section className="helper-panel">
+              <div className="panel-heading">
+                <h3>Pending actions</h3>
+                <span>{thread?.pending_proposals.length ?? 0}</span>
+              </div>
+              {(thread?.pending_proposals ?? []).length === 0 ? (
+                <p className="empty-copy">No confirmation is waiting right now.</p>
+              ) : (
+                <div className="proposal-list">
+                  {thread?.pending_proposals.map((proposal) => (
+                    <article key={proposal.id} className="proposal-card">
+                      <div className="proposal-copy">
+                        <strong>{proposal.summary}</strong>
+                        <p>{renderProposalSummary(proposal)}</p>
+                      </div>
+                      <div className="proposal-actions">
                         <button
                           type="button"
-                          className="device-row-button"
-                          onClick={() => toggleDevice(device.id)}
+                          onClick={() => void handleProposalDecision(proposal.id, "confirm")}
+                          disabled={busyAction !== null}
                         >
-                          <div className="row-main">
-                            <strong>{device.name}</strong>
-                            <span>
-                              {humanizeLabel(device.device_type)} · {device.manufacturer || "Unknown maker"} ·{" "}
-                              {device.model || "Unknown model"}
-                            </span>
-                          </div>
-                          <div className="row-side">
-                            {device.protocols.map((protocol) => (
-                              <span key={`${device.id}-${protocol}`} className="soft-tag">
-                                {protocol}
-                              </span>
-                            ))}
-                            <StatusBadge status={device.primary_status} />
-                          </div>
+                          Confirm
                         </button>
-                        {expanded ? renderDeviceDetails(device) : null}
-                      </article>
-                    );
-                  })}
-                </div>
-              ) : (
-                <div className="empty-state">
-                  <h4>No devices discovered yet</h4>
-                  <p>Choose a subnet above and run discovery to build the local inventory.</p>
-                </div>
-              )}
-            </section>
-          </div>
-        ) : (
-          <div className="page-layout">
-            <section className="section-panel span-12">
-              <div className="section-title">
-                <h3>HEMS status</h3>
-              </div>
-              {hemsSummary ? (
-                <div className="site-strip hems-strip">
-                  <div className="site-stat">
-                    <span>Assets</span>
-                    <strong>{hemsSummary.asset_count}</strong>
-                    <small>{hemsSummary.dispatchable_asset_count} dispatchable</small>
-                  </div>
-                  <div className="site-stat">
-                    <span>Execution</span>
-                    <strong>{humanizeLabel(hemsSummary.policy.execution_mode)}</strong>
-                    <small>{hemsSummary.plan_only_asset_count} plan only</small>
-                  </div>
-                  <div className="site-stat">
-                    <span>Latest plan</span>
-                    <strong>{latestPlanHeader ? humanizeLabel(latestPlanHeader.status) : "Not run yet"}</strong>
-                    <small>{latestPlanHeader ? formatDateTime(latestPlanHeader.created_at) : "No plan recorded"}</small>
-                  </div>
-                  <div className="site-stat">
-                    <span>Guardrails</span>
-                    <strong>{hemsSummary.blocked_asset_count} blocked</strong>
-                    <small>{hemsSummary.read_only_asset_count} read only</small>
-                  </div>
-                </div>
-              ) : (
-                <div className="empty-state">
-                  <h4>No HEMS summary available</h4>
-                  <p>The HEMS service has not returned a site model yet.</p>
-                </div>
-              )}
-            </section>
-
-            <section className="section-panel span-12">
-              <div className="section-title">
-                <h3>Policy</h3>
-              </div>
-              {policyDraft ? (
-                <>
-                  <div className="note-lines">
-                    <p>Edit policy values here and apply them with the next replan.</p>
-                  </div>
-                  <div className="policy-grid">
-                    <label>
-                      <span>Execution mode</span>
-                      <select value={policyDraft.execution_mode} onChange={handlePolicyTextChange("execution_mode")}>
-                        <option value="guarded_auto">Guarded auto</option>
-                        <option value="plan_only">Plan only</option>
-                      </select>
-                    </label>
-                    <label>
-                      <span>Battery reserve (%)</span>
-                      <input
-                        type="number"
-                        step="1"
-                        value={policyDraft.battery_reserve_pct}
-                        onChange={handlePolicyNumberChange("battery_reserve_pct")}
-                      />
-                    </label>
-                    <label>
-                      <span>EV target SOC (%)</span>
-                      <input
-                        type="number"
-                        step="1"
-                        value={policyDraft.ev_default_target_soc_pct}
-                        onChange={handlePolicyNumberChange("ev_default_target_soc_pct")}
-                      />
-                    </label>
-                    <label>
-                      <span>Default departure</span>
-                      <input
-                        type="time"
-                        value={policyDraft.ev_default_departure_time}
-                        onChange={handlePolicyTextChange("ev_default_departure_time")}
-                      />
-                    </label>
-                    <label>
-                      <span>Heat comfort min (°C)</span>
-                      <input
-                        type="number"
-                        step="0.5"
-                        value={policyDraft.heat_comfort_min_c}
-                        onChange={handlePolicyNumberChange("heat_comfort_min_c")}
-                      />
-                    </label>
-                    <label>
-                      <span>Heat comfort max (°C)</span>
-                      <input
-                        type="number"
-                        step="0.5"
-                        value={policyDraft.heat_comfort_max_c}
-                        onChange={handlePolicyNumberChange("heat_comfort_max_c")}
-                      />
-                    </label>
-                    <label>
-                      <span>Grid import limit (kW)</span>
-                      <input
-                        type="number"
-                        step="0.5"
-                        value={policyDraft.grid_import_limit_kw}
-                        onChange={handlePolicyNumberChange("grid_import_limit_kw")}
-                      />
-                    </label>
-                    <label>
-                      <span>Grid export limit (kW)</span>
-                      <input
-                        type="number"
-                        step="0.5"
-                        value={policyDraft.grid_export_limit_kw}
-                        onChange={handlePolicyNumberChange("grid_export_limit_kw")}
-                      />
-                    </label>
-                    <label>
-                      <span>Horizon (hours)</span>
-                      <input
-                        type="number"
-                        step="1"
-                        value={policyDraft.horizon_hours}
-                        onChange={handlePolicyNumberChange("horizon_hours")}
-                      />
-                    </label>
-                    <label>
-                      <span>Step size (minutes)</span>
-                      <input
-                        type="number"
-                        step="5"
-                        value={policyDraft.step_minutes}
-                        onChange={handlePolicyNumberChange("step_minutes")}
-                      />
-                    </label>
-                  </div>
-
-                  <div className="toggle-grid">
-                    <label className={`checkbox-row ${policyDraft.allow_price_arbitrage ? "selected" : ""}`}>
-                      <input
-                        type="checkbox"
-                        checked={policyDraft.allow_price_arbitrage}
-                        onChange={handlePolicyToggle("allow_price_arbitrage")}
-                      />
-                      <span>Allow price arbitrage</span>
-                      <small>policy</small>
-                    </label>
-                    <label className={`checkbox-row ${policyDraft.allow_heat_precharge ? "selected" : ""}`}>
-                      <input
-                        type="checkbox"
-                        checked={policyDraft.allow_heat_precharge}
-                        onChange={handlePolicyToggle("allow_heat_precharge")}
-                      />
-                      <span>Allow heat precharge</span>
-                      <small>policy</small>
-                    </label>
-                    <label className={`checkbox-row ${policyDraft.allow_ev_load_shifting ? "selected" : ""}`}>
-                      <input
-                        type="checkbox"
-                        checked={policyDraft.allow_ev_load_shifting}
-                        onChange={handlePolicyToggle("allow_ev_load_shifting")}
-                      />
-                      <span>Allow EV load shifting</span>
-                      <small>policy</small>
-                    </label>
-                  </div>
-                </>
-              ) : (
-                <div className="empty-state">
-                  <h4>No HEMS policy available</h4>
-                  <p>The planner policy has not been initialized yet.</p>
-                </div>
-              )}
-            </section>
-
-            <section className="section-panel span-12">
-              <div className="section-title">
-                <h3>Canonical assets</h3>
-              </div>
-              {hemsAssets.length > 0 ? (
-                <ul className="line-list">
-                  {hemsAssets.map((asset) => (
-                    <li key={asset.asset_key} className="line-row hems-asset-row">
-                      <div className="row-main">
-                        <strong>{asset.label}</strong>
-                        <span>
-                          {humanizeLabel(asset.asset_type)} · {humanizeLabel(asset.control_capability)}
-                        </span>
-                        {asset.reasons.length > 0 ? (
-                          <div className="tag-row">
-                            {asset.reasons.map((reason) => (
-                              <span key={`${asset.asset_key}-${reason}`} className="soft-tag">
-                                {humanize(reason)}
-                              </span>
-                            ))}
-                          </div>
-                        ) : null}
-                        <div className="detail-pairs">
-                          <div>
-                            <small>Dispatch contract</small>
-                            <p>{commandContractSummary(asset)}</p>
-                          </div>
-                          <div>
-                            <small>Telemetry</small>
-                            <p>
-                              {summarizeEntries(asset.telemetry)
-                                .map(([key, value]) => `${humanize(key)} ${formatValue(value)}`)
-                                .join(" • ") || "No live telemetry mapped"}
-                            </p>
-                          </div>
-                          <div>
-                            <small>Constraints</small>
-                            <p>
-                              {summarizeEntries(asset.constraints)
-                                .map(([key, value]) => `${humanize(key)} ${formatValue(value)}`)
-                                .join(" • ") || "No explicit constraints available"}
-                            </p>
-                          </div>
-                        </div>
+                        <button
+                          type="button"
+                          className="ghost-button"
+                          onClick={() => void handleProposalDecision(proposal.id, "reject")}
+                          disabled={busyAction !== null}
+                        >
+                          Reject
+                        </button>
                       </div>
-                      <div className="row-side">
-                        <span className={`status-badge ${toneForEligibility(asset.eligibility)}`}>
-                          {humanize(asset.eligibility)}
-                        </span>
-                      </div>
+                    </article>
+                  ))}
+                </div>
+              )}
+            </section>
+
+            <section className="helper-panel">
+              <div className="panel-heading">
+                <h3>Live activity</h3>
+              </div>
+              {activities.length === 0 ? (
+                <p className="empty-copy">Activity from the current turn will appear here while Helios works.</p>
+              ) : (
+                <ul className="activity-list">
+                  {activities.map((activity) => (
+                    <li key={activity.id} className={`activity-item ${activity.tone}`}>
+                      <strong>{activity.title}</strong>
+                      <span>{activity.detail}</span>
+                      <small>{formatDateTime(activity.createdAt)}</small>
                     </li>
                   ))}
                 </ul>
-              ) : (
-                <div className="empty-state">
-                  <h4>No HEMS assets available</h4>
-                  <p>Run discovery first so the HEMS builder can map canonical assets.</p>
-                </div>
               )}
             </section>
 
-            <section className="section-panel span-12">
-              <div className="section-title">
-                <h3>Latest plan</h3>
-              </div>
-              {latestPlanHeader ? (
-                <div className="panel-stack">
-                  <div className="list-header">
-                    <div className="row-main">
-                      <strong>{humanizeLabel(latestPlanHeader.status)}</strong>
-                      <span>
-                        {humanizeLabel(latestPlanHeader.execution_mode)} · {latestPlanHeader.summary}
-                      </span>
-                    </div>
-                    <div className="row-side">
-                      <span className="soft-tag">{latestPlanHeader.solver_name}</span>
-                      <span className="soft-tag">{formatDateTime(latestPlanHeader.created_at)}</span>
-                    </div>
-                  </div>
-
-                  {hemsPlan ? (
-                    <>
-                      <div className="plan-grid">
-                        {intervalGroups.length > 0 ? (
-                          intervalGroups.map((group) => (
-                            <article key={group.assetKey} className="plan-group">
-                              <div className="list-header">
-                                <div className="row-main">
-                                  <strong>{group.asset?.label ?? group.assetKey}</strong>
-                                  <span>{humanizeLabel(group.asset?.asset_type ?? "asset")}</span>
-                                </div>
-                                {group.asset ? (
-                                  <span className={`status-badge ${toneForEligibility(group.asset.eligibility)}`}>
-                                    {humanize(group.asset.eligibility)}
-                                  </span>
-                                ) : null}
-                              </div>
-                              <div className="plan-interval-list">
-                                {group.intervals.slice(0, 5).map((interval) => (
-                                  <div key={`${interval.asset_key}-${interval.starts_at}`} className="plan-interval">
-                                    <div className="row-main">
-                                      <strong>{formatTimeRange(interval.starts_at, interval.ends_at)}</strong>
-                                      <span>{commandSummary(interval.command)}</span>
-                                    </div>
-                                    {Object.keys(interval.predicted_state).length > 0 ? (
-                                      <div className="tag-row">
-                                        {summarizeEntries(interval.predicted_state, 2).map(([key, value]) => (
-                                          <span key={`${interval.asset_key}-${interval.starts_at}-${key}`} className="soft-tag">
-                                            {humanize(key)} {formatValue(value)}
-                                          </span>
-                                        ))}
-                                      </div>
-                                    ) : null}
-                                  </div>
-                                ))}
-                                {group.intervals.length > 5 ? (
-                                  <p className="inline-note">+ {group.intervals.length - 5} more planned intervals</p>
-                                ) : null}
-                              </div>
-                            </article>
-                          ))
-                        ) : (
-                          <div className="empty-state">
-                            <h4>No interval schedule stored</h4>
-                            <p>The latest plan did not persist interval-level commands.</p>
-                          </div>
-                        )}
-                      </div>
-
-                      <div className="split-grid">
-                        <div className="sub-block no-border">
-                          <h4>Dispatch</h4>
-                          {hemsPlan.dispatch_events.length > 0 ? (
-                            <ul className="line-list">
-                              {hemsPlan.dispatch_events.slice(0, 8).map((event: HemsDispatchEventRead) => (
-                                <li key={event.id} className="line-row slim">
-                                  <div className="row-main">
-                                    <strong>{event.summary}</strong>
-                                    <span>
-                                      {formatDateTime(event.executed_at)} · {commandSummary(event.applied_command || event.requested_command)}
-                                    </span>
-                                  </div>
-                                  <div className="row-side">
-                                    <span className={`status-badge ${toneForDispatchStatus(event.status)}`}>
-                                      {humanize(event.status)}
-                                    </span>
-                                  </div>
-                                </li>
-                              ))}
-                            </ul>
-                          ) : (
-                            <p className="inline-note">No dispatch events were recorded for this plan.</p>
-                          )}
-                        </div>
-
-                        <div className="sub-block no-border">
-                          <h4>Violations</h4>
-                          {hemsPlan.violations.length > 0 ? (
-                            <ul className="line-list">
-                              {hemsPlan.violations.slice(0, 8).map((violation) => (
-                                <li key={violation.id} className="line-row slim">
-                                  <div className="row-main">
-                                    <strong>{violation.message}</strong>
-                                    <span>
-                                      {humanizeLabel(violation.violation_type)} · {formatDateTime(violation.created_at)}
-                                    </span>
-                                  </div>
-                                  <div className="row-side">
-                                    <span className={`status-badge ${toneForViolationSeverity(violation.severity)}`}>
-                                      {humanize(violation.severity)}
-                                    </span>
-                                  </div>
-                                </li>
-                              ))}
-                            </ul>
-                          ) : (
-                            <p className="inline-note">No violations were recorded for this plan.</p>
-                          )}
-                        </div>
-                      </div>
-                    </>
-                  ) : (
-                    <div className="empty-state">
-                      <h4>Plan header only</h4>
-                      <p>The latest plan metadata exists, but detailed intervals are not loaded yet.</p>
-                    </div>
-                  )}
+            {thread?.latest_debug_case ? (
+              <section className="helper-panel">
+                <div className="panel-heading">
+                  <h3>Latest investigation</h3>
                 </div>
-              ) : (
-                <div className="empty-state">
-                  <h4>No HEMS plan yet</h4>
-                  <p>Run the first HEMS replan to create a dispatch snapshot for this site.</p>
-                </div>
-              )}
-            </section>
-          </div>
-        )}
+                <strong>{thread.latest_debug_case.subject_label}</strong>
+                <p>{thread.latest_debug_case.diagnosis.summary}</p>
+              </section>
+            ) : null}
+          </aside>
+        </div>
       </main>
+
+      {advancedOpen ? (
+        <div className="advanced-backdrop" onClick={() => setAdvancedOpen(false)}>
+          <aside className="advanced-drawer" onClick={(event) => event.stopPropagation()}>
+            <div className="advanced-header">
+              <div>
+                <span className="eyebrow">Advanced</span>
+                <h3>Technical runtime state</h3>
+              </div>
+              <button type="button" className="ghost-button" onClick={() => setAdvancedOpen(false)}>
+                Close
+              </button>
+            </div>
+
+            <section className="advanced-section">
+              <div className="panel-heading">
+                <h4>Inventory</h4>
+                <span>{overview?.devices.length ?? 0}</span>
+              </div>
+              <div className="advanced-device-list">
+                {(overview?.devices ?? []).map((device) => (
+                  <article key={device.id} className="advanced-device-card">
+                    <div className="advanced-device-header">
+                      <div className="truncate-stack">
+                        <strong className="truncate-line" title={device.name}>
+                          {device.name}
+                        </strong>
+                        <span className="truncate-line" title={`${device.manufacturer} · ${device.model}`}>
+                          {device.manufacturer} · {device.model}
+                        </span>
+                      </div>
+                      <StatusBadge status={device.primary_status} />
+                    </div>
+                    <div className="capability-row">
+                      <CapabilityPill enabled={device.capabilities.visible} label="Visible" />
+                      <CapabilityPill enabled={device.capabilities.monitorable} label="Telemetry" />
+                      <CapabilityPill enabled={device.capabilities.controllable} label="Control" />
+                      <CapabilityPill enabled={device.capabilities.optimizable} label="Optimizable" />
+                    </div>
+                    <p>{device.explanation}</p>
+                    <small>Next step: {device.next_step || "None"}</small>
+                  </article>
+                ))}
+              </div>
+            </section>
+
+            <section className="advanced-section">
+              <div className="panel-heading">
+                <h4>HEMS runtime</h4>
+              </div>
+              {hemsSummary ? (
+                <div className="advanced-grid">
+                  <div className="metric-card">
+                    <span>Assets</span>
+                    <strong>{hemsSummary.asset_count}</strong>
+                  </div>
+                  <div className="metric-card">
+                    <span>Dispatchable</span>
+                    <strong>{hemsSummary.dispatchable_asset_count}</strong>
+                  </div>
+                  <div className="metric-card">
+                    <span>Plan only</span>
+                    <strong>{hemsSummary.plan_only_asset_count}</strong>
+                  </div>
+                  <div className="metric-card">
+                    <span>Blocked</span>
+                    <strong>{hemsSummary.blocked_asset_count}</strong>
+                  </div>
+                </div>
+              ) : null}
+              {hemsPlan ? (
+                <div className="plan-card">
+                  <strong>{hemsPlan.summary}</strong>
+                  <span>
+                    {hemsPlan.intervals.length} intervals · {hemsPlan.dispatch_events.length} dispatch event(s)
+                  </span>
+                  <small>
+                    Latest plan: {formatDateTime(hemsPlan.created_at)} · {humanize(hemsPlan.status)}
+                  </small>
+                </div>
+              ) : (
+                <p className="empty-copy">No HEMS plan has been generated yet.</p>
+              )}
+            </section>
+          </aside>
+        </div>
+      ) : null}
     </div>
   );
 }

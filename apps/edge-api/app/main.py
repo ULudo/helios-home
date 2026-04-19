@@ -24,7 +24,7 @@ def create_app() -> FastAPI:
         title=settings.app_name,
         version="0.1.0",
         lifespan=lifespan,
-        summary="Local API for the Helios Home HEMS MVP.",
+        summary="Local API for the Helios Home agent-first HEMS runtime.",
     )
     application.add_middleware(
         CORSMiddleware,

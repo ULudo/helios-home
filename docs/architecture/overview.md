@@ -2,7 +2,7 @@
 
 ## Product stance
 
-Helios Home is currently a local discovery and device-inspection runtime with a backend-first HEMS core.
+Helios Home is currently a local, agent-first runtime for discovering devices, confirming setup decisions through conversation, and building a deterministic HEMS foundation underneath.
 
 The system is built to:
 
@@ -13,7 +13,14 @@ The system is built to:
 - plan and audit guarded local energy-management decisions
 - keep the runtime offline-capable and low-overhead
 
-Control and optimization remain deferred from the current public UI, but the backend core for HEMS planning now exists behind the API.
+The public UI is conversation-first. Technical inventory and HEMS state still exist, but they are secondary, advanced surfaces behind the same runtime.
+
+The assistant runtime is now provider-neutral at the configuration layer:
+
+- the user can select a model provider locally
+- credentials remain local to the machine
+- the deterministic tool core stays inside Helios
+- model-backed phrasing sits above the deterministic setup/runtime state
 
 ## Current runtime shape
 
@@ -57,19 +64,12 @@ The reconciled view is persisted into the local database as:
 
 ### 5. Read model
 
-The current frontend consumes a compact read model:
+The current frontend consumes:
 
-- selected network scope
-- integrated devices
-
-Each device exposes:
-
-- current status
-- protocol tags
-- capabilities
-- telemetry
-- explanation
-- next step
+- a conversation thread with streamed activity
+- pending confirmation proposals
+- a setup profile with confirmed systems and unresolved questions
+- advanced inventory and HEMS inspection data
 
 ### 6. HEMS backend
 

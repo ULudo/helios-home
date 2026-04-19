@@ -81,6 +81,16 @@ class Site(Base):
         cascade="all, delete-orphan",
         order_by="HemsPlanRun.created_at.desc()",
     )
+    setup_profile: Mapped["SiteSetupProfile | None"] = relationship(
+        back_populates="site",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
+    conversation_threads: Mapped[list["ConversationThread"]] = relationship(
+        back_populates="site",
+        cascade="all, delete-orphan",
+        order_by="ConversationThread.updated_at.desc()",
+    )
 
 
 class DeviceCandidate(Base):
@@ -419,6 +429,145 @@ class KnowledgeEntry(Base):
 
     site: Mapped[Site] = relationship(back_populates="knowledge_entries")
     source_case: Mapped[DebugCase | None] = relationship(back_populates="knowledge_entries")
+
+
+class SiteSetupProfile(Base):
+    __tablename__ = "site_setup_profiles"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"), unique=True)
+    summary: Mapped[str] = mapped_column(Text, default="")
+    confirmed_systems: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    unresolved_items: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    user_notes: Mapped[list[str]] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        onupdate=utcnow,
+    )
+
+    site: Mapped[Site] = relationship(back_populates="setup_profile")
+
+
+class ConversationThread(Base):
+    __tablename__ = "conversation_threads"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"))
+    title: Mapped[str] = mapped_column(String(160), default="Helios setup assistant")
+    status: Mapped[str] = mapped_column(String(40), default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        onupdate=utcnow,
+    )
+
+    site: Mapped[Site] = relationship(back_populates="conversation_threads")
+    messages: Mapped[list["ConversationMessage"]] = relationship(
+        back_populates="thread",
+        cascade="all, delete-orphan",
+        order_by="ConversationMessage.created_at.asc()",
+    )
+    turns: Mapped[list["ConversationTurn"]] = relationship(
+        back_populates="thread",
+        cascade="all, delete-orphan",
+        order_by="ConversationTurn.created_at.asc()",
+    )
+    proposals: Mapped[list["ActionProposal"]] = relationship(
+        back_populates="thread",
+        cascade="all, delete-orphan",
+        order_by="ActionProposal.created_at.desc()",
+    )
+
+
+class ConversationMessage(Base):
+    __tablename__ = "conversation_messages"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    thread_id: Mapped[str] = mapped_column(ForeignKey("conversation_threads.id"))
+    role: Mapped[str] = mapped_column(String(20))
+    content: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(40), default="completed")
+    turn_id: Mapped[str | None] = mapped_column(ForeignKey("conversation_turns.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        onupdate=utcnow,
+    )
+
+    thread: Mapped[ConversationThread] = relationship(back_populates="messages")
+    turn: Mapped["ConversationTurn | None"] = relationship(
+        back_populates="assistant_message",
+        foreign_keys=[turn_id],
+    )
+
+
+class ConversationTurn(Base):
+    __tablename__ = "conversation_turns"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    thread_id: Mapped[str] = mapped_column(ForeignKey("conversation_threads.id"))
+    user_message_id: Mapped[str] = mapped_column(String(64))
+    assistant_message_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    provider_name: Mapped[str] = mapped_column(String(80), default="stub")
+    status: Mapped[str] = mapped_column(String(40), default="pending")
+    summary: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    thread: Mapped[ConversationThread] = relationship(back_populates="turns")
+    events: Mapped[list["ConversationEvent"]] = relationship(
+        back_populates="turn",
+        cascade="all, delete-orphan",
+        order_by="ConversationEvent.event_index.asc()",
+    )
+    proposals: Mapped[list["ActionProposal"]] = relationship(
+        back_populates="turn",
+        order_by="ActionProposal.created_at.desc()",
+    )
+    assistant_message: Mapped[ConversationMessage | None] = relationship(
+        foreign_keys=[assistant_message_id],
+        primaryjoin="ConversationTurn.assistant_message_id == ConversationMessage.id",
+    )
+
+
+class ConversationEvent(Base):
+    __tablename__ = "conversation_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    turn_id: Mapped[str] = mapped_column(ForeignKey("conversation_turns.id"))
+    event_index: Mapped[int] = mapped_column(Integer, default=0)
+    event_type: Mapped[str] = mapped_column(String(80))
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    turn: Mapped[ConversationTurn] = relationship(back_populates="events")
+
+
+class ActionProposal(Base):
+    __tablename__ = "action_proposals"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    thread_id: Mapped[str] = mapped_column(ForeignKey("conversation_threads.id"))
+    turn_id: Mapped[str | None] = mapped_column(ForeignKey("conversation_turns.id"), nullable=True)
+    action_type: Mapped[str] = mapped_column(String(80))
+    summary: Mapped[str] = mapped_column(Text, default="")
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(40), default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        onupdate=utcnow,
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    thread: Mapped[ConversationThread] = relationship(back_populates="proposals")
+    turn: Mapped[ConversationTurn | None] = relationship(back_populates="proposals")
 
 
 class HemsPolicy(Base):

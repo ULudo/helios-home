@@ -331,3 +331,15 @@ def test_hems_api_endpoints_return_summary_policy_and_latest_plan(tmp_path, monk
         latest_plan_response = client.get("/api/v1/hems/plans/latest")
         assert latest_plan_response.status_code == 200
         assert latest_plan_response.json()["id"] == replan_response.json()["id"]
+
+
+def test_hems_latest_plan_returns_null_before_any_replan(tmp_path, monkeypatch):
+    monkeypatch.setenv("HELIOS_DATABASE_URL", f"sqlite:///{tmp_path / 'latest-empty.db'}")
+    get_settings.cache_clear()
+    get_engine.cache_clear()
+
+    app = create_app()
+    with TestClient(app) as client:
+        response = client.get("/api/v1/hems/plans/latest")
+        assert response.status_code == 200
+        assert response.json() is None

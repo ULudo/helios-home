@@ -24,6 +24,9 @@ class Settings(BaseSettings):
     mqtt_probe_window_seconds: float = 2.0
     native_writes_enabled: bool = False
     write_http_timeout_seconds: float = 3.0
+    agent_provider: str = "stub"
+    agent_config_path: str = "~/.config/helios-home/agent-provider.json"
+    agent_stream_delay_ms: int = 12
     cors_origins: list[str] = [
         "http://localhost:5173",
         "http://127.0.0.1:5173",

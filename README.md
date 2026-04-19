@@ -1,14 +1,13 @@
 # Helios Home
 
-Helios Home is a local-first HEMS prototype. The current frontend milestone is focused on discovering network-reachable energy devices in a building, representing them cleanly, and surfacing their live telemetry in a compact local UI.
+Helios Home is a local-first Home Energy Management System built around an agent-first setup experience. The current frontend milestone is focused on helping a user discover network-reachable devices, confirm what they belong to in the home, and build the setup interactively through conversation.
 
 The current public milestone is intentionally narrow:
 
-- local network selection
-- discovery across configured subnets
-- device inventory with inline details
-- session-based monitoring views
-- a first HEMS page for plan, policy and asset inspection
+- conversation-first setup workspace
+- streamed activity during discovery and setup turns
+- confirmation-gated setup actions
+- advanced drawer for device inventory and HEMS inspection
 - local-only runtime with no cloud dependency
 
 The runtime now also contains a first HEMS core with:
@@ -19,7 +18,22 @@ The runtime now also contains a first HEMS core with:
 - guarded dispatch, including generic controllable loads
 - audit persistence
 
-The stable public UI remains centered on discovery and device inspection for now.
+The stable public UI is now centered on the Helios assistant workspace.
+
+## Agent model provider
+
+Helios now supports a local, provider-neutral model configuration for the assistant runtime.
+
+Current built-in options:
+
+- development stub
+- OpenAI
+- Anthropic
+- OpenRouter
+- Ollama
+- custom OpenAI-compatible endpoint
+
+Provider credentials are stored only on the local machine in the agent config path and are never returned by the API after saving. The repository does not contain any provider keys or checked-in model configuration.
 
 ## Repository layout
 
@@ -81,8 +95,9 @@ Implemented now:
 - native Modbus / SunSpec probing
 - candidate reconciliation across native live sources
 - device inventory materialization into the local SQLite store
-- inline device details and session-based monitoring charts
-- HEMS page with policy, canonical assets, latest plan, dispatch and violations
+- agent conversation thread with streaming activity and confirmation proposals
+- setup profile persistence for confirmed systems and unresolved questions
+- advanced drawer with device inventory and HEMS runtime inspection
 - backend HEMS canonical asset model
 - backend HEMS policy, planner, dispatch and audit records
 
