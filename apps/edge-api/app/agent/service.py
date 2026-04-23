@@ -286,6 +286,14 @@ def _context_snapshot(session: Session, thread: ConversationThread, profile: Sit
             for device in overview.devices
         ],
         "setup_profile": _serialize_setup_profile(profile).model_dump(),
+        "recent_messages": [
+            {
+                "role": message.role,
+                "content": message.content,
+                "created_at": message.created_at,
+            }
+            for message in thread.messages[-6:]
+        ],
         "pending_proposals": [
             _serialize_proposal(proposal).model_dump()
             for proposal in thread.proposals
@@ -757,8 +765,20 @@ def stream_turn_events(turn_id: str) -> Generator[str, None, None]:
                 session.refresh(thread)
                 profile = _get_or_create_setup_profile(session)
                 final_context = _context_snapshot(session, thread, profile)
-                final_text = provider.compose_turn(final_context, user_message.content, tool_results, created_proposals)
-                for chunk in _stream_text(final_text):
+                final_output = provider.compose_turn(final_context, user_message.content, tool_results, created_proposals)
+                if final_output.ui_actions:
+                    ui_actions_payload = {
+                        "actions": [
+                            {
+                                "type": action.type,
+                                "payload": action.payload,
+                            }
+                            for action in final_output.ui_actions
+                        ]
+                    }
+                    ui_event = _persist_event(session, turn, "ui_actions", ui_actions_payload)
+                    yield _encode_sse(ui_event)
+                for chunk in _stream_text(final_output.message):
                     delta_event = _persist_event(session, turn, "assistant_delta", {"delta": chunk})
                     yield _encode_sse(delta_event)
                     if settings.agent_stream_delay_ms > 0:
@@ -767,11 +787,11 @@ def stream_turn_events(turn_id: str) -> Generator[str, None, None]:
                 assistant_message = session.get(ConversationMessage, assistant_message_id)
                 turn = session.get(ConversationTurn, turn.id)
                 assert assistant_message is not None and turn is not None
-                assistant_message.content = final_text
+                assistant_message.content = final_output.message
                 assistant_message.status = "completed"
                 assistant_message.updated_at = utcnow()
                 turn.status = "completed"
-                turn.summary = final_text
+                turn.summary = final_output.message
                 turn.finished_at = utcnow()
                 session.add_all([assistant_message, turn, thread])
                 session.commit()
@@ -782,6 +802,13 @@ def stream_turn_events(turn_id: str) -> Generator[str, None, None]:
                     "assistant_message_completed",
                     {
                         "message": _serialize_message(assistant_message).model_dump(mode="json"),
+                        "ui_actions": [
+                            {
+                                "type": action.type,
+                                "payload": action.payload,
+                            }
+                            for action in final_output.ui_actions
+                        ],
                     },
                 )
                 yield _encode_sse(completed_event)

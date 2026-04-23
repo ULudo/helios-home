@@ -40,6 +40,11 @@ class AgentMessageRead(BaseModel):
     turn_id: str | None = None
 
 
+class AgentUiActionRead(BaseModel):
+    type: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
 class ActionProposalRead(BaseModel):
     id: str
     action_type: str

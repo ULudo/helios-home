@@ -57,6 +57,8 @@ def test_agent_turn_streams_discovery_activity_and_persists_assistant_reply(tmp_
         assert any(event["event_type"] == "tool_started" and event["payload"]["tool_name"] == "refresh_discovery" for event in events)
         assert any(event["event_type"] == "tool_finished" and event["payload"]["tool_name"] == "refresh_discovery" for event in events)
         assert any(event["event_type"] == "assistant_message_completed" for event in events)
+        ui_actions_event = next(event for event in events if event["event_type"] == "ui_actions")
+        assert any(action["type"] == "open_view" and action["payload"]["view"] == "overview" for action in ui_actions_event["payload"]["actions"])
 
         thread = client.get("/api/v1/agent/thread").json()
         assert thread["messages"][-1]["role"] == "assistant"
@@ -83,11 +85,32 @@ def test_agent_can_propose_and_confirm_system_binding(tmp_path, monkeypatch):
         assert proposal_events
         proposal_id = proposal_events[0]["payload"]["id"]
         assert proposal_events[0]["payload"]["action_type"] == "confirm_system_binding"
+        ui_actions_event = next(event for event in events if event["event_type"] == "ui_actions")
+        assert any(action["type"] == "focus_system" and action["payload"]["system_type"] == "battery" for action in ui_actions_event["payload"]["actions"])
+        assert any(action["type"] == "open_view" and action["payload"]["view"] == "devices" for action in ui_actions_event["payload"]["actions"])
 
         decision = client.post(f"/api/v1/agent/proposals/{proposal_id}/confirm")
         assert decision.status_code == 200
         setup_profile = client.get("/api/v1/agent/setup-profile").json()
         assert any(binding["system_type"] == "battery" for binding in setup_profile["confirmed_systems"])
+
+
+def test_agent_can_drive_monitoring_view_for_system_load_question(tmp_path, monkeypatch):
+    app = _bootstrap_app(tmp_path, monkeypatch, "monitoring.db")
+
+    with TestClient(app) as client:
+        discovery_turn = client.post("/api/v1/agent/messages", json={"content": "Scan the house."}).json()["turn_id"]
+        client.get(f"/api/v1/agent/turns/{discovery_turn}/events")
+
+        accepted = client.post("/api/v1/agent/messages", json={"content": "Do you see load curves for the heat pump?"})
+        assert accepted.status_code == 200
+        turn_id = accepted.json()["turn_id"]
+        stream_response = client.get(f"/api/v1/agent/turns/{turn_id}/events")
+        events = _decode_sse_payloads(stream_response.text)
+
+        ui_actions_event = next(event for event in events if event["event_type"] == "ui_actions")
+        assert any(action["type"] == "open_view" and action["payload"]["view"] == "monitoring" for action in ui_actions_event["payload"]["actions"])
+        assert any(action["type"] == "show_monitoring" for action in ui_actions_event["payload"]["actions"])
 
 
 def test_agent_provider_config_can_be_updated_without_returning_the_key(tmp_path, monkeypatch):
@@ -182,3 +205,4 @@ def test_agent_uses_configured_openai_compatible_provider_for_final_response(tmp
         events = _decode_sse_payloads(stream_response.text)
         completed = next(event for event in events if event["event_type"] == "assistant_message_completed")
         assert "I checked the current setup" in completed["payload"]["message"]["content"]
+        assert completed["payload"]["ui_actions"]

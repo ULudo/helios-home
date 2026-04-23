@@ -46,10 +46,22 @@ class ProposalRequest:
 
 
 @dataclass(slots=True)
+class UiAction:
+    type: str
+    payload: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
 class TurnDecision:
     tool_calls: list[ToolRequest] = field(default_factory=list)
     proposal_requests: list[ProposalRequest] = field(default_factory=list)
     immediate_response: str | None = None
+
+
+@dataclass(slots=True)
+class TurnOutput:
+    message: str
+    ui_actions: list[UiAction] = field(default_factory=list)
 
 
 class AgentProvider(Protocol):
@@ -64,7 +76,7 @@ class AgentProvider(Protocol):
         user_message: str,
         tool_results: dict[str, Any],
         created_proposals: list[dict[str, Any]],
-    ) -> str:
+    ) -> TurnOutput:
         ...
 
 
@@ -170,21 +182,25 @@ class StubAgentProvider:
         user_message: str,
         tool_results: dict[str, Any],
         created_proposals: list[dict[str, Any]],
-    ) -> str:
+    ) -> TurnOutput:
+        message: str
         if "confirm_latest_proposal" in tool_results:
             result = tool_results["confirm_latest_proposal"]
-            return f"I applied that confirmation. {result.get('summary', 'The setup state is updated.')}"
+            message = f"I applied that confirmation. {result.get('summary', 'The setup state is updated.')}"
+            return TurnOutput(message=message, ui_actions=self._build_ui_actions(context, user_message, tool_results, created_proposals, message))
 
         if "reject_latest_proposal" in tool_results:
             result = tool_results["reject_latest_proposal"]
-            return f"I left the current setup unchanged. {result.get('summary', 'The proposal was rejected.')}"
+            message = f"I left the current setup unchanged. {result.get('summary', 'The proposal was rejected.')}"
+            return TurnOutput(message=message, ui_actions=self._build_ui_actions(context, user_message, tool_results, created_proposals, message))
 
         if "refresh_discovery" in tool_results:
             result = tool_results["refresh_discovery"]
-            return (
+            message = (
                 f"I refreshed discovery and now see {result.get('integrated_devices', 0)} integrated devices "
                 f"from {', '.join(result.get('source_names', [])) or 'the configured local sources'}."
             )
+            return TurnOutput(message=message, ui_actions=self._build_ui_actions(context, user_message, tool_results, created_proposals, message))
 
         if "run_latest_debug_probe" in tool_results:
             report = tool_results.get("run_latest_debug_probe") or {}
@@ -192,22 +208,28 @@ class StubAgentProvider:
             summary = diagnosis.get("summary") or "I checked the claim and refined the diagnosis."
             next_actions = diagnosis.get("next_actions", [])
             if next_actions:
-                return f"{summary} Next, I recommend: {next_actions[0]}"
-            return summary
+                message = f"{summary} Next, I recommend: {next_actions[0]}"
+                return TurnOutput(message=message, ui_actions=self._build_ui_actions(context, user_message, tool_results, created_proposals, message))
+            message = summary
+            return TurnOutput(message=message, ui_actions=self._build_ui_actions(context, user_message, tool_results, created_proposals, message))
 
         if "open_debug_case" in tool_results:
             report = tool_results["open_debug_case"]
             diagnosis = report.get("diagnosis", {})
-            return diagnosis.get("summary") or "I opened a debug case for that device claim."
+            message = diagnosis.get("summary") or "I opened a debug case for that device claim."
+            return TurnOutput(message=message, ui_actions=self._build_ui_actions(context, user_message, tool_results, created_proposals, message))
 
         if created_proposals:
             summary = created_proposals[0].get("summary", "I prepared a confirmation step.")
             if created_proposals[0].get("action_type") == "confirm_system_binding":
-                return f"I found a likely match. Please confirm it: {summary}"
-            return f"I prepared the next setup action for confirmation: {summary}"
+                message = f"I found a likely match. Please confirm it: {summary}"
+                return TurnOutput(message=message, ui_actions=self._build_ui_actions(context, user_message, tool_results, created_proposals, message))
+            message = f"I prepared the next setup action for confirmation: {summary}"
+            return TurnOutput(message=message, ui_actions=self._build_ui_actions(context, user_message, tool_results, created_proposals, message))
 
         immediate = self.decide_turn(context, user_message).immediate_response
-        return immediate or "I updated the setup context."
+        message = immediate or "I updated the setup context."
+        return TurnOutput(message=message, ui_actions=self._build_ui_actions(context, user_message, tool_results, created_proposals, message))
 
     def _requested_system_type(self, normalized: str) -> str | None:
         if _contains_any(normalized, ("heat pump", "wärmepumpe", "heizung")):
@@ -244,6 +266,155 @@ class StubAgentProvider:
         summary = ", ".join(f"{count} {device_type.replace('_', ' ')}" for device_type, count in sorted(by_type.items()))
         return f"I currently see {len(devices)} devices: {summary}."
 
+    def _infer_system_type(self, context: dict[str, Any], normalized: str) -> str | None:
+        requested = self._requested_system_type(normalized)
+        if requested is not None:
+            return requested
+        recent_messages = context.get("recent_messages", [])
+        for message in reversed(recent_messages):
+            if str(message.get("role", "")) != "user":
+                continue
+            content = _normalize(str(message.get("content", "")))
+            requested = self._requested_system_type(content)
+            if requested is not None:
+                return requested
+        return None
+
+    def _build_ui_actions(
+        self,
+        context: dict[str, Any],
+        user_message: str,
+        tool_results: dict[str, Any],
+        created_proposals: list[dict[str, Any]],
+        message: str,
+    ) -> list[UiAction]:
+        normalized = _normalize(user_message)
+        devices = context.get("devices", [])
+        ui_actions: list[UiAction] = []
+        system_type = self._infer_system_type(context, normalized)
+        matches = self._matching_devices(devices, system_type) if system_type is not None else []
+        monitoring_intent = _contains_any(
+            normalized,
+            ("load curve", "load curves", "plot", "plots", "graph", "monitor", "monitoring", "power", "verbrauch", "last", "trend"),
+        )
+        overview_intent = _contains_any(
+            normalized,
+            ("what do you see", "what can you see", "what have you found", "show overview", "overview", "scan", "discover", "refresh"),
+        )
+
+        if monitoring_intent:
+            target_devices = matches or devices[: min(3, len(devices))]
+            if target_devices:
+                target_ids = [str(device["id"]) for device in target_devices]
+                if system_type is not None:
+                    ui_actions.append(UiAction(type="focus_system", payload={"system_type": system_type}))
+                ui_actions.extend(
+                    [
+                        UiAction(type="open_view", payload={"view": "monitoring", "mode": "switch"}),
+                        UiAction(type="select_devices", payload={"device_ids": target_ids}),
+                        UiAction(type="highlight_devices", payload={"device_ids": target_ids}),
+                        UiAction(
+                            type="show_monitoring",
+                            payload={
+                                "device_ids": target_ids,
+                                "metric_keys": ["power_w"],
+                                "time_range": "last_24h",
+                                "mode": "switch",
+                            },
+                        ),
+                        UiAction(
+                            type="show_explanation",
+                            payload={
+                                "title": "Monitoring view",
+                                "body": message,
+                                "severity": "info",
+                            },
+                        ),
+                    ]
+                )
+                return ui_actions
+
+        if system_type is not None:
+            ui_actions.append(UiAction(type="focus_system", payload={"system_type": system_type}))
+            if matches:
+                target_ids = [str(device["id"]) for device in matches]
+                ui_actions.extend(
+                    [
+                        UiAction(type="open_view", payload={"view": "devices", "mode": "focus"}),
+                        UiAction(type="highlight_devices", payload={"device_ids": target_ids}),
+                        UiAction(type="select_devices", payload={"device_ids": target_ids[:1]}),
+                        UiAction(
+                            type="show_explanation",
+                            payload={
+                                "title": f"{system_type.replace('_', ' ').title()} candidates",
+                                "body": message,
+                                "severity": "info",
+                            },
+                        ),
+                    ]
+                )
+            else:
+                ui_actions.extend(
+                    [
+                        UiAction(type="open_view", payload={"view": "tasks", "mode": "focus"}),
+                        UiAction(
+                            type="show_explanation",
+                            payload={
+                                "title": f"{system_type.replace('_', ' ').title()} setup",
+                                "body": message,
+                                "severity": "caution",
+                            },
+                        ),
+                    ]
+                )
+            return ui_actions
+
+        if created_proposals:
+            ui_actions.extend(
+                [
+                    UiAction(type="open_view", payload={"view": "tasks", "mode": "focus"}),
+                    UiAction(
+                        type="show_explanation",
+                        payload={
+                            "title": "Confirmation needed",
+                            "body": message,
+                            "severity": "caution",
+                        },
+                    ),
+                ]
+            )
+            return ui_actions
+
+        if overview_intent or "refresh_discovery" in tool_results:
+            ui_actions.extend(
+                [
+                    UiAction(type="open_view", payload={"view": "overview", "mode": "focus"}),
+                    UiAction(type="clear_focus", payload={}),
+                    UiAction(
+                        type="show_explanation",
+                        payload={
+                            "title": "Current house view",
+                            "body": message,
+                            "severity": "info",
+                        },
+                    ),
+                ]
+            )
+            return ui_actions
+
+        if tool_results or devices:
+            ui_actions.append(
+                UiAction(
+                    type="show_explanation",
+                    payload={
+                        "title": "Helios context",
+                        "body": message,
+                        "severity": "info",
+                    },
+                )
+            )
+        return ui_actions
+
 
 class LLMBackedAgentProvider:
     def __init__(self, runtime: ProviderRuntimeStatus):
@@ -260,15 +431,19 @@ class LLMBackedAgentProvider:
         user_message: str,
         tool_results: dict[str, Any],
         created_proposals: list[dict[str, Any]],
-    ) -> str:
-        fallback_text = self._fallback.compose_turn(context, user_message, tool_results, created_proposals)
+    ) -> TurnOutput:
+        fallback_output = self._fallback.compose_turn(context, user_message, tool_results, created_proposals)
         try:
-            return self._complete_response(context, user_message, tool_results, created_proposals, fallback_text)
+            message = self._complete_response(context, user_message, tool_results, created_proposals, fallback_output.message)
+            return TurnOutput(message=message, ui_actions=fallback_output.ui_actions)
         except Exception as exc:
-            return (
-                f"{fallback_text}\n\n"
+            return TurnOutput(
+                message=(
+                f"{fallback_output.message}\n\n"
                 f"I could not reach the configured {self.runtime.spec.label} provider, so I used the local fallback instead. "
                 f"Details: {exc}"
+                ),
+                ui_actions=fallback_output.ui_actions,
             )
 
     def _complete_response(

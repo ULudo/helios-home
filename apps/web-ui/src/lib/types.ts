@@ -344,3 +344,22 @@ export interface ActionProposalDecisionRead {
   proposal: ActionProposalRead;
   thread: AgentThreadRead;
 }
+
+export type ViewKey = "overview" | "devices" | "monitoring" | "tasks" | "settings";
+export type NavigationMode = "peek" | "focus" | "switch";
+export type TimeRange = "last_1h" | "last_6h" | "last_24h" | "last_7d";
+
+export type AgentUiAction =
+  | { type: "open_view"; payload: { view: ViewKey; mode?: NavigationMode } }
+  | { type: "focus_system"; payload: { system_type: string | null } }
+  | { type: "select_devices"; payload: { device_ids: string[] } }
+  | { type: "highlight_devices"; payload: { device_ids: string[] } }
+  | {
+      type: "show_monitoring";
+      payload: { device_ids: string[]; metric_keys: string[]; time_range: TimeRange; mode?: NavigationMode };
+    }
+  | {
+      type: "show_explanation";
+      payload: { title: string; body: string; severity?: "info" | "caution" | "critical" };
+    }
+  | { type: "clear_focus"; payload: Record<string, never> };
