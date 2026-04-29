@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 from typing import Any, Protocol
 
 import httpx
@@ -14,7 +15,18 @@ def _normalize(text: str) -> str:
 
 def _contains_any(text: str, tokens: tuple[str, ...] | list[str]) -> bool:
     normalized = _normalize(text)
-    return any(token in normalized for token in tokens)
+    for token in tokens:
+        normalized_token = _normalize(token)
+        if not normalized_token:
+            continue
+        if " " in normalized_token:
+            if normalized_token in normalized:
+                return True
+            continue
+        pattern = rf"(?<!\w){re.escape(normalized_token)}(?!\w)"
+        if re.search(pattern, normalized):
+            return True
+    return False
 
 
 def _stringify_json(value: Any) -> str:
@@ -101,7 +113,7 @@ class StubAgentProvider:
         if pending_proposals and normalized in {"no", "nope", "reject", "cancel", "not that one"}:
             return TurnDecision(tool_calls=[ToolRequest(name="reject_latest_proposal")])
 
-        if _contains_any(normalized, ("scan", "discover", "refresh", "look again", "erneut", "suche", "scan my")):
+        if _contains_any(normalized, ("scan", "discover", "refresh", "look again", "erneut", "suche", "search", "find devices", "scan my")):
             return TurnDecision(tool_calls=[ToolRequest(name="refresh_discovery")])
 
         if _contains_any(normalized, ("all networks", "scan everything", "alle netze", "ganze netz", "all subnets")):
@@ -196,10 +208,7 @@ class StubAgentProvider:
 
         if "refresh_discovery" in tool_results:
             result = tool_results["refresh_discovery"]
-            message = (
-                f"I refreshed discovery and now see {result.get('integrated_devices', 0)} integrated devices "
-                f"from {', '.join(result.get('source_names', [])) or 'the configured local sources'}."
-            )
+            message = self._discovery_guidance(context.get("devices", []), result)
             return TurnOutput(message=message, ui_actions=self._build_ui_actions(context, user_message, tool_results, created_proposals, message))
 
         if "run_latest_debug_probe" in tool_results:
@@ -266,10 +275,51 @@ class StubAgentProvider:
         summary = ", ".join(f"{count} {device_type.replace('_', ' ')}" for device_type, count in sorted(by_type.items()))
         return f"I currently see {len(devices)} devices: {summary}."
 
+    def _discovery_guidance(self, devices: list[dict[str, Any]], result: dict[str, Any]) -> str:
+        source_names = ", ".join(result.get("source_names", [])) or "the configured local sources"
+        if not devices:
+            return (
+                f"I refreshed discovery through {source_names}, but I do not see any integrated devices yet. "
+                "The next useful step is to confirm the network scope or tell me which device you expected to find."
+            )
+
+        by_type: dict[str, list[dict[str, Any]]] = {}
+        for device in devices:
+            device_type = str(device.get("device_type", "unknown"))
+            by_type.setdefault(device_type, []).append(device)
+        type_summary = ", ".join(
+            f"{len(group)} {device_type.replace('_', ' ')}"
+            for device_type, group in sorted(by_type.items())
+        )
+        ambiguous = [
+            device
+            for device in devices
+            if str(device.get("device_type", "")) in {"smart_appliance", "other", "unclassified_energy_device"}
+            or str(device.get("status", "")) in {"visible_only", "protocol_incomplete"}
+        ]
+        examples = ", ".join(str(device.get("name", "unknown")) for device in devices[:4])
+        suffix = "" if len(devices) <= 4 else f", and {len(devices) - 4} more"
+
+        if ambiguous:
+            ambiguous_names = ", ".join(str(device.get("name", "unknown")) for device in ambiguous[:3])
+            return (
+                f"I refreshed discovery and now see {len(devices)} device(s) from {source_names}: {type_summary}. "
+                f"Examples are {examples}{suffix}. Some devices still need user help to identify what they belong to, "
+                f"for example {ambiguous_names}. A good next step is: tell me which physical system one of these devices controls "
+                "or ask me to inspect a specific device. If a device currently has no useful load signal, I may not be able to infer its role from telemetry alone."
+            )
+
+        return (
+            f"I refreshed discovery and now see {len(devices)} device(s) from {source_names}: {type_summary}. "
+            f"Examples are {examples}{suffix}. Next, tell me which system you want to set up first, such as the heat pump, battery, PV, or EV charger."
+        )
+
     def _infer_system_type(self, context: dict[str, Any], normalized: str) -> str | None:
         requested = self._requested_system_type(normalized)
         if requested is not None:
             return requested
+        if self._is_overview_or_discovery_intent(normalized):
+            return None
         recent_messages = context.get("recent_messages", [])
         for message in reversed(recent_messages):
             if str(message.get("role", "")) != "user":
@@ -279,6 +329,28 @@ class StubAgentProvider:
             if requested is not None:
                 return requested
         return None
+
+    def _is_overview_or_discovery_intent(self, normalized: str) -> bool:
+        return _contains_any(
+            normalized,
+            (
+                "scan",
+                "discover",
+                "refresh",
+                "look again",
+                "erneut",
+                "suche",
+                "search",
+                "devices",
+                "network",
+                "netzwerk",
+                "what do you see",
+                "what can you see",
+                "what have you found",
+                "was hast du",
+                "overview",
+            ),
+        )
 
     def _build_ui_actions(
         self,
@@ -291,15 +363,12 @@ class StubAgentProvider:
         normalized = _normalize(user_message)
         devices = context.get("devices", [])
         ui_actions: list[UiAction] = []
-        system_type = self._infer_system_type(context, normalized)
+        overview_intent = self._is_overview_or_discovery_intent(normalized)
+        system_type = None if overview_intent else self._infer_system_type(context, normalized)
         matches = self._matching_devices(devices, system_type) if system_type is not None else []
         monitoring_intent = _contains_any(
             normalized,
             ("load curve", "load curves", "plot", "plots", "graph", "monitor", "monitoring", "power", "verbrauch", "last", "trend"),
-        )
-        overview_intent = _contains_any(
-            normalized,
-            ("what do you see", "what can you see", "what have you found", "show overview", "overview", "scan", "discover", "refresh"),
         )
 
         if monitoring_intent:
@@ -310,7 +379,7 @@ class StubAgentProvider:
                     ui_actions.append(UiAction(type="focus_system", payload={"system_type": system_type}))
                 ui_actions.extend(
                     [
-                        UiAction(type="open_view", payload={"view": "monitoring", "mode": "switch"}),
+                        UiAction(type="open_view", payload={"view": "overview", "mode": "focus"}),
                         UiAction(type="select_devices", payload={"device_ids": target_ids}),
                         UiAction(type="highlight_devices", payload={"device_ids": target_ids}),
                         UiAction(
@@ -340,7 +409,7 @@ class StubAgentProvider:
                 target_ids = [str(device["id"]) for device in matches]
                 ui_actions.extend(
                     [
-                        UiAction(type="open_view", payload={"view": "devices", "mode": "focus"}),
+                        UiAction(type="open_view", payload={"view": "overview", "mode": "focus"}),
                         UiAction(type="highlight_devices", payload={"device_ids": target_ids}),
                         UiAction(type="select_devices", payload={"device_ids": target_ids[:1]}),
                         UiAction(
@@ -356,7 +425,7 @@ class StubAgentProvider:
             else:
                 ui_actions.extend(
                     [
-                        UiAction(type="open_view", payload={"view": "tasks", "mode": "focus"}),
+                        UiAction(type="open_view", payload={"view": "overview", "mode": "focus"}),
                         UiAction(
                             type="show_explanation",
                             payload={
@@ -372,7 +441,7 @@ class StubAgentProvider:
         if created_proposals:
             ui_actions.extend(
                 [
-                    UiAction(type="open_view", payload={"view": "tasks", "mode": "focus"}),
+                    UiAction(type="open_view", payload={"view": "overview", "mode": "focus"}),
                     UiAction(
                         type="show_explanation",
                         payload={
@@ -386,14 +455,16 @@ class StubAgentProvider:
             return ui_actions
 
         if overview_intent or "refresh_discovery" in tool_results:
+            target_ids = [str(device["id"]) for device in devices]
             ui_actions.extend(
                 [
                     UiAction(type="open_view", payload={"view": "overview", "mode": "focus"}),
                     UiAction(type="clear_focus", payload={}),
+                    UiAction(type="highlight_devices", payload={"device_ids": target_ids}),
                     UiAction(
                         type="show_explanation",
                         payload={
-                            "title": "Current house view",
+                            "title": "Detected devices",
                             "body": message,
                             "severity": "info",
                         },
@@ -474,7 +545,8 @@ class LLMBackedAgentProvider:
             "You are Helios, a local-first home energy setup assistant. "
             "Respond clearly and concretely. Do not invent devices, capabilities, or completed actions. "
             "Use the provided context exactly. If a confirmation is pending, explicitly ask the user to confirm it. "
-            "Prefer plain language over technical jargon. Keep the reply compact but useful."
+            "Prefer plain language over technical jargon. Help the user set up the home step by step: say what Helios can infer alone, "
+            "where user confirmation is needed, and the next useful action. Keep the reply compact but useful."
         )
 
     def _user_prompt(
@@ -490,7 +562,12 @@ class LLMBackedAgentProvider:
         reachable_subnets = context.get("reachable_subnets", [])
         setup_profile = context.get("setup_profile", {})
         device_lines = [
-            f"- {device.get('name', 'Unknown')} ({device.get('device_type', 'unknown')}, {device.get('status', 'unknown')})"
+            (
+                f"- {device.get('name', 'Unknown')} ({device.get('device_type', 'unknown')}, {device.get('status', 'unknown')}); "
+                f"protocols={_stringify_json(device.get('protocols', []))}; "
+                f"capabilities={_stringify_json(device.get('capabilities', {}))}; "
+                f"telemetry_keys={_stringify_json(device.get('telemetry_keys', []))}"
+            )
             for device in devices[:12]
         ]
         proposal_lines = [

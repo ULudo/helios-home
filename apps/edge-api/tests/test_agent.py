@@ -87,7 +87,7 @@ def test_agent_can_propose_and_confirm_system_binding(tmp_path, monkeypatch):
         assert proposal_events[0]["payload"]["action_type"] == "confirm_system_binding"
         ui_actions_event = next(event for event in events if event["event_type"] == "ui_actions")
         assert any(action["type"] == "focus_system" and action["payload"]["system_type"] == "battery" for action in ui_actions_event["payload"]["actions"])
-        assert any(action["type"] == "open_view" and action["payload"]["view"] == "devices" for action in ui_actions_event["payload"]["actions"])
+        assert any(action["type"] == "open_view" and action["payload"]["view"] == "overview" for action in ui_actions_event["payload"]["actions"])
 
         decision = client.post(f"/api/v1/agent/proposals/{proposal_id}/confirm")
         assert decision.status_code == 200
@@ -109,8 +109,34 @@ def test_agent_can_drive_monitoring_view_for_system_load_question(tmp_path, monk
         events = _decode_sse_payloads(stream_response.text)
 
         ui_actions_event = next(event for event in events if event["event_type"] == "ui_actions")
-        assert any(action["type"] == "open_view" and action["payload"]["view"] == "monitoring" for action in ui_actions_event["payload"]["actions"])
+        assert any(action["type"] == "open_view" and action["payload"]["view"] == "overview" for action in ui_actions_event["payload"]["actions"])
         assert any(action["type"] == "show_monitoring" for action in ui_actions_event["payload"]["actions"])
+
+
+def test_generic_device_discovery_does_not_focus_ev_from_devices_word(tmp_path, monkeypatch):
+    app = _bootstrap_app(tmp_path, monkeypatch, "generic-devices.db")
+
+    with TestClient(app) as client:
+        accepted = client.post("/api/v1/agent/messages", json={"content": "Search for devices in the network."})
+        assert accepted.status_code == 200
+        turn_id = accepted.json()["turn_id"]
+        stream_response = client.get(f"/api/v1/agent/turns/{turn_id}/events")
+        assert stream_response.status_code == 200
+        events = _decode_sse_payloads(stream_response.text)
+
+        ui_actions_event = next(event for event in events if event["event_type"] == "ui_actions")
+        actions = ui_actions_event["payload"]["actions"]
+
+        assert any(action["type"] == "open_view" and action["payload"]["view"] == "overview" for action in actions)
+        assert any(action["type"] == "highlight_devices" for action in actions)
+        assert not any(
+            action["type"] == "focus_system" and action["payload"].get("system_type") == "ev_charger"
+            for action in actions
+        )
+
+        completed = next(event for event in events if event["event_type"] == "assistant_message_completed")
+        message = completed["payload"]["message"]["content"].lower()
+        assert "next" in message or "näch" in message or "user help" in message
 
 
 def test_agent_provider_config_can_be_updated_without_returning_the_key(tmp_path, monkeypatch):

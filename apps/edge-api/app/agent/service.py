@@ -282,6 +282,14 @@ def _context_snapshot(session: Session, thread: ConversationThread, profile: Sit
                 "manufacturer": device.manufacturer,
                 "model": device.model,
                 "status": device.primary_status,
+                "protocols": list(device.protocols),
+                "capabilities": device.capabilities.model_dump(),
+                "telemetry_keys": sorted(device.telemetry.keys()),
+                "telemetry_preview": {
+                    key: value
+                    for key, value in list(device.telemetry.items())[:6]
+                },
+                "next_step": device.next_step,
             }
             for device in overview.devices
         ],
