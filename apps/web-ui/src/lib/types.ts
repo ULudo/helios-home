@@ -261,9 +261,40 @@ export interface ActionProposalRead {
   summary: string;
   payload: Record<string, unknown>;
   status: string;
+  title: string;
+  risk_level: string;
+  target_refs: string[];
+  decision_request_id: string | null;
+  decision_question: string | null;
   created_at: string;
   updated_at: string;
   resolved_at: string | null;
+}
+
+export interface AgentBlockerRead {
+  id: string;
+  task_id: string | null;
+  subject_ref: string;
+  blocker_type: string;
+  summary: string;
+  status: string;
+  details: Record<string, unknown>;
+  created_at: string;
+  resolved_at: string | null;
+}
+
+export interface AgentTaskRead {
+  id: string;
+  task_type: string;
+  title: string;
+  goal: string;
+  status: string;
+  target_refs: string[];
+  context: Record<string, unknown>;
+  blockers: AgentBlockerRead[];
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
 }
 
 export interface DebugEvidenceRead {
@@ -317,6 +348,8 @@ export interface AgentThreadRead {
   status: string;
   messages: AgentMessageRead[];
   pending_proposals: ActionProposalRead[];
+  active_tasks: AgentTaskRead[];
+  open_blockers: AgentBlockerRead[];
   setup_profile: SiteSetupProfileRead;
   latest_debug_case: DebugCaseRead | null;
   created_at: string;
@@ -325,6 +358,7 @@ export interface AgentThreadRead {
 
 export interface AgentMessageCreate {
   content: string;
+  context?: Record<string, unknown>;
 }
 
 export interface AgentTurnAcceptedRead {
@@ -345,21 +379,33 @@ export interface ActionProposalDecisionRead {
   thread: AgentThreadRead;
 }
 
+export interface UserDecisionCreate {
+  decision: "approve" | "reject";
+  comment?: string;
+}
+
 export type ViewKey = "overview" | "devices" | "monitoring" | "tasks" | "settings";
 export type NavigationMode = "peek" | "focus" | "switch";
 export type TimeRange = "last_1h" | "last_6h" | "last_24h" | "last_7d";
 
-export type AgentUiAction =
-  | { type: "open_view"; payload: { view: ViewKey; mode?: NavigationMode } }
-  | { type: "focus_system"; payload: { system_type: string | null } }
-  | { type: "select_devices"; payload: { device_ids: string[] } }
-  | { type: "highlight_devices"; payload: { device_ids: string[] } }
+export type AgentUiEvent =
+  | { event_type: "view.open"; payload: { view: ViewKey; mode?: NavigationMode } }
+  | { event_type: "entity.focus"; payload: { entity_refs: string[]; reason?: string; mode?: "focus" | "highlight" } }
   | {
-      type: "show_monitoring";
-      payload: { device_ids: string[]; metric_keys: string[]; time_range: TimeRange; mode?: NavigationMode };
+      event_type: "entity.relationship.show";
+      payload: { from_ref: string; to_ref: string; relationship: string };
     }
   | {
-      type: "show_explanation";
-      payload: { title: string; body: string; severity?: "info" | "caution" | "critical" };
+      event_type: "task.show";
+      payload: {
+        task_ref: string;
+        mode?: "progress" | "blockers" | "summary";
+        title?: string;
+        status?: string;
+        summary?: string;
+        blockers?: Array<Record<string, unknown>>;
+      };
     }
-  | { type: "clear_focus"; payload: Record<string, never> };
+  | { event_type: "proposal.present"; payload: { proposal_ref: string; decision_request_ref: string } }
+  | { event_type: "evidence.recorded"; payload: { evidence_ref: string; subject_ref: string } }
+  | { event_type: "assessment.show"; payload: { assessment_ref: string; entity_ref: string } };

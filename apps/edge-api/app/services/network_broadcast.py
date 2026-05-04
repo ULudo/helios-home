@@ -142,8 +142,18 @@ def _service_instance_key(value: str) -> str | None:
     return _slugify(normalized)
 
 
+def _is_eebus_ship_announcement(announcements: list[BroadcastAnnouncement]) -> bool:
+    for announcement in announcements:
+        haystack = _combined_text(announcement.service_type, announcement.service_name, *announcement.txt)
+        if "_ship._tcp.local" in haystack or "eebus" in haystack:
+            return True
+    return False
+
+
 def _build_announcement_candidate(group_key: str, announcements: list[BroadcastAnnouncement]) -> RawCandidate | None:
     protocols = sorted({announcement.protocol for announcement in announcements})
+    if _is_eebus_ship_announcement(announcements):
+        protocols = sorted({*protocols, "eebus_ship"})
     host = next((announcement.host for announcement in announcements if announcement.host), None)
     service_names = [announcement.service_name for announcement in announcements if announcement.service_name]
     service_types = [announcement.service_type for announcement in announcements if announcement.service_type]

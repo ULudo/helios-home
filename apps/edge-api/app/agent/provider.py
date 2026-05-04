@@ -1,692 +1,395 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 import re
-from typing import Any, Protocol
+import time
+from typing import Any, Literal, Protocol
 
 import httpx
 
 from app.agent.configuration import PROVIDER_SPECS, ProviderRuntimeStatus
 
 
-def _normalize(text: str) -> str:
-    return " ".join(text.lower().split())
-
-
-def _contains_any(text: str, tokens: tuple[str, ...] | list[str]) -> bool:
-    normalized = _normalize(text)
-    for token in tokens:
-        normalized_token = _normalize(token)
-        if not normalized_token:
-            continue
-        if " " in normalized_token:
-            if normalized_token in normalized:
-                return True
-            continue
-        pattern = rf"(?<!\w){re.escape(normalized_token)}(?!\w)"
-        if re.search(pattern, normalized):
-            return True
-    return False
-
-
 def _stringify_json(value: Any) -> str:
     if isinstance(value, str):
         return value
-    if value is None:
-        return "null"
-    if isinstance(value, (int, float, bool)):
-        return str(value)
-    if isinstance(value, dict):
-        parts = [f"{key}: {_stringify_json(inner)}" for key, inner in value.items()]
-        return "{ " + ", ".join(parts) + " }"
-    if isinstance(value, list):
-        return "[ " + ", ".join(_stringify_json(item) for item in value) + " ]"
-    return str(value)
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def _supports_openai_reasoning_effort(model: str) -> bool:
+    normalized = model.strip().lower()
+    return normalized.startswith("gpt-5") or bool(re.match(r"^o\d", normalized))
+
+
+def _openai_incomplete_reason(payload: dict[str, Any]) -> str:
+    details = payload.get("incomplete_details")
+    if isinstance(details, dict):
+        return str(details.get("reason") or "")
+    return ""
+
+
+def _extract_openai_response_text(payload: dict[str, Any]) -> str:
+    output_text = str(payload.get("output_text", "")).strip()
+    if output_text:
+        return output_text
+
+    output_items = payload.get("output") or []
+    parts: list[str] = []
+    for item in output_items:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        for content_item in item.get("content") or []:
+            if not isinstance(content_item, dict):
+                continue
+            text = str(content_item.get("text", "")).strip()
+            if text:
+                parts.append(text)
+    return "\n".join(parts).strip()
 
 
 @dataclass(slots=True)
-class ToolRequest:
+class ModelToolCall:
     name: str
     arguments: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
-class ProposalRequest:
-    action_type: str
-    summary: str
-    payload: dict[str, Any] = field(default_factory=dict)
+class ModelFinalAnswer:
+    content: str
+
+
+ModelAction = ModelToolCall | ModelFinalAnswer
 
 
 @dataclass(slots=True)
-class UiAction:
-    type: str
-    payload: dict[str, Any] = field(default_factory=dict)
+class ModelObservation:
+    tool_name: str
+    output: dict[str, Any] = field(default_factory=dict)
+    invocation_id: str = ""
+    ui_events: list[dict[str, Any]] = field(default_factory=list)
+    error: str = ""
 
 
 @dataclass(slots=True)
-class TurnDecision:
-    tool_calls: list[ToolRequest] = field(default_factory=list)
-    proposal_requests: list[ProposalRequest] = field(default_factory=list)
-    immediate_response: str | None = None
+class ModelRequest:
+    turn_id: str
+    user_message: str
+    recent_messages: list[dict[str, Any]]
+    context: dict[str, Any]
+    available_tools: list[dict[str, Any]]
+    observations: list[ModelObservation] = field(default_factory=list)
+    force_final: bool = False
+    max_tool_iterations: int = 6
 
 
 @dataclass(slots=True)
-class TurnOutput:
+class ModelResponse:
+    action: ModelAction
+    provider_name: str
+    model: str
+    raw_text: str = ""
+    raw_payload: dict[str, Any] = field(default_factory=dict)
+    latency_ms: int | None = None
+    token_usage: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class ModelError:
     message: str
-    ui_actions: list[UiAction] = field(default_factory=list)
+    provider_name: str
+    model: str = ""
+    raw_payload: dict[str, Any] = field(default_factory=dict)
 
 
-class AgentProvider(Protocol):
+class ProviderError(RuntimeError):
+    def __init__(self, message: str, *, raw_text: str = "", raw_payload: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.raw_text = raw_text
+        self.raw_payload = raw_payload or {}
+
+
+class ModelProvider(Protocol):
     provider_name: str
 
-    def decide_turn(self, context: dict[str, Any], user_message: str) -> TurnDecision:
-        ...
-
-    def compose_turn(
-        self,
-        context: dict[str, Any],
-        user_message: str,
-        tool_results: dict[str, Any],
-        created_proposals: list[dict[str, Any]],
-    ) -> TurnOutput:
+    def next_action(self, request: ModelRequest) -> ModelResponse:
         ...
 
 
-class StubAgentProvider:
+class DiagnosticStubModelProvider:
     provider_name = "stub"
 
-    def decide_turn(self, context: dict[str, Any], user_message: str) -> TurnDecision:
-        normalized = _normalize(user_message)
-        devices = context.get("devices", [])
-        pending_proposals = context.get("pending_proposals", [])
-        reachable_subnets = context.get("reachable_subnets", [])
-        current_scope = set(context.get("current_subnets", []))
-        referenced_subnets = [
-            entry["cidr"]
-            for entry in reachable_subnets
-            if str(entry.get("cidr", "")) and str(entry.get("cidr", "")) in normalized
-        ]
-
-        if pending_proposals and normalized in {"yes", "yeah", "yep", "correct", "confirm", "do it", "sounds good"}:
-            return TurnDecision(tool_calls=[ToolRequest(name="confirm_latest_proposal")])
-
-        if pending_proposals and normalized in {"no", "nope", "reject", "cancel", "not that one"}:
-            return TurnDecision(tool_calls=[ToolRequest(name="reject_latest_proposal")])
-
-        if _contains_any(normalized, ("scan", "discover", "refresh", "look again", "erneut", "suche", "search", "find devices", "scan my")):
-            return TurnDecision(tool_calls=[ToolRequest(name="refresh_discovery")])
-
-        if _contains_any(normalized, ("all networks", "scan everything", "alle netze", "ganze netz", "all subnets")):
-            all_subnets = [entry["cidr"] for entry in reachable_subnets]
-            if all_subnets and set(all_subnets) != current_scope:
-                return TurnDecision(
-                    proposal_requests=[
-                        ProposalRequest(
-                            action_type="update_site_scope",
-                            summary=f"Use all reachable subnets for discovery ({len(all_subnets)} network segment(s)).",
-                            payload={"local_subnet": ", ".join(all_subnets)},
-                        )
-                    ]
-                )
-
-        if referenced_subnets:
-            selected = ", ".join(referenced_subnets)
-            if set(referenced_subnets) != current_scope:
-                return TurnDecision(
-                    proposal_requests=[
-                        ProposalRequest(
-                            action_type="update_site_scope",
-                            summary=f"Use {selected} for discovery.",
-                            payload={"local_subnet": selected},
-                        )
-                    ]
-                )
-
-        if _contains_any(normalized, ("what do you see", "what can you see", "was hast du", "what have you found")):
-            return TurnDecision(immediate_response=self._device_summary(devices))
-
-        requested_system = self._requested_system_type(normalized)
-        if requested_system is not None:
-            matches = self._matching_devices(devices, requested_system)
-            if len(matches) == 1:
-                device = matches[0]
-                return TurnDecision(
-                    proposal_requests=[
-                        ProposalRequest(
-                            action_type="confirm_system_binding",
-                            summary=f"Confirm {device['name']} as the home's {requested_system.replace('_', ' ')}.",
-                            payload={
-                                "system_type": requested_system,
-                                "label": device["name"],
-                                "device_id": device["id"],
-                                "device_name": device["name"],
-                            },
-                        )
-                    ]
-                )
-            if len(matches) > 1:
-                names = ", ".join(device["name"] for device in matches[:4])
-                return TurnDecision(
-                    immediate_response=f"I found multiple possible {requested_system.replace('_', ' ')} devices: {names}. Tell me which one looks right and I will bind it into the setup."
-                )
-            return TurnDecision(
-                tool_calls=[
-                    ToolRequest(
-                        name="open_debug_case",
-                        arguments={"device_type": requested_system, "notes": user_message},
-                    ),
-                    ToolRequest(name="run_latest_debug_probe"),
-                ]
-            )
-
-        if not devices:
-            return TurnDecision(
-                immediate_response="I do not have any detected devices yet. Ask me to scan the house and I will start discovery."
-            )
-
-        return TurnDecision(
-            immediate_response="I can scan the house, explain what I found, help you identify systems like the heat pump or battery, and propose setup changes for confirmation."
+    def next_action(self, request: ModelRequest) -> ModelResponse:
+        raise ProviderError(
+            "The development stub is diagnostic-only and cannot operate normal Helios agent turns. "
+            "Configure a model provider to use Helios as a model-operated command center."
         )
 
-    def compose_turn(
-        self,
-        context: dict[str, Any],
-        user_message: str,
-        tool_results: dict[str, Any],
-        created_proposals: list[dict[str, Any]],
-    ) -> TurnOutput:
-        message: str
-        if "confirm_latest_proposal" in tool_results:
-            result = tool_results["confirm_latest_proposal"]
-            message = f"I applied that confirmation. {result.get('summary', 'The setup state is updated.')}"
-            return TurnOutput(message=message, ui_actions=self._build_ui_actions(context, user_message, tool_results, created_proposals, message))
 
-        if "reject_latest_proposal" in tool_results:
-            result = tool_results["reject_latest_proposal"]
-            message = f"I left the current setup unchanged. {result.get('summary', 'The proposal was rejected.')}"
-            return TurnOutput(message=message, ui_actions=self._build_ui_actions(context, user_message, tool_results, created_proposals, message))
-
-        if "refresh_discovery" in tool_results:
-            result = tool_results["refresh_discovery"]
-            message = self._discovery_guidance(context.get("devices", []), result)
-            return TurnOutput(message=message, ui_actions=self._build_ui_actions(context, user_message, tool_results, created_proposals, message))
-
-        if "run_latest_debug_probe" in tool_results:
-            report = tool_results.get("run_latest_debug_probe") or {}
-            diagnosis = report.get("diagnosis", {})
-            summary = diagnosis.get("summary") or "I checked the claim and refined the diagnosis."
-            next_actions = diagnosis.get("next_actions", [])
-            if next_actions:
-                message = f"{summary} Next, I recommend: {next_actions[0]}"
-                return TurnOutput(message=message, ui_actions=self._build_ui_actions(context, user_message, tool_results, created_proposals, message))
-            message = summary
-            return TurnOutput(message=message, ui_actions=self._build_ui_actions(context, user_message, tool_results, created_proposals, message))
-
-        if "open_debug_case" in tool_results:
-            report = tool_results["open_debug_case"]
-            diagnosis = report.get("diagnosis", {})
-            message = diagnosis.get("summary") or "I opened a debug case for that device claim."
-            return TurnOutput(message=message, ui_actions=self._build_ui_actions(context, user_message, tool_results, created_proposals, message))
-
-        if created_proposals:
-            summary = created_proposals[0].get("summary", "I prepared a confirmation step.")
-            if created_proposals[0].get("action_type") == "confirm_system_binding":
-                message = f"I found a likely match. Please confirm it: {summary}"
-                return TurnOutput(message=message, ui_actions=self._build_ui_actions(context, user_message, tool_results, created_proposals, message))
-            message = f"I prepared the next setup action for confirmation: {summary}"
-            return TurnOutput(message=message, ui_actions=self._build_ui_actions(context, user_message, tool_results, created_proposals, message))
-
-        immediate = self.decide_turn(context, user_message).immediate_response
-        message = immediate or "I updated the setup context."
-        return TurnOutput(message=message, ui_actions=self._build_ui_actions(context, user_message, tool_results, created_proposals, message))
-
-    def _requested_system_type(self, normalized: str) -> str | None:
-        if _contains_any(normalized, ("heat pump", "wärmepumpe", "heizung")):
-            return "heat_pump"
-        if _contains_any(normalized, ("battery", "batterie", "storage")):
-            return "battery"
-        if _contains_any(normalized, ("pv", "solar", "inverter", "wechselrichter")):
-            return "pv_inverter"
-        if _contains_any(normalized, ("wallbox", "ev", "charger", "auto laden")):
-            return "ev_charger"
-        return None
-
-    def _matching_devices(self, devices: list[dict[str, Any]], system_type: str) -> list[dict[str, Any]]:
-        aliases = {
-            "heat_pump": {"heat_pump"},
-            "battery": {"battery"},
-            "pv_inverter": {"pv_inverter"},
-            "ev_charger": {"wallbox", "ev_charger"},
-        }
-        return [
-            device
-            for device in devices
-            if device.get("device_type") in aliases.get(system_type, {system_type})
-            or system_type.replace("_", " ") in _normalize(device.get("name", ""))
-        ]
-
-    def _device_summary(self, devices: list[dict[str, Any]]) -> str:
-        if not devices:
-            return "I do not see any devices yet. Ask me to run discovery and I will scan the configured local networks."
-        by_type: dict[str, int] = {}
-        for device in devices:
-            device_type = str(device.get("device_type", "unknown"))
-            by_type[device_type] = by_type.get(device_type, 0) + 1
-        summary = ", ".join(f"{count} {device_type.replace('_', ' ')}" for device_type, count in sorted(by_type.items()))
-        return f"I currently see {len(devices)} devices: {summary}."
-
-    def _discovery_guidance(self, devices: list[dict[str, Any]], result: dict[str, Any]) -> str:
-        source_names = ", ".join(result.get("source_names", [])) or "the configured local sources"
-        if not devices:
-            return (
-                f"I refreshed discovery through {source_names}, but I do not see any integrated devices yet. "
-                "The next useful step is to confirm the network scope or tell me which device you expected to find."
-            )
-
-        by_type: dict[str, list[dict[str, Any]]] = {}
-        for device in devices:
-            device_type = str(device.get("device_type", "unknown"))
-            by_type.setdefault(device_type, []).append(device)
-        type_summary = ", ".join(
-            f"{len(group)} {device_type.replace('_', ' ')}"
-            for device_type, group in sorted(by_type.items())
-        )
-        ambiguous = [
-            device
-            for device in devices
-            if str(device.get("device_type", "")) in {"smart_appliance", "other", "unclassified_energy_device"}
-            or str(device.get("status", "")) in {"visible_only", "protocol_incomplete"}
-        ]
-        examples = ", ".join(str(device.get("name", "unknown")) for device in devices[:4])
-        suffix = "" if len(devices) <= 4 else f", and {len(devices) - 4} more"
-
-        if ambiguous:
-            ambiguous_names = ", ".join(str(device.get("name", "unknown")) for device in ambiguous[:3])
-            return (
-                f"I refreshed discovery and now see {len(devices)} device(s) from {source_names}: {type_summary}. "
-                f"Examples are {examples}{suffix}. Some devices still need user help to identify what they belong to, "
-                f"for example {ambiguous_names}. A good next step is: tell me which physical system one of these devices controls "
-                "or ask me to inspect a specific device. If a device currently has no useful load signal, I may not be able to infer its role from telemetry alone."
-            )
-
-        return (
-            f"I refreshed discovery and now see {len(devices)} device(s) from {source_names}: {type_summary}. "
-            f"Examples are {examples}{suffix}. Next, tell me which system you want to set up first, such as the heat pump, battery, PV, or EV charger."
-        )
-
-    def _infer_system_type(self, context: dict[str, Any], normalized: str) -> str | None:
-        requested = self._requested_system_type(normalized)
-        if requested is not None:
-            return requested
-        if self._is_overview_or_discovery_intent(normalized):
-            return None
-        recent_messages = context.get("recent_messages", [])
-        for message in reversed(recent_messages):
-            if str(message.get("role", "")) != "user":
-                continue
-            content = _normalize(str(message.get("content", "")))
-            requested = self._requested_system_type(content)
-            if requested is not None:
-                return requested
-        return None
-
-    def _is_overview_or_discovery_intent(self, normalized: str) -> bool:
-        return _contains_any(
-            normalized,
-            (
-                "scan",
-                "discover",
-                "refresh",
-                "look again",
-                "erneut",
-                "suche",
-                "search",
-                "devices",
-                "network",
-                "netzwerk",
-                "what do you see",
-                "what can you see",
-                "what have you found",
-                "was hast du",
-                "overview",
-            ),
-        )
-
-    def _build_ui_actions(
-        self,
-        context: dict[str, Any],
-        user_message: str,
-        tool_results: dict[str, Any],
-        created_proposals: list[dict[str, Any]],
-        message: str,
-    ) -> list[UiAction]:
-        normalized = _normalize(user_message)
-        devices = context.get("devices", [])
-        ui_actions: list[UiAction] = []
-        overview_intent = self._is_overview_or_discovery_intent(normalized)
-        system_type = None if overview_intent else self._infer_system_type(context, normalized)
-        matches = self._matching_devices(devices, system_type) if system_type is not None else []
-        monitoring_intent = _contains_any(
-            normalized,
-            ("load curve", "load curves", "plot", "plots", "graph", "monitor", "monitoring", "power", "verbrauch", "last", "trend"),
-        )
-
-        if monitoring_intent:
-            target_devices = matches or devices[: min(3, len(devices))]
-            if target_devices:
-                target_ids = [str(device["id"]) for device in target_devices]
-                if system_type is not None:
-                    ui_actions.append(UiAction(type="focus_system", payload={"system_type": system_type}))
-                ui_actions.extend(
-                    [
-                        UiAction(type="open_view", payload={"view": "overview", "mode": "focus"}),
-                        UiAction(type="select_devices", payload={"device_ids": target_ids}),
-                        UiAction(type="highlight_devices", payload={"device_ids": target_ids}),
-                        UiAction(
-                            type="show_monitoring",
-                            payload={
-                                "device_ids": target_ids,
-                                "metric_keys": ["power_w"],
-                                "time_range": "last_24h",
-                                "mode": "switch",
-                            },
-                        ),
-                        UiAction(
-                            type="show_explanation",
-                            payload={
-                                "title": "Monitoring view",
-                                "body": message,
-                                "severity": "info",
-                            },
-                        ),
-                    ]
-                )
-                return ui_actions
-
-        if system_type is not None:
-            ui_actions.append(UiAction(type="focus_system", payload={"system_type": system_type}))
-            if matches:
-                target_ids = [str(device["id"]) for device in matches]
-                ui_actions.extend(
-                    [
-                        UiAction(type="open_view", payload={"view": "overview", "mode": "focus"}),
-                        UiAction(type="highlight_devices", payload={"device_ids": target_ids}),
-                        UiAction(type="select_devices", payload={"device_ids": target_ids[:1]}),
-                        UiAction(
-                            type="show_explanation",
-                            payload={
-                                "title": f"{system_type.replace('_', ' ').title()} candidates",
-                                "body": message,
-                                "severity": "info",
-                            },
-                        ),
-                    ]
-                )
-            else:
-                ui_actions.extend(
-                    [
-                        UiAction(type="open_view", payload={"view": "overview", "mode": "focus"}),
-                        UiAction(
-                            type="show_explanation",
-                            payload={
-                                "title": f"{system_type.replace('_', ' ').title()} setup",
-                                "body": message,
-                                "severity": "caution",
-                            },
-                        ),
-                    ]
-                )
-            return ui_actions
-
-        if created_proposals:
-            ui_actions.extend(
-                [
-                    UiAction(type="open_view", payload={"view": "overview", "mode": "focus"}),
-                    UiAction(
-                        type="show_explanation",
-                        payload={
-                            "title": "Confirmation needed",
-                            "body": message,
-                            "severity": "caution",
-                        },
-                    ),
-                ]
-            )
-            return ui_actions
-
-        if overview_intent or "refresh_discovery" in tool_results:
-            target_ids = [str(device["id"]) for device in devices]
-            ui_actions.extend(
-                [
-                    UiAction(type="open_view", payload={"view": "overview", "mode": "focus"}),
-                    UiAction(type="clear_focus", payload={}),
-                    UiAction(type="highlight_devices", payload={"device_ids": target_ids}),
-                    UiAction(
-                        type="show_explanation",
-                        payload={
-                            "title": "Detected devices",
-                            "body": message,
-                            "severity": "info",
-                        },
-                    ),
-                ]
-            )
-            return ui_actions
-
-        if tool_results or devices:
-            ui_actions.append(
-                UiAction(
-                    type="show_explanation",
-                    payload={
-                        "title": "Helios context",
-                        "body": message,
-                        "severity": "info",
-                    },
-                )
-            )
-        return ui_actions
-
-
-class LLMBackedAgentProvider:
+class LLMModelProvider:
     def __init__(self, runtime: ProviderRuntimeStatus):
         self.provider_name = runtime.effective_provider
         self.runtime = runtime
-        self._fallback = StubAgentProvider()
 
-    def decide_turn(self, context: dict[str, Any], user_message: str) -> TurnDecision:
-        return self._fallback.decide_turn(context, user_message)
+    def next_action(self, request: ModelRequest) -> ModelResponse:
+        started = time.perf_counter()
+        response = self._complete_action(request)
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        response.latency_ms = latency_ms
+        return response
 
-    def compose_turn(
-        self,
-        context: dict[str, Any],
-        user_message: str,
-        tool_results: dict[str, Any],
-        created_proposals: list[dict[str, Any]],
-    ) -> TurnOutput:
-        fallback_output = self._fallback.compose_turn(context, user_message, tool_results, created_proposals)
-        try:
-            message = self._complete_response(context, user_message, tool_results, created_proposals, fallback_output.message)
-            return TurnOutput(message=message, ui_actions=fallback_output.ui_actions)
-        except Exception as exc:
-            return TurnOutput(
-                message=(
-                f"{fallback_output.message}\n\n"
-                f"I could not reach the configured {self.runtime.spec.label} provider, so I used the local fallback instead. "
-                f"Details: {exc}"
-                ),
-                ui_actions=fallback_output.ui_actions,
+    def _system_prompt(self, request: ModelRequest, *, json_action: bool = False) -> str:
+        final_constraint = (
+            "No tools are available for this response. Answer naturally based only on the conversation, "
+            "context, and observations."
+            if request.force_final
+            else "You may either call one typed tool through the provider tool interface or return a natural final answer."
+        )
+        lines = [
+            "You are the configured Helios Home model operator.",
+            "Helios-Home is the command center: it validates tools, executes deterministic workflows, persists state, and enforces safety.",
+            "You own semantic interpretation, follow-up/reference resolution strategy, tool choice, evaluation of observations, planning, and the natural final answer.",
+            "Never claim commissioning, telemetry validation, control, physical binding, or user approval unless it is explicitly present in tool observations or WorkStore/HomeGraph state.",
+            "The backend will reject unsafe or unavailable tool calls. The model must not ask tools to approve user decisions or apply physical control.",
+            final_constraint,
+        ]
+        if json_action:
+            lines.extend(
+                [
+                    "This provider does not expose a native tool-call channel here. Return strict JSON only, with one of these shapes:",
+                    '{"type":"tool_call","tool_call":{"name":"tool.name","arguments":{}}}',
+                    '{"type":"final_answer","final_answer":"natural assistant response"}',
+                ]
             )
+        return "\n".join(lines)
 
-    def _complete_response(
-        self,
-        context: dict[str, Any],
-        user_message: str,
-        tool_results: dict[str, Any],
-        created_proposals: list[dict[str, Any]],
-        fallback_text: str,
-    ) -> str:
-        spec = self.runtime.spec
-        state = self.runtime.state
-        prompt_system = self._system_prompt()
-        prompt_user = self._user_prompt(context, user_message, tool_results, created_proposals, fallback_text)
-
-        if spec.transport == "openai_compatible":
-            return self._complete_openai_compatible(prompt_system, prompt_user, state)
-        if spec.transport == "openai_responses":
-            return self._complete_openai_responses(prompt_system, prompt_user, state)
-        if spec.transport == "anthropic":
-            return self._complete_anthropic(prompt_system, prompt_user, state)
-        if spec.transport == "ollama":
-            return self._complete_ollama(prompt_system, prompt_user, state)
-        raise RuntimeError(f"Unsupported provider transport: {spec.transport}")
-
-    def _system_prompt(self) -> str:
-        return (
-            "You are Helios, a local-first home energy setup assistant. "
-            "Respond clearly and concretely. Do not invent devices, capabilities, or completed actions. "
-            "Use the provided context exactly. If a confirmation is pending, explicitly ask the user to confirm it. "
-            "Prefer plain language over technical jargon. Help the user set up the home step by step: say what Helios can infer alone, "
-            "where user confirmation is needed, and the next useful action. Keep the reply compact but useful."
+    def _user_prompt(self, request: ModelRequest, *, include_tool_schemas: bool) -> str:
+        observations = [
+            {
+                "tool_name": observation.tool_name,
+                "invocation_id": observation.invocation_id,
+                "output": observation.output,
+                "ui_events": observation.ui_events,
+                "error": observation.error,
+            }
+            for observation in request.observations
+        ]
+        context = dict(request.context)
+        if not include_tool_schemas:
+            context["available_tools"] = [tool.get("name") for tool in request.available_tools]
+        available_tools: list[dict[str, Any]] | list[str]
+        if request.force_final:
+            available_tools = []
+        elif include_tool_schemas:
+            available_tools = request.available_tools
+        else:
+            available_tools = [tool.get("name", "") for tool in request.available_tools]
+        return "\n".join(
+            [
+                f"Turn id: {request.turn_id}",
+                f"User message: {request.user_message}",
+                f"Recent conversation: {_stringify_json(request.recent_messages)}",
+                f"Available tools: {_stringify_json(available_tools)}",
+                f"Context snapshot: {_stringify_json(context)}",
+                f"Observations this turn: {_stringify_json(observations)}",
+                f"Max tool iterations this turn: {request.max_tool_iterations}",
+                (
+                    "Choose the next action. Use the provider tool-call channel for state inspection or mutation; "
+                    "return natural assistant text when you can answer from current context and observations."
+                    if not include_tool_schemas
+                    else "Choose the next action. Use tool_call JSON for state inspection or mutation; use final_answer JSON when you can answer naturally from current context and observations."
+                ),
+            ]
         )
 
-    def _user_prompt(
-        self,
-        context: dict[str, Any],
-        user_message: str,
-        tool_results: dict[str, Any],
-        created_proposals: list[dict[str, Any]],
-        fallback_text: str,
-    ) -> str:
-        devices = context.get("devices", [])
-        pending = context.get("pending_proposals", [])
-        reachable_subnets = context.get("reachable_subnets", [])
-        setup_profile = context.get("setup_profile", {})
-        device_lines = [
-            (
-                f"- {device.get('name', 'Unknown')} ({device.get('device_type', 'unknown')}, {device.get('status', 'unknown')}); "
-                f"protocols={_stringify_json(device.get('protocols', []))}; "
-                f"capabilities={_stringify_json(device.get('capabilities', {}))}; "
-                f"telemetry_keys={_stringify_json(device.get('telemetry_keys', []))}"
-            )
-            for device in devices[:12]
-        ]
-        proposal_lines = [
-            f"- {proposal.get('summary', 'Pending action')} ({proposal.get('action_type', 'unknown')})"
-            for proposal in created_proposals[:4]
-        ]
-        tool_lines = [
-            f"- {name}: {_stringify_json(result)}"
-            for name, result in tool_results.items()
-        ]
-        subnet_lines = [
-            f"- {entry.get('cidr', 'unknown')} via {entry.get('interface', 'unknown')}"
-            for entry in reachable_subnets[:8]
-        ]
-        prompt_lines = [
-            f"User message:\n{user_message}",
-            "",
-            f"Current selected discovery scope: {', '.join(context.get('current_subnets', [])) or 'none'}",
-            "Reachable subnets:",
-            *(subnet_lines or ["- none discovered"]),
-            "",
-            "Detected devices:",
-            *(device_lines or ["- none detected"]),
-            "",
-            f"Setup profile summary: {setup_profile.get('summary', 'No setup profile summary available.')}",
-            f"Confirmed systems: {_stringify_json(setup_profile.get('confirmed_systems', []))}",
-            f"Open setup questions: {_stringify_json(setup_profile.get('unresolved_items', []))}",
-            "",
-            "Tool results from this turn:",
-            *(tool_lines or ["- no tool executed"]),
-            "",
-            "New pending confirmations created in this turn:",
-            *(proposal_lines or ["- none"]),
-            "",
-            f"Existing pending confirmations: {len(pending)}",
-            "",
-            "Deterministic fallback draft:",
-            fallback_text,
-            "",
-            "Write the final assistant reply in natural language. Do not mention JSON or internal prompt structure.",
-        ]
-        return "\n".join(prompt_lines)
+    def _complete_action(self, request: ModelRequest) -> ModelResponse:
+        spec = self.runtime.spec
+        if spec.transport == "openai_compatible":
+            return self._complete_openai_compatible_action(request)
+        if spec.transport == "openai_responses":
+            return self._complete_openai_responses_action(request)
+        if spec.transport == "anthropic":
+            return self._complete_json_fallback_action(request, self._complete_anthropic_text)
+        if spec.transport == "ollama":
+            return self._complete_json_fallback_action(request, self._complete_ollama_text)
+        raise ProviderError(f"Unsupported provider transport: {spec.transport}")
 
-    def _complete_openai_compatible(self, prompt_system: str, prompt_user: str, state) -> str:
+    def _complete_openai_compatible_action(self, request: ModelRequest) -> ModelResponse:
+        state = self.runtime.state
         base_url = (state.base_url or PROVIDER_SPECS[self.provider_name].base_url_default or "").rstrip("/")
         headers = {"Content-Type": "application/json"}
         if state.api_key:
             headers["Authorization"] = f"Bearer {state.api_key}"
+        request_payload: dict[str, Any] = {
+            "model": state.model,
+            "temperature": 0.2,
+            "messages": [
+                {"role": "system", "content": self._system_prompt(request)},
+                {"role": "user", "content": self._user_prompt(request, include_tool_schemas=False)},
+            ],
+        }
+        name_map = _provider_tool_name_map(request.available_tools)
+        if request.available_tools and not request.force_final:
+            request_payload["tools"] = _openai_chat_tools(request.available_tools, name_map)
+            request_payload["tool_choice"] = "auto"
+            request_payload["parallel_tool_calls"] = False
         with httpx.Client(timeout=25.0) as client:
             response = client.post(
                 f"{base_url}/chat/completions",
                 headers=headers,
-                json={
-                    "model": state.model,
-                    "temperature": 0.2,
-                    "messages": [
-                        {"role": "system", "content": prompt_system},
-                        {"role": "user", "content": prompt_user},
-                    ],
-                },
+                json=request_payload,
             )
             self._raise_for_status(response)
             payload = response.json()
         choices = payload.get("choices") or []
         if not choices:
-            raise RuntimeError("The provider returned no choices.")
+            raise ProviderError("The provider returned no choices.", raw_payload=payload)
         message = choices[0].get("message") or {}
+        tool_calls = message.get("tool_calls") or []
+        if tool_calls and not request.force_final:
+            action = _model_tool_call_from_openai_chat_tool_call(tool_calls[0], name_map)
+            return ModelResponse(
+                action=action,
+                provider_name=self.provider_name,
+                model=state.model,
+                raw_payload=payload,
+                token_usage=payload.get("usage") or {},
+            )
         content = message.get("content")
         if isinstance(content, str) and content.strip():
-            return content.strip()
+            return ModelResponse(
+                action=ModelFinalAnswer(content.strip()),
+                provider_name=self.provider_name,
+                model=state.model,
+                raw_text=content.strip(),
+                raw_payload=payload,
+                token_usage=payload.get("usage") or {},
+            )
         if isinstance(content, list):
             parts = [str(item.get("text", "")).strip() for item in content if isinstance(item, dict)]
             joined = "\n".join(part for part in parts if part)
             if joined:
-                return joined
-        raise RuntimeError("The provider returned an empty message.")
+                return ModelResponse(
+                    action=ModelFinalAnswer(joined),
+                    provider_name=self.provider_name,
+                    model=state.model,
+                    raw_text=joined,
+                    raw_payload=payload,
+                    token_usage=payload.get("usage") or {},
+                )
+        raise ProviderError("The provider returned an empty message.", raw_payload=payload)
 
-    def _complete_openai_responses(self, prompt_system: str, prompt_user: str, state) -> str:
+    def _complete_openai_responses_action(self, request: ModelRequest) -> ModelResponse:
+        state = self.runtime.state
         base_url = (state.base_url or PROVIDER_SPECS[self.provider_name].base_url_default or "").rstrip("/")
         headers = {"Content-Type": "application/json"}
         if state.api_key:
             headers["Authorization"] = f"Bearer {state.api_key}"
+
+        budgets = (2400, 6000)
+        last_token_error = ""
+        name_map = _provider_tool_name_map(request.available_tools)
         with httpx.Client(timeout=25.0) as client:
-            response = client.post(
-                f"{base_url}/responses",
-                headers=headers,
-                json={
+            for attempt_index, token_budget in enumerate(budgets):
+                request_payload: dict[str, Any] = {
                     "model": state.model,
-                    "instructions": prompt_system,
-                    "input": prompt_user,
-                    "max_output_tokens": 900,
-                },
-            )
-            self._raise_for_status(response)
-            payload = response.json()
+                    "instructions": self._system_prompt(request),
+                    "input": self._user_prompt(request, include_tool_schemas=False),
+                    "max_output_tokens": token_budget,
+                }
+                if request.available_tools and not request.force_final:
+                    request_payload["tools"] = _openai_response_tools(request.available_tools, name_map)
+                    request_payload["tool_choice"] = "auto"
+                    request_payload["parallel_tool_calls"] = False
+                if _supports_openai_reasoning_effort(state.model):
+                    request_payload["reasoning"] = {"effort": "low"}
 
-        output_text = str(payload.get("output_text", "")).strip()
-        if output_text:
-            return output_text
+                response = client.post(
+                    f"{base_url}/responses",
+                    headers=headers,
+                    json=request_payload,
+                )
+                self._raise_for_status(response)
+                payload = response.json()
 
-        output_items = payload.get("output") or []
-        parts: list[str] = []
-        for item in output_items:
-            if not isinstance(item, dict):
-                continue
-            if item.get("type") != "message":
-                continue
-            for content_item in item.get("content") or []:
-                if not isinstance(content_item, dict):
-                    continue
-                text = str(content_item.get("text", "")).strip()
-                if text:
-                    parts.append(text)
-        joined = "\n".join(parts).strip()
-        if joined:
-            return joined
-        raise RuntimeError("The provider returned an empty response.")
+                action = _model_action_from_openai_responses_payload(payload, name_map, force_final=request.force_final)
+                if action is not None:
+                    output_text = action.content if isinstance(action, ModelFinalAnswer) else ""
+                    return ModelResponse(
+                        action=action,
+                        provider_name=self.provider_name,
+                        model=state.model,
+                        raw_text=output_text,
+                        raw_payload=payload,
+                        token_usage=payload.get("usage") or {},
+                    )
 
-    def _complete_anthropic(self, prompt_system: str, prompt_user: str, state) -> str:
+                incomplete_reason = _openai_incomplete_reason(payload)
+                if payload.get("status") == "incomplete" and incomplete_reason in {"max_output_tokens", "max_tokens"}:
+                    last_token_error = (
+                        f"The OpenAI Responses API exhausted max_output_tokens={token_budget} before producing visible text."
+                    )
+                    if attempt_index < len(budgets) - 1:
+                        continue
+                    raise ProviderError(
+                        f"{last_token_error} Retried once with a larger output budget and still received no text.",
+                        raw_payload=payload,
+                    )
+
+                status = str(payload.get("status") or "unknown")
+                error = payload.get("error")
+                if error:
+                    raise ProviderError(f"The OpenAI Responses API returned status {status}: {_stringify_json(error)}", raw_payload=payload)
+                raise ProviderError(f"The OpenAI Responses API returned status {status} without a tool call or final answer.", raw_payload=payload)
+
+        if last_token_error:
+            raise ProviderError(last_token_error)
+        raise ProviderError("The OpenAI Responses API returned no visible assistant text.")
+
+    def _complete_json_fallback_action(self, request: ModelRequest, completer) -> ModelResponse:
+        prompt_system = self._system_prompt(request, json_action=True)
+        prompt_user = self._user_prompt(request, include_tool_schemas=True)
+        text, usage, raw_payload = completer(prompt_system, prompt_user)
+        try:
+            action = _parse_model_action(text, force_final=request.force_final)
+        except ProviderError as exc:
+            if _looks_like_plain_final_answer(text):
+                action = ModelFinalAnswer(text.strip())
+            else:
+                repair_text, repair_usage, repair_payload = completer(
+                    "Convert the previous model response into the required ModelAction JSON. Return JSON only.",
+                    "\n".join(
+                        [
+                            f"Previous response: {text}",
+                            f"Parse error: {exc}",
+                            "Required JSON shapes:",
+                            '{"type":"tool_call","tool_call":{"name":"tool.name","arguments":{}}}',
+                            '{"type":"final_answer","final_answer":"natural assistant response"}',
+                        ]
+                    ),
+                )
+                usage = _merge_usage(usage, repair_usage)
+                raw_payload = {"initial": raw_payload, "repair": repair_payload}
+                try:
+                    action = _parse_model_action(repair_text, force_final=request.force_final)
+                    text = repair_text
+                except ProviderError as repair_exc:
+                    raise ProviderError(
+                        f"{repair_exc}. Retried once with a JSON repair prompt.",
+                        raw_text=text,
+                        raw_payload=raw_payload if isinstance(raw_payload, dict) else {},
+                    ) from None
+        return ModelResponse(
+            action=action,
+            provider_name=self.provider_name,
+            model=self.runtime.state.model,
+            raw_text=text,
+            raw_payload=raw_payload if isinstance(raw_payload, dict) else {},
+            token_usage=usage,
+        )
+
+    def _complete_anthropic_text(self, prompt_system: str, prompt_user: str) -> tuple[str, dict[str, Any], dict[str, Any]]:
+        state = self.runtime.state
         base_url = (state.base_url or PROVIDER_SPECS[self.provider_name].base_url_default or "").rstrip("/")
         headers = {
             "Content-Type": "application/json",
@@ -699,12 +402,10 @@ class LLMBackedAgentProvider:
                 headers=headers,
                 json={
                     "model": state.model,
-                    "max_tokens": 900,
+                    "max_tokens": 2400,
                     "temperature": 0.2,
                     "system": prompt_system,
-                    "messages": [
-                        {"role": "user", "content": prompt_user},
-                    ],
+                    "messages": [{"role": "user", "content": prompt_user}],
                 },
             )
             self._raise_for_status(response)
@@ -713,10 +414,11 @@ class LLMBackedAgentProvider:
         parts = [str(item.get("text", "")).strip() for item in content if isinstance(item, dict)]
         joined = "\n".join(part for part in parts if part)
         if joined:
-            return joined
-        raise RuntimeError("The provider returned an empty message.")
+            return joined, payload.get("usage") or {}, payload
+        raise ProviderError("The provider returned an empty message.", raw_payload=payload)
 
-    def _complete_ollama(self, prompt_system: str, prompt_user: str, state) -> str:
+    def _complete_ollama_text(self, prompt_system: str, prompt_user: str) -> tuple[str, dict[str, Any], dict[str, Any]]:
+        state = self.runtime.state
         base_url = (state.base_url or PROVIDER_SPECS[self.provider_name].base_url_default or "").rstrip("/")
         with httpx.Client(timeout=45.0) as client:
             response = client.post(
@@ -735,8 +437,8 @@ class LLMBackedAgentProvider:
         message = payload.get("message") or {}
         content = str(message.get("content", "")).strip()
         if content:
-            return content
-        raise RuntimeError("The provider returned an empty message.")
+            return content, payload.get("usage") or {}, payload
+        raise ProviderError("The provider returned an empty message.", raw_payload=payload)
 
     def _raise_for_status(self, response: httpx.Response) -> None:
         try:
@@ -744,11 +446,184 @@ class LLMBackedAgentProvider:
         except httpx.HTTPStatusError as exc:
             detail = response.text.strip()
             if detail:
-                raise RuntimeError(f"{exc}. Response body: {detail}") from exc
-            raise RuntimeError(str(exc)) from exc
+                raise ProviderError(f"{exc}. Response body: {detail}") from exc
+            raise ProviderError(str(exc)) from exc
 
 
-def get_agent_provider(runtime: ProviderRuntimeStatus) -> AgentProvider:
+def _provider_tool_name(tool_name: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_-]", "__", tool_name)[:64]
+
+
+def _provider_tool_name_map(available_tools: list[dict[str, Any]]) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    used: set[str] = set()
+    for tool in available_tools:
+        canonical = str(tool.get("name") or "").strip()
+        if not canonical:
+            continue
+        external = _provider_tool_name(canonical)
+        if external in used:
+            suffix = 2
+            base = external[:58]
+            while f"{base}_{suffix}" in used:
+                suffix += 1
+            external = f"{base}_{suffix}"
+        used.add(external)
+        mapping[external] = canonical
+    return mapping
+
+
+def _provider_name_for_tool(canonical_name: str, name_map: dict[str, str]) -> str:
+    for external, canonical in name_map.items():
+        if canonical == canonical_name:
+            return external
+    return _provider_tool_name(canonical_name)
+
+
+def _tool_parameters_schema(tool: dict[str, Any]) -> dict[str, Any]:
+    schema = tool.get("input_schema")
+    if isinstance(schema, dict) and schema:
+        return schema
+    return {"type": "object", "properties": {}}
+
+
+def _openai_response_tools(available_tools: list[dict[str, Any]], name_map: dict[str, str]) -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "function",
+            "name": _provider_name_for_tool(str(tool.get("name") or ""), name_map),
+            "description": f"{tool.get('purpose', '')} Canonical Helios tool name: {tool.get('name', '')}".strip(),
+            "parameters": _tool_parameters_schema(tool),
+        }
+        for tool in available_tools
+    ]
+
+
+def _openai_chat_tools(available_tools: list[dict[str, Any]], name_map: dict[str, str]) -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": _provider_name_for_tool(str(tool.get("name") or ""), name_map),
+                "description": f"{tool.get('purpose', '')} Canonical Helios tool name: {tool.get('name', '')}".strip(),
+                "parameters": _tool_parameters_schema(tool),
+            },
+        }
+        for tool in available_tools
+    ]
+
+
+def _parse_tool_arguments(raw_arguments: Any) -> dict[str, Any]:
+    if raw_arguments is None or raw_arguments == "":
+        return {}
+    if isinstance(raw_arguments, dict):
+        return raw_arguments
+    if isinstance(raw_arguments, str):
+        try:
+            parsed = json.loads(raw_arguments)
+        except json.JSONDecodeError as exc:
+            raise ProviderError(f"Model tool_call arguments were not valid JSON: {exc}", raw_text=raw_arguments) from None
+        if isinstance(parsed, dict):
+            return parsed
+    raise ProviderError("Model tool_call arguments must be an object.")
+
+
+def _model_tool_call_from_openai_chat_tool_call(tool_call: dict[str, Any], name_map: dict[str, str]) -> ModelToolCall:
+    function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+    external_name = str(function.get("name") or tool_call.get("name") or "").strip()
+    canonical_name = name_map.get(external_name, external_name)
+    return ModelToolCall(name=canonical_name, arguments=_parse_tool_arguments(function.get("arguments") or tool_call.get("arguments")))
+
+
+def _model_action_from_openai_responses_payload(
+    payload: dict[str, Any],
+    name_map: dict[str, str],
+    *,
+    force_final: bool,
+) -> ModelAction | None:
+    output_items = payload.get("output") or []
+    if not isinstance(output_items, list):
+        return None
+    for item in output_items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "function_call" and not force_final:
+            external_name = str(item.get("name") or "").strip()
+            canonical_name = name_map.get(external_name, external_name)
+            return ModelToolCall(name=canonical_name, arguments=_parse_tool_arguments(item.get("arguments")))
+
+    output_text = _extract_openai_response_text(payload)
+    if output_text:
+        return ModelFinalAnswer(output_text)
+    return None
+
+
+def _looks_like_plain_final_answer(text: str) -> bool:
+    stripped = text.strip()
+    return bool(stripped) and not stripped.startswith("{") and not stripped.startswith("[") and "tool_call" not in stripped[:200]
+
+
+def _merge_usage(first: dict[str, Any], second: dict[str, Any]) -> dict[str, Any]:
+    if not first:
+        return second
+    if not second:
+        return first
+    merged = dict(first)
+    for key, value in second.items():
+        if isinstance(value, (int, float)) and isinstance(merged.get(key), (int, float)):
+            merged[key] = merged[key] + value
+        else:
+            merged[f"repair_{key}"] = value
+    return merged
+
+
+def _parse_json_object(text: str) -> dict[str, Any]:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```(?:json)?", "", stripped).strip()
+        stripped = re.sub(r"```$", "", stripped).strip()
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError:
+        start = stripped.find("{")
+        end = stripped.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise ProviderError("Model response was not valid JSON.") from None
+        payload = json.loads(stripped[start : end + 1])
+    if not isinstance(payload, dict):
+        raise ProviderError("Model action response must be a JSON object.")
+    return payload
+
+
+def _parse_model_action(text: str, *, force_final: bool = False) -> ModelAction:
+    payload = _parse_json_object(text)
+    action_type = str(payload.get("type") or "").strip()
+    if action_type == "final_answer":
+        content = str(payload.get("final_answer") or "").strip()
+        if not content:
+            raise ProviderError("Model returned an empty final_answer.")
+        return ModelFinalAnswer(content=content)
+    if action_type == "tool_call":
+        if force_final:
+            raise ProviderError("Model returned a tool_call when a final_answer was required.")
+        tool_call = payload.get("tool_call")
+        if not isinstance(tool_call, dict):
+            raise ProviderError("Model tool_call action is missing the tool_call object.")
+        name = str(tool_call.get("name") or "").strip()
+        arguments = tool_call.get("arguments")
+        if not name:
+            raise ProviderError("Model tool_call action is missing a tool name.")
+        if arguments is None:
+            arguments = {}
+        if not isinstance(arguments, dict):
+            raise ProviderError("Model tool_call arguments must be an object.")
+        return ModelToolCall(name=name, arguments=arguments)
+    raise ProviderError("Model action must be either tool_call or final_answer.")
+
+
+def get_model_provider(runtime: ProviderRuntimeStatus) -> ModelProvider:
+    if not runtime.ready:
+        raise ProviderError(runtime.message)
     if runtime.effective_provider == "stub":
-        return StubAgentProvider()
-    return LLMBackedAgentProvider(runtime)
+        return DiagnosticStubModelProvider()
+    return LLMModelProvider(runtime)

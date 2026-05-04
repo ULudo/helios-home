@@ -1,3 +1,5 @@
+import pytest
+
 from app.core.config import get_settings
 from app.db.models import Site
 from app.db.seed import seed_demo_data
@@ -5,11 +7,27 @@ from app.db.session import get_engine, get_session_factory, init_database
 from app.services.dashboard import build_overview
 from app.services.discovery import list_device_candidates, list_discovery_runs, run_discovery
 from app.services.discovery_blueprints import RawCandidate
+from app.services.eebus import EebusDiscoveryBatch
 from app.services.local_network import LocalNetworkDiscoveryBatch
 from app.services.modbus import ModbusDiscoveryBatch
 from app.services.mqtt import MqttDiscoveryBatch
 from app.services.network_broadcast import BroadcastDiscoveryBatch
+from app.services.network_scope import ReachableSubnetOption
 from app.services.recovery import run_recovery
+
+
+def _empty_eebus_batch(interface_ip=None, timeout_seconds=3.0, tls_check=False):
+    return EebusDiscoveryBatch(
+        source_name="eebus_ship_live",
+        status="completed",
+        message="EEBus SHIP discovery completed, but no _ship._tcp.local services were found.",
+        candidates=[],
+    )
+
+
+@pytest.fixture(autouse=True)
+def _use_deterministic_eebus_discovery(monkeypatch):
+    monkeypatch.setattr("app.services.discovery.discover_eebus_site", _empty_eebus_batch)
 
 
 def _build_session(tmp_path, monkeypatch):
@@ -366,6 +384,7 @@ def test_distinct_live_sources_materialize_together_when_not_reconciled(tmp_path
             "local_network_live",
             "network_broadcast_live",
             "mqtt_live",
+            "eebus_ship_live",
         ]
     finally:
         session.close()
@@ -431,6 +450,7 @@ def test_mqtt_is_used_when_other_live_sources_find_no_candidates(tmp_path, monke
             "network_broadcast_live",
             "modbus_live",
             "mqtt_live",
+            "eebus_ship_live",
         ]
         assert {device.id for device in overview.devices} == {"dev-mqtt-laundry-plug"}
     finally:
@@ -513,6 +533,54 @@ def test_local_discovery_combines_multiple_configured_subnets(tmp_path, monkeypa
         session.close()
 
 
+def test_local_discovery_uses_reachable_subnets_when_scope_is_empty(tmp_path, monkeypatch):
+    session = _build_session(tmp_path, monkeypatch)
+    try:
+        monkeypatch.setenv("HELIOS_LOCAL_SCAN_ENABLED", "true")
+        get_settings.cache_clear()
+        site = session.get(Site, 1)
+        assert site is not None
+        site.local_subnet = ""
+        session.add(site)
+        session.commit()
+
+        seen_subnets: list[str] = []
+
+        monkeypatch.setattr(
+            "app.services.discovery.list_reachable_subnets",
+            lambda: [ReachableSubnetOption(cidr="192.168.188.0/24", interface="enp1s0", label="192.168.188.0/24 (enp1s0)")],
+        )
+
+        def local_batch(subnet, timeout_seconds, concurrency, max_hosts):
+            seen_subnets.append(subnet)
+            return LocalNetworkDiscoveryBatch(
+                source_name="local_network_live",
+                status="completed",
+                message="Imported 1 local candidate from reachable subnet scanning.",
+                candidates=[_local_http_candidate()],
+            )
+
+        monkeypatch.setattr("app.services.discovery.discover_local_network_site", local_batch)
+        monkeypatch.setattr(
+            "app.services.discovery.discover_eebus_site",
+            lambda interface_ip, timeout_seconds, tls_check: LocalNetworkDiscoveryBatch(
+                source_name="eebus_ship_live",
+                status="completed",
+                message="EEBus SHIP discovery completed, but no _ship._tcp.local services were found.",
+                candidates=[],
+            ),
+        )
+
+        discovery = run_discovery(session)
+
+        assert seen_subnets == ["192.168.188.0/24"]
+        assert discovery.source_names == ["local_network_live"]
+        assert discovery.source_results[0].source_name == "local_network_live"
+        assert discovery.source_results[0].candidate_count == 1
+    finally:
+        session.close()
+
+
 def test_failed_live_mqtt_run_records_source_failure_without_fallback(tmp_path, monkeypatch):
     session = _build_session(tmp_path, monkeypatch)
     try:
@@ -538,7 +606,7 @@ def test_failed_live_mqtt_run_records_source_failure_without_fallback(tmp_path, 
         overview = build_overview(session)
 
         assert discovery.status == "failed"
-        assert discovery.source_names == ["mqtt_live"]
+        assert discovery.source_names == ["mqtt_live", "eebus_ship_live"]
         assert discovery.source_results[0].status == "failed"
         assert overview.devices == []
     finally:

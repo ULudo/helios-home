@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useReducer, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
+import { Fragment, useEffect, useMemo, useReducer, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
@@ -8,15 +8,17 @@ import { StatusBadge } from "./components/StatusBadge";
 import { api } from "./lib/api";
 import type {
   ActionProposalRead,
+  AgentBlockerRead,
   AgentMessageRead,
   AgentProviderConfigRead,
   AgentProviderOptionRead,
+  AgentTaskRead,
   AgentThreadRead,
   DeviceRead,
   OverviewResponse,
   ReachableSubnetRead,
 } from "./lib/types";
-import { createInitialUIState, parseUiActions, uiStateReducer } from "./lib/uiState";
+import { createInitialUIState, parseUiEvents, uiStateReducer } from "./lib/uiState";
 
 type NavView = "overview" | "settings";
 
@@ -29,6 +31,14 @@ type NavItem = {
 type CanvasPoint = {
   x: number;
   y: number;
+};
+
+type ChatTaskView = {
+  id: string;
+  title: string;
+  status: string;
+  summary: string;
+  blockers: Array<Pick<AgentBlockerRead, "id" | "summary" | "blocker_type">>;
 };
 
 const NAV_ITEMS: NavItem[] = [
@@ -185,14 +195,63 @@ function messageCardClasses(role: string): string {
   return "mr-10 border-[#d7deea] bg-[#f6f8fb]";
 }
 
-function renderProposalSummary(proposal: ActionProposalRead): string {
-  if (proposal.action_type === "confirm_system_binding") {
-    return String(proposal.payload.label ?? proposal.summary);
+function proposalHeading(proposal: ActionProposalRead): string {
+  if (proposal.action_type === "role_binding") {
+    return "Role binding";
   }
-  if (proposal.action_type === "update_site_scope") {
-    return String(proposal.payload.local_subnet ?? proposal.summary);
+  return humanize(proposal.action_type || proposal.title || "proposal");
+}
+
+function proposalFacts(proposal: ActionProposalRead): Array<[string, string]> {
+  const facts: Array<[string, string]> = [["Risk", humanize(proposal.risk_level)]];
+  if (proposal.action_type === "role_binding") {
+    const label = typeof proposal.payload.label === "string" ? proposal.payload.label : "";
+    const role = typeof proposal.payload.role === "string" ? proposal.payload.role : "";
+    if (label) {
+      facts.unshift(["Entity", label]);
+    }
+    if (role) {
+      facts.push(["Role", humanize(role)]);
+    }
+    return facts;
   }
-  return proposal.summary;
+  if (proposal.action_type === "update_site_scope" && typeof proposal.payload.local_subnet === "string") {
+    facts.unshift(["Scope", proposal.payload.local_subnet]);
+  }
+  return facts;
+}
+
+function blockerFromRecord(entry: Record<string, unknown>, index: number): Pick<AgentBlockerRead, "id" | "summary" | "blocker_type"> {
+  const summary = typeof entry.summary === "string" ? entry.summary : "blocked";
+  return {
+    id: typeof entry.blocker_ref === "string" ? entry.blocker_ref : `blocker-${index}`,
+    summary: humanize(summary),
+    blocker_type: typeof entry.blocker_type === "string" ? entry.blocker_type : "blocker",
+  };
+}
+
+function taskFromHint(hint: NonNullable<ReturnType<typeof createInitialUIState>["activeTask"]>): ChatTaskView {
+  return {
+    id: hint.taskRef,
+    title: humanize(hint.title || "active_hems_task"),
+    status: hint.status || hint.mode,
+    summary: humanize(hint.summary || "setup_step_tracked"),
+    blockers: hint.blockers.map(blockerFromRecord),
+  };
+}
+
+function taskFromRead(task: AgentTaskRead): ChatTaskView {
+  return {
+    id: task.id,
+    title: humanize(task.title || "active_hems_task"),
+    status: task.status,
+    summary: humanize(task.goal || "setup_step_tracked"),
+    blockers: task.blockers.map((blocker) => ({
+      id: blocker.id,
+      summary: humanize(blocker.summary),
+      blocker_type: blocker.blocker_type,
+    })),
+  };
 }
 
 function buildCanvasPoints(count: number): CanvasPoint[] {
@@ -221,6 +280,44 @@ function severityTone(severity: "info" | "caution" | "critical"): string {
     return "border-amber-200 bg-amber-50 text-amber-800";
   }
   return "border-slate-200 bg-slate-50 text-slate-800";
+}
+
+function alertTone(tone: "info" | "caution" | "critical" | "notice" | "error"): string {
+  if (tone === "error" || tone === "critical") {
+    return "border-rose-200 bg-rose-50 text-rose-800";
+  }
+  if (tone === "notice" || tone === "caution") {
+    return "border-amber-200 bg-amber-50 text-amber-800";
+  }
+  return severityTone("info");
+}
+
+function DismissibleAlert({
+  title,
+  body,
+  tone,
+  onClose,
+}: {
+  title?: string;
+  body: string;
+  tone: "info" | "caution" | "critical" | "notice" | "error";
+  onClose: () => void;
+}) {
+  return (
+    <div className={`relative rounded-lg border px-3 py-3 pr-10 text-sm shadow-[0_14px_30px_rgba(15,23,42,0.08)] ${alertTone(tone)}`}>
+      <button
+        type="button"
+        title="Close"
+        aria-label="Close alert"
+        className="absolute right-2 top-2 flex h-7 w-7 items-center justify-center rounded-full text-current opacity-70 transition hover:bg-white/70 hover:opacity-100"
+        onClick={onClose}
+      >
+        <AppIcon name="x" className="h-4 w-4" />
+      </button>
+      {title ? <p className="m-0 pr-1 font-semibold">{title}</p> : null}
+      <div className={`subtle-scrollbar max-h-28 overflow-y-auto leading-6 ${title ? "mt-1" : ""}`}>{body}</div>
+    </div>
+  );
 }
 
 function ProviderFormSection({
@@ -353,7 +450,6 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
   const [navExpanded, setNavExpanded] = useState(false);
   const [inspectedDeviceId, setInspectedDeviceId] = useState<string | null>(null);
   const [activeTurnId, setActiveTurnId] = useState<string | null>(null);
@@ -398,7 +494,7 @@ export default function App() {
     if (!agentProviderConfig) {
       return false;
     }
-    return agentProviderConfig.ready && agentProviderConfig.effective_provider !== "stub";
+    return agentProviderConfig.ready || agentProviderConfig.effective_provider === "stub";
   }, [agentProviderConfig]);
 
   const currentScope = useMemo(() => parseConfiguredSubnets(overview?.site.local_subnet ?? ""), [overview?.site.local_subnet]);
@@ -406,6 +502,14 @@ export default function App() {
   const currentView: NavView = uiState.currentView === "settings" ? "settings" : "overview";
   const unresolvedItems = thread?.setup_profile.unresolved_items ?? [];
   const confirmedSystems = thread?.setup_profile.confirmed_systems ?? [];
+  const activeTaskView = useMemo<ChatTaskView | null>(() => {
+    const activeTasks = thread?.active_tasks ?? [];
+    if (uiState.activeTask) {
+      const persisted = activeTasks.find((task) => task.id === uiState.activeTask?.taskRef);
+      return persisted ? taskFromRead(persisted) : taskFromHint(uiState.activeTask);
+    }
+    return activeTasks.length > 0 ? taskFromRead(activeTasks[0]) : null;
+  }, [thread?.active_tasks, uiState.activeTask]);
 
   function syncProviderForm(config: AgentProviderConfigRead, providerId?: string) {
     const option =
@@ -465,7 +569,7 @@ export default function App() {
       return;
     }
     timelineRef.current.scrollTop = timelineRef.current.scrollHeight;
-  }, [thread?.pending_proposals, timelineMessages]);
+  }, [activeTaskView, thread?.pending_proposals, timelineMessages]);
 
   useEffect(() => {
     if (inspectedDeviceId && !allDevices.some((device) => device.id === inspectedDeviceId)) {
@@ -473,12 +577,16 @@ export default function App() {
     }
   }, [allDevices, inspectedDeviceId]);
 
+  function shouldShowExplanationPopup(): boolean {
+    return Boolean(uiState.explanation && uiState.explanation.severity !== "info");
+  }
+
   function startStream(turnId: string) {
     streamRef.current?.close();
     streamRef.current = api.streamAgentTurn(turnId, {
       onEvent: (event) => {
-        if (event.event_type === "ui_actions") {
-          const actions = parseUiActions(event.payload.actions);
+        if (event.event_type === "ui_events") {
+          const actions = parseUiEvents(event.payload.events);
           if (actions.length > 0) {
             dispatchUiState({ type: "apply_actions", actions, occurredAt: event.created_at });
           }
@@ -503,10 +611,6 @@ export default function App() {
 
         if (event.event_type === "assistant_message_completed") {
           const nextMessage = event.payload.message as AgentMessageRead | undefined;
-          const actions = parseUiActions(event.payload.ui_actions);
-          if (actions.length > 0) {
-            dispatchUiState({ type: "apply_actions", actions, occurredAt: event.created_at });
-          }
           if (nextMessage) {
             setThread((current) => {
               if (!current) {
@@ -519,10 +623,6 @@ export default function App() {
             });
           }
           setStreamingAssistant(null);
-        }
-
-        if (event.event_type === "proposal_created") {
-          setNotice("Helios prepared a setup confirmation.");
         }
 
         if (event.event_type === "error") {
@@ -549,16 +649,24 @@ export default function App() {
     }
     if (!providerReadyForChat) {
       dispatchUiState({ type: "set_view", view: "settings" });
-      setNotice("Configure a model provider first. Then the right panel switches into chat.");
       return;
     }
 
     setBusyAction("send-message");
     setError(null);
-    setNotice(null);
 
     try {
-      const accepted = await api.createAgentMessage({ content: normalized });
+      const selectedDeviceId = inspectedDeviceId ?? uiState.selectedDeviceIds[0] ?? null;
+      const accepted = await api.createAgentMessage({
+        content: normalized,
+        context: selectedDeviceId
+          ? {
+              selected_device_id: selectedDeviceId,
+              selected_entity_ref: `device:${selectedDeviceId}`,
+              agent_mode: "setup",
+            }
+          : { agent_mode: "setup" },
+      });
       setThread((current) => {
         if (!current) {
           return current;
@@ -604,15 +712,16 @@ export default function App() {
   async function handleProposalDecision(proposalId: string, decision: "confirm" | "reject") {
     setBusyAction(`${decision}-proposal`);
     setError(null);
-    setNotice(null);
 
     try {
-      const result =
-        decision === "confirm"
-          ? await api.confirmAgentProposal(proposalId)
-          : await api.rejectAgentProposal(proposalId);
+      const proposal = thread?.pending_proposals.find((entry) => entry.id === proposalId);
+      if (!proposal?.decision_request_id) {
+        throw new Error("This proposal is missing a decision request.");
+      }
+      const result = await api.respondToDecisionRequest(proposal.decision_request_id, {
+        decision: decision === "confirm" ? "approve" : "reject",
+      });
       setThread(result.thread);
-      setNotice(decision === "confirm" ? "Helios applied your confirmation." : "Helios left the current setup unchanged.");
       await refreshAll();
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "Unable to apply that decision.");
@@ -624,7 +733,6 @@ export default function App() {
   async function handleProviderSave() {
     setBusyAction("save-provider");
     setError(null);
-    setNotice(null);
 
     try {
       const nextConfig = await api.updateAgentProviderConfig({
@@ -635,7 +743,6 @@ export default function App() {
       });
       setAgentProviderConfig(nextConfig);
       syncProviderForm(nextConfig, providerForm.providerId);
-      setNotice("Helios updated the local model provider configuration.");
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "Unable to update the provider configuration.");
     } finally {
@@ -646,7 +753,6 @@ export default function App() {
   async function handleProviderKeyClear() {
     setBusyAction("clear-provider-key");
     setError(null);
-    setNotice(null);
 
     try {
       const nextConfig = await api.updateAgentProviderConfig({
@@ -655,7 +761,6 @@ export default function App() {
       });
       setAgentProviderConfig(nextConfig);
       syncProviderForm(nextConfig, providerForm.providerId);
-      setNotice("Helios removed the stored provider key from this machine.");
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "Unable to clear the provider key.");
     } finally {
@@ -666,12 +771,10 @@ export default function App() {
   async function handleRunDiscovery() {
     setBusyAction("run-discovery");
     setError(null);
-    setNotice(null);
 
     try {
-      const result = await api.runDiscovery();
+      await api.runDiscovery();
       await refreshAll();
-      setNotice(`Discovery finished. ${result.integrated_devices} device(s) are now in the workspace.`);
       dispatchUiState({ type: "set_view", view: "overview" });
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "Unable to run discovery.");
@@ -682,24 +785,50 @@ export default function App() {
 
   async function handleUseReachableNetworks() {
     if (reachableSubnets.length === 0) {
-      setNotice("No reachable networks are available on this machine.");
       return;
     }
 
     setBusyAction("apply-scope");
     setError(null);
-    setNotice(null);
 
     try {
       const localSubnet = reachableSubnets.map((entry) => entry.cidr).join(", ");
       await api.updateSite({ local_subnet: localSubnet });
       await refreshAll();
-      setNotice("Helios updated the site scope to the currently reachable networks.");
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "Unable to update the site scope.");
     } finally {
       setBusyAction(null);
     }
+  }
+
+  function renderActiveTaskCard(task: ChatTaskView) {
+    return (
+      <article className="rounded-[18px] border border-[#d8dfea] bg-white px-4 py-4 shadow-[0_12px_28px_rgba(15,23,42,0.05)]">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <p className="section-heading">Active HEMS task</p>
+            <p className="m-0 mt-2 text-sm font-semibold text-slate-950">{task.title}</p>
+          </div>
+          <span className="shrink-0 rounded-full border border-[#d8dfea] bg-[#f8fbff] px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.08em] text-slate-600">
+            {humanize(task.status)}
+          </span>
+        </div>
+        <p className="m-0 mt-3 text-sm leading-6 text-slate-600">{task.summary}</p>
+        {task.blockers.length > 0 ? (
+          <div className="mt-3 space-y-2">
+            {task.blockers.slice(0, 2).map((blocker) => (
+              <div key={blocker.id} className="rounded-[14px] border border-[#f1d7a2] bg-[#fffaf0] px-3 py-3">
+                <p className="m-0 text-[11px] font-semibold uppercase tracking-[0.08em] text-[#9c6410]">
+                  {humanize(blocker.blocker_type)}
+                </p>
+                <p className="m-0 mt-1 text-sm leading-6 text-slate-700">{blocker.summary}</p>
+              </div>
+            ))}
+          </div>
+        ) : null}
+      </article>
+    );
   }
 
   function renderDeviceOverlay(device: DeviceRead) {
@@ -813,19 +942,23 @@ export default function App() {
   }
 
   function renderCanvasAlerts() {
-    if (!error && !notice && !uiState.explanation) {
+    const showExplanation = shouldShowExplanationPopup();
+    if (!error && !showExplanation) {
       return null;
     }
 
     return (
-      <div className="pointer-events-auto absolute left-1/2 top-5 z-20 flex w-[min(720px,calc(100%-2rem))] -translate-x-1/2 flex-col gap-3">
-        {error ? <div className="rounded-[16px] border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">{error}</div> : null}
-        {notice ? <div className="rounded-[16px] border border-[#f1d7a2] bg-[#fff7e8] px-4 py-3 text-sm text-[#9c6410]">{notice}</div> : null}
-        {uiState.explanation ? (
-          <div className={`rounded-[16px] border px-4 py-3 text-sm ${severityTone(uiState.explanation.severity)}`}>
-            <p className="m-0 font-semibold">{uiState.explanation.title}</p>
-            <p className="m-0 mt-1 leading-6">{uiState.explanation.body}</p>
-          </div>
+      <div className="pointer-events-auto absolute left-1/2 top-5 z-20 flex w-[min(520px,calc(100%-2rem))] -translate-x-1/2 flex-col gap-2">
+        {error ? (
+          <DismissibleAlert tone="error" body={error} onClose={() => setError(null)} />
+        ) : null}
+        {showExplanation && uiState.explanation ? (
+          <DismissibleAlert
+            tone={uiState.explanation.severity}
+            title={uiState.explanation.title}
+            body={uiState.explanation.body}
+            onClose={() => dispatchUiState({ type: "clear_explanation" })}
+          />
         ) : null}
       </div>
     );
@@ -895,7 +1028,7 @@ export default function App() {
 
           {allDevices.length === 0 ? (
             <div className="absolute left-1/2 top-[calc(50%+170px)] z-10 w-[320px] -translate-x-1/2 rounded-[24px] border border-dashed border-[#d8dfea] bg-white/90 px-5 py-4 text-center text-sm leading-6 text-slate-500 shadow-[0_16px_34px_rgba(15,23,42,0.06)]">
-              No devices have been detected yet. Ask Helios to scan the house, or configure the provider and site scope in Settings.
+              No devices have been detected yet. Discovery can be requested in chat or run from Settings.
             </div>
           ) : null}
         </div>
@@ -909,15 +1042,16 @@ export default function App() {
     return (
       <div className="subtle-scrollbar h-full min-h-0 overflow-y-auto pr-1">
         <div className="mx-auto flex max-w-[920px] flex-col gap-5">
-          {(error || notice || uiState.explanation) ? (
+          {(error || shouldShowExplanationPopup()) ? (
             <div className="flex flex-col gap-3">
-              {error ? <div className="rounded-[16px] border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">{error}</div> : null}
-              {notice ? <div className="rounded-[16px] border border-[#f1d7a2] bg-[#fff7e8] px-4 py-3 text-sm text-[#9c6410]">{notice}</div> : null}
-              {uiState.explanation ? (
-                <div className={`rounded-[16px] border px-4 py-3 text-sm ${severityTone(uiState.explanation.severity)}`}>
-                  <p className="m-0 font-semibold">{uiState.explanation.title}</p>
-                  <p className="m-0 mt-1 leading-6">{uiState.explanation.body}</p>
-                </div>
+              {error ? <DismissibleAlert tone="error" body={error} onClose={() => setError(null)} /> : null}
+              {shouldShowExplanationPopup() && uiState.explanation ? (
+                <DismissibleAlert
+                  tone={uiState.explanation.severity}
+                  title={uiState.explanation.title}
+                  body={uiState.explanation.body}
+                  onClose={() => dispatchUiState({ type: "clear_explanation" })}
+                />
               ) : null}
             </div>
           ) : null}
@@ -943,7 +1077,7 @@ export default function App() {
               <div>
                 <p className="section-heading">Networks</p>
                 <p className="mt-2 text-sm leading-6 text-slate-600">
-                  Helios only scans within the configured site scope. Apply the reachable networks from this machine or let the agent propose scope changes.
+                  Discovery scans within the configured site scope. Reachable networks from this machine can be applied here.
                 </p>
               </div>
               <div className="flex flex-wrap items-center gap-2">
@@ -1023,7 +1157,7 @@ export default function App() {
               <div className="rounded-[18px] border border-[#d8dfea] bg-white px-4 py-4">
                 <p className="section-heading">Open setup questions</p>
                 {unresolvedItems.length === 0 ? (
-                  <p className="mt-3 text-sm leading-6 text-slate-500">Helios currently has no unresolved setup questions.</p>
+                  <p className="mt-3 text-sm leading-6 text-slate-500">No unresolved setup questions.</p>
                 ) : (
                   <div className="mt-3 space-y-2">
                     {unresolvedItems.map((item) => (
@@ -1070,9 +1204,9 @@ export default function App() {
         <div ref={timelineRef} className="subtle-scrollbar min-h-0 space-y-3 overflow-y-auto px-5 py-5">
           {timelineMessages.length === 0 ? (
             <div className="rounded-[18px] border border-[#d8dfea] bg-white px-4 py-4">
-              <p className="m-0 text-sm font-medium text-slate-900">Helios is ready.</p>
+              <p className="m-0 text-sm font-medium text-slate-900">No messages yet.</p>
               <p className="m-0 mt-2 text-sm leading-6 text-slate-600">
-                Ask Helios to scan the house, inspect a device, or clarify what the current setup is missing.
+                Send a message to the model operator to start the session.
               </p>
             </div>
           ) : (
@@ -1100,13 +1234,22 @@ export default function App() {
             ))
           )}
 
+          {activeTaskView ? renderActiveTaskCard(activeTaskView) : null}
+
           {thread?.pending_proposals.length ? (
             <div className="space-y-3">
               {thread.pending_proposals.map((proposal) => (
                 <article key={proposal.id} className="rounded-[18px] border border-[#f1d7a2] bg-[#fffaf0] px-4 py-4">
                   <p className="section-heading">Confirmation needed</p>
-                  <p className="mt-2 text-sm font-semibold text-slate-950">{proposal.summary}</p>
-                  <p className="mt-2 text-sm leading-6 text-slate-600">{renderProposalSummary(proposal)}</p>
+                  <p className="mt-2 text-sm font-semibold text-slate-950">{proposalHeading(proposal)}</p>
+                  <dl className="mt-3 grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-2 text-sm">
+                    {proposalFacts(proposal).map(([label, value]) => (
+                      <Fragment key={`${proposal.id}-${label}`}>
+                        <dt className="text-slate-500">{label}</dt>
+                        <dd className="m-0 font-medium text-slate-800">{value}</dd>
+                      </Fragment>
+                    ))}
+                  </dl>
                   <div className="mt-4 flex items-center gap-2">
                     <button
                       type="button"

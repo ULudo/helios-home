@@ -10,9 +10,10 @@ from app.services.discovery_blueprints import RawCandidate
 SOURCE_PRIORITY = {
     "local_network_live": 0,
     "modbus_live": 1,
-    "network_broadcast_live": 2,
-    "mqtt_live": 3,
-    "fixture_registry": 4,
+    "eebus_ship_live": 2,
+    "network_broadcast_live": 3,
+    "mqtt_live": 4,
+    "fixture_registry": 5,
 }
 GENERIC_LABELS = {
     "",

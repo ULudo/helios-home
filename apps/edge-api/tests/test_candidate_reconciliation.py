@@ -168,6 +168,38 @@ def _broadcast_evcc_ipv6_candidate() -> RawCandidate:
     )
 
 
+def _eebus_evcc_candidate() -> RawCandidate:
+    return RawCandidate(
+        candidate_id="cand-eebus-evcc",
+        device_id="dev-eebus-evcc",
+        asset_id="asset-eebus-evcc",
+        asset_name="EV Charging",
+        display_name="MENNEKES CC612",
+        manufacturer="MENNEKES",
+        model="CC612_2S0R_CC",
+        firmware="unknown",
+        device_type="wallbox",
+        discovery_sources=["eebus_ship_live"],
+        protocols=["eebus_ship"],
+        telemetry={"eebus_ship_advertised": True},
+        evidence={
+            "identity_keys": ["network-host:198-51-100-158", "eebus-ski:abc123"],
+            "classification_reasoning": "EEBus SHIP advertisement matched evse for the wallbox profile.",
+            "classification_confidence": 0.9,
+        },
+        recovery_zone="human_gated",
+        issue_code=None,
+        explanation_hint="Helios discovered an EEBus SHIP peer.",
+        next_step_hint="Pair a trusted EEBus identity.",
+        capabilities_hint={
+            "visible": True,
+            "monitorable": False,
+            "controllable": False,
+            "optimizable": False,
+        },
+    )
+
+
 def test_reconcile_candidates_merges_shared_identity():
     reconciled = reconcile_candidates([_local_candidate(), _modbus_candidate()])
 
@@ -193,3 +225,12 @@ def test_reconcile_candidates_merges_broadcast_ipv4_and_ipv6_views():
     assert len(reconciled) == 1
     assert reconciled[0].device_id == "dev-broadcast-evcc-ipv4"
     assert "network-host:198-51-100-158" in reconciled[0].evidence["identity_keys"]
+
+
+def test_reconcile_candidates_keeps_eebus_protocol_on_ship_peers():
+    reconciled = reconcile_candidates([_broadcast_evcc_ipv4_candidate(), _eebus_evcc_candidate()])
+
+    assert len(reconciled) == 1
+    assert reconciled[0].device_id == "dev-eebus-evcc"
+    assert sorted(reconciled[0].protocols) == ["eebus_ship", "mdns", "ssdp"]
+    assert sorted(reconciled[0].discovery_sources) == ["eebus_ship_live", "network_broadcast_live"]

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class HemsPolicyRead(BaseModel):
@@ -58,12 +58,34 @@ class HemsAssetRead(BaseModel):
     asset_type: str
     label: str
     device_id: str | None
+    binding_id: str | None = None
+    binding_status: str | None = None
+    connection_status: str | None = None
+    telemetry_status: str | None = None
+    control_status: str | None = None
     control_capability: str
     eligibility: str
     telemetry: dict[str, Any] = Field(default_factory=dict)
     constraints: dict[str, Any] = Field(default_factory=dict)
     command_contract: HemsCommandContractRead | None = None
     reasons: list[str] = Field(default_factory=list)
+
+
+class HemsSystemBindingRead(BaseModel):
+    id: str
+    system_type: str
+    label: str
+    device_id: str | None = None
+    asset_id: str | None = None
+    status: str
+    connection_status: str
+    telemetry_status: str
+    control_status: str
+    source: str
+    confidence: float = 0.0
+    evidence: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+    updated_at: datetime
 
 
 class HemsPlanHeaderRead(BaseModel):
@@ -133,3 +155,49 @@ class HemsSummaryRead(BaseModel):
     blocked_asset_count: int
     read_only_asset_count: int
     latest_plan: HemsPlanHeaderRead | None = None
+
+
+class EebusShipServiceRead(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    service_name: str
+    target: str | None = None
+    port: int | None = None
+    path: str = "/ship/"
+    ship_id: str | None = None
+    ski: str | None = None
+    brand: str | None = None
+    model: str | None = None
+    device_type: str | None = None
+    registration_requested: bool | None = Field(default=None, alias="register")
+    addresses: dict[str, list[str]] = Field(default_factory=dict)
+    txt: dict[str, str] = Field(default_factory=dict)
+    tls_probe: dict[str, Any] | None = None
+
+
+class EebusLoadPowerLimitCreate(BaseModel):
+    use_case: str | None = None
+    limit_id: int | None = None
+    limit_watts: int
+    duration_seconds: int | None = None
+    is_active: bool = True
+    source: str = "eebus"
+    peer_ski: str | None = None
+    raw: dict[str, Any] = Field(default_factory=dict)
+
+
+class EebusLoadPowerLimitDistributionRead(BaseModel):
+    use_case: str
+    limit_id: int
+    direction: str
+    is_active: bool
+    limit_watts: int
+    duration_seconds: int | None = None
+    previous_grid_import_limit_kw: float
+    previous_grid_export_limit_kw: float
+    applied_grid_import_limit_kw: float
+    applied_grid_export_limit_kw: float
+    changed_policy_fields: dict[str, float] = Field(default_factory=dict)
+    eebus_payload: dict[str, Any] = Field(default_factory=dict)
+    plan: HemsPlanHeaderRead | None = None
+    message: str

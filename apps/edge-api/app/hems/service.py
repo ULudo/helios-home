@@ -6,6 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from app.db.models import AuditEvent, HemsDispatchEvent, HemsPlanInterval, HemsPlanRun, HemsViolation, Site, utcnow
+from app.hems.bindings import list_system_bindings
 from app.hems.dispatcher import dispatch_current_interval
 from app.hems.models import ForecastBundle, SiteModel
 from app.hems.planner import solve_site_plan
@@ -20,6 +21,7 @@ from app.hems.schemas import (
     HemsPolicyRead,
     HemsPolicyUpdate,
     HemsSummaryRead,
+    HemsSystemBindingRead,
     HemsViolationRead,
 )
 from app.hems.site_model import build_site_model
@@ -38,6 +40,11 @@ def _serialize_asset(asset) -> HemsAssetRead:
         asset_type=asset.asset_type,
         label=asset.label,
         device_id=asset.device_id,
+        binding_id=asset.binding_id,
+        binding_status=asset.binding_status,
+        connection_status=asset.connection_status,
+        telemetry_status=asset.telemetry_status,
+        control_status=asset.control_status,
         control_capability=asset.control_capability,
         eligibility=asset.eligibility,
         telemetry=asset.telemetry,
@@ -59,6 +66,25 @@ def _serialize_asset(asset) -> HemsAssetRead:
             else None
         ),
         reasons=asset.reasons,
+    )
+
+
+def _serialize_binding(binding) -> HemsSystemBindingRead:
+    return HemsSystemBindingRead(
+        id=binding.id,
+        system_type=binding.system_type,
+        label=binding.label,
+        device_id=binding.device_id,
+        asset_id=binding.asset_id,
+        status=binding.status,
+        connection_status=binding.connection_status,
+        telemetry_status=binding.telemetry_status,
+        control_status=binding.control_status,
+        source=binding.source,
+        confidence=binding.confidence,
+        evidence=binding.evidence or {},
+        created_at=binding.created_at,
+        updated_at=binding.updated_at,
     )
 
 
@@ -148,6 +174,10 @@ def _latest_plan_run(session: Session) -> HemsPlanRun | None:
 def list_hems_assets(session: Session, forecast_override: ForecastBundle | None = None) -> list[HemsAssetRead]:
     site_model = build_site_model(session, forecast_override=forecast_override)
     return [_serialize_asset(asset) for asset in site_model.assets]
+
+
+def list_hems_system_bindings(session: Session) -> list[HemsSystemBindingRead]:
+    return [_serialize_binding(binding) for binding in list_system_bindings(session)]
 
 
 def get_hems_summary(session: Session, forecast_override: ForecastBundle | None = None) -> HemsSummaryRead:

@@ -21,7 +21,8 @@ export type AppIconName =
   | "unlock"
   | "chevron-left"
   | "chevron-right"
-  | "link";
+  | "link"
+  | "x";
 
 type AppIconProps = SVGProps<SVGSVGElement> & {
   name: AppIconName;
@@ -183,6 +184,12 @@ export function AppIcon({ name, className, ...props }: AppIconProps) {
         <>
           <path d="M10 13a5 5 0 0 0 7.1 0l2-2a5 5 0 0 0-7.1-7.1l-1.1 1.1" />
           <path d="M14 11a5 5 0 0 0-7.1 0l-2 2a5 5 0 1 0 7.1 7.1l1.1-1.1" />
+        </>
+      ) : null}
+      {name === "x" ? (
+        <>
+          <path d="M18 6 6 18" />
+          <path d="m6 6 12 12" />
         </>
       ) : null}
     </svg>

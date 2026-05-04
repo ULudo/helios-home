@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.db.models import Asset, Device, DeviceCandidate, Site
 from app.domain.enums import HemsAssetType, HemsControlCapability
+from app.hems.bindings import binding_lookup
 from app.hems.dispatchability import assess_dispatchability
 from app.hems.forecast import build_default_forecast
 from app.hems.models import CanonicalAsset, ForecastBundle, SiteModel
@@ -189,8 +190,9 @@ def _canonical_asset(
     now: datetime,
     *,
     native_writes_enabled: bool,
+    binding=None,
 ) -> CanonicalAsset:
-    asset_type = _map_asset_type(asset.asset_type, device=device, evidence=evidence)
+    asset_type = binding.system_type if binding is not None else _map_asset_type(asset.asset_type, device=device, evidence=evidence)
     telemetry = dict(device.telemetry if device is not None else asset.metrics or {})
     constraints = _asset_constraints(asset_type, telemetry, policy, now)
     control_capability = _control_capability(asset_type, telemetry, bool(device and device.capabilities.get("controllable")))
@@ -206,7 +208,7 @@ def _canonical_asset(
     return CanonicalAsset(
         asset_key=asset.id,
         asset_type=asset_type,
-        label=device.name if device is not None else asset.name,
+        label=binding.label if binding is not None else (device.name if device is not None else asset.name),
         device_id=device.id if device is not None else None,
         control_capability=control_capability,
         eligibility=dispatchability.eligibility,
@@ -214,6 +216,11 @@ def _canonical_asset(
         constraints=constraints,
         command_contract=dispatchability.command_contract,
         reasons=dispatchability.reasons,
+        binding_id=binding.id if binding is not None else None,
+        binding_status=binding.status if binding is not None else None,
+        connection_status=binding.connection_status if binding is not None else None,
+        telemetry_status=binding.telemetry_status if binding is not None else None,
+        control_status=binding.control_status if binding is not None else None,
     )
 
 
@@ -237,6 +244,7 @@ def build_site_model(
         for candidate in session.scalars(select(DeviceCandidate).order_by(DeviceCandidate.updated_at.desc())).all()
         if candidate.matched_device_id
     }
+    bindings_by_asset_id, bindings_by_device_id = binding_lookup(session)
 
     canonical_assets: list[CanonicalAsset] = []
     for asset in assets:
@@ -246,6 +254,9 @@ def build_site_model(
             if device is not None:
                 break
         evidence = dict(candidate_evidence_by_device_id.get(device.id, {}) if device is not None else {})
+        binding = bindings_by_asset_id.get(asset.id)
+        if binding is None and device is not None:
+            binding = bindings_by_device_id.get(device.id)
         canonical_assets.append(
             _canonical_asset(
                 asset,
@@ -254,6 +265,7 @@ def build_site_model(
                 policy,
                 current_time,
                 native_writes_enabled=native_writes_enabled,
+                binding=binding,
             )
         )
 

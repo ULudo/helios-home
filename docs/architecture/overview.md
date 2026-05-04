@@ -31,6 +31,7 @@ The backend can collect discovery evidence from:
 - local subnet HTTP probes
 - mDNS / SSDP advertisements
 - native Modbus / SunSpec probes
+- EEBus / SHIP `_ship._tcp.local` peers
 
 Additional adapters and deeper debugging services exist behind this layer, but the current stable user flow is centered on network-native local discovery.
 
@@ -95,6 +96,12 @@ Current native write support is intentionally narrow and opt-in:
 - telemetry simulation for validated test assets
 - Shelly local HTTP relay control
 - Tasmota local HTTP power control
+
+EEBus LoadControl support is handled as a grid-side constraint input:
+
+- LPC, limitation of power consumption, tightens the site import limit.
+- LPP, limitation of power production, tightens the site export limit.
+- Accepted active limits trigger a fresh HEMS plan so the current device fleet receives the resulting dispatch through its validated adapters.
 
 ## Current boundaries
 

@@ -9,6 +9,7 @@ print(f"{sys.version_info.major}.{sys.version_info.minor}")
 PY
 )"
 TARGET="$ROOT/.venv/lib/python${PYTHON_VERSION}/site-packages"
+EXTRAS="${HELIOS_BACKEND_EXTRAS:-[dev]}"
 
 if [[ ! -x "$ROOT/.venv/bin/python" ]]; then
   "$PYTHON" -m venv "$ROOT/.venv"
@@ -20,4 +21,4 @@ mkdir -p "$TARGET"
   --break-system-packages \
   --upgrade \
   --target "$TARGET" \
-  "$ROOT[dev]"
+  "$ROOT$EXTRAS"

@@ -31,6 +31,11 @@ class CanonicalAsset:
     constraints: dict[str, Any]
     command_contract: CommandContract | None = None
     reasons: list[str] = field(default_factory=list)
+    binding_id: str | None = None
+    binding_status: str | None = None
+    connection_status: str | None = None
+    telemetry_status: str | None = None
+    control_status: str | None = None
 
 
 @dataclass(slots=True)

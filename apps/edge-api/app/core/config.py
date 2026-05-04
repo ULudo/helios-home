@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     mqtt_live_enabled: bool = False
     mqtt_timeout_seconds: float = 5.0
     mqtt_probe_window_seconds: float = 2.0
+    eebus_interface_ip: str = ""
+    eebus_timeout_seconds: float = 3.0
+    eebus_tls_check_enabled: bool = False
     native_writes_enabled: bool = False
     write_http_timeout_seconds: float = 3.0
     agent_provider: str = "stub"

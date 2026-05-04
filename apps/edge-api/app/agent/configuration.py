@@ -49,8 +49,8 @@ class ProviderRuntimeStatus:
 PROVIDER_SPECS: dict[str, ProviderSpec] = {
     "stub": ProviderSpec(
         provider_id="stub",
-        label="Development stub",
-        description="Local deterministic responses without an external model provider.",
+        label="Diagnostics stub",
+        description="Diagnostic-only placeholder; normal agent turns require a configured model provider.",
         transport="stub",
         auth_kind="none",
         base_url_default=None,
@@ -203,8 +203,8 @@ def resolve_provider_status(config: AgentProviderConfig | None = None) -> Provid
         return ProviderRuntimeStatus(
             selected_provider=selected_provider,
             effective_provider="stub",
-            ready=True,
-            message="Helios is using the local deterministic development stub.",
+            ready=False,
+            message="The diagnostics stub is selected. Configure a model provider to operate Helios agent turns.",
             state=state,
             spec=spec,
         )
@@ -221,9 +221,9 @@ def resolve_provider_status(config: AgentProviderConfig | None = None) -> Provid
         joined = ", ".join(missing)
         return ProviderRuntimeStatus(
             selected_provider=selected_provider,
-            effective_provider="stub",
+            effective_provider=selected_provider,
             ready=False,
-            message=f"{spec.label} is selected but not ready yet. Missing: {joined}. Helios will fall back to the local stub until it is configured.",
+            message=f"{spec.label} is selected but not ready yet. Missing: {joined}. Configure the provider before starting agent turns.",
             state=state,
             spec=spec,
         )

@@ -320,6 +320,19 @@ def assess_connectors(candidate: RawCandidate) -> list[ConnectorAssessment]:
                     detail="Observed a local network advertisement, but no validated telemetry path is attached to it yet.",
                 )
             )
+        elif protocol == "eebus_ship":
+            ship_service = candidate.evidence.get("ship_service", {})
+            trusted_identity_ready = bool(ship_service.get("ski")) if isinstance(ship_service, dict) else False
+            assessments.append(
+                ConnectorAssessment(
+                    connector_name="EEBus SHIP discovery",
+                    protocol=protocol,
+                    outcome=ConnectorOutcome.INFO.value if trusted_identity_ready else ConnectorOutcome.PARTIAL.value,
+                    detail=(
+                        "Discovered an EEBus SHIP service advertisement. Pair a trusted identity before SPINE telemetry or load-control exchange."
+                    ),
+                )
+            )
         elif protocol == "vendor_cloud":
             if candidate.issue_code == "auth_required":
                 outcome = ConnectorOutcome.FAILED.value

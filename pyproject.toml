@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
   "cvxpy>=1.6,<2.0",
+  "eebus-sdk @ git+https://github.com/ULudo/eebus-sdk.git@48c854639ebd70b7250eb7c8273bcd9dad714351",
   "fastapi>=0.115,<1.0",
   "highspy>=1.9,<2.0",
   "httpx>=0.28,<1.0",

@@ -81,6 +81,11 @@ class Site(Base):
         cascade="all, delete-orphan",
         order_by="HemsPlanRun.created_at.desc()",
     )
+    hems_system_bindings: Mapped[list["HemsSystemBinding"]] = relationship(
+        back_populates="site",
+        cascade="all, delete-orphan",
+        order_by="HemsSystemBinding.updated_at.desc()",
+    )
     setup_profile: Mapped["SiteSetupProfile | None"] = relationship(
         back_populates="site",
         cascade="all, delete-orphan",
@@ -247,6 +252,35 @@ class Asset(Base):
     )
 
     site: Mapped[Site] = relationship(back_populates="assets")
+
+
+class HemsSystemBinding(Base):
+    __tablename__ = "hems_system_bindings"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"))
+    system_type: Mapped[str] = mapped_column(String(80))
+    label: Mapped[str] = mapped_column(String(160))
+    device_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    asset_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(40), default="confirmed")
+    connection_status: Mapped[str] = mapped_column(String(40), default="unknown")
+    telemetry_status: Mapped[str] = mapped_column(String(40), default="unknown")
+    control_status: Mapped[str] = mapped_column(String(40), default="unknown")
+    source: Mapped[str] = mapped_column(String(80), default="agent")
+    confidence: Mapped[float] = mapped_column(default=0.0)
+    evidence: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        onupdate=utcnow,
+    )
+
+    site: Mapped[Site] = relationship(back_populates="hems_system_bindings")
 
 
 class Recommendation(Base):
@@ -475,12 +509,6 @@ class ConversationThread(Base):
         cascade="all, delete-orphan",
         order_by="ConversationTurn.created_at.asc()",
     )
-    proposals: Mapped[list["ActionProposal"]] = relationship(
-        back_populates="thread",
-        cascade="all, delete-orphan",
-        order_by="ActionProposal.created_at.desc()",
-    )
-
 
 class ConversationMessage(Base):
     __tablename__ = "conversation_messages"
@@ -525,10 +553,6 @@ class ConversationTurn(Base):
         cascade="all, delete-orphan",
         order_by="ConversationEvent.event_index.asc()",
     )
-    proposals: Mapped[list["ActionProposal"]] = relationship(
-        back_populates="turn",
-        order_by="ActionProposal.created_at.desc()",
-    )
     assistant_message: Mapped[ConversationMessage | None] = relationship(
         foreign_keys=[assistant_message_id],
         primaryjoin="ConversationTurn.assistant_message_id == ConversationMessage.id",
@@ -548,16 +572,149 @@ class ConversationEvent(Base):
     turn: Mapped[ConversationTurn] = relationship(back_populates="events")
 
 
-class ActionProposal(Base):
-    __tablename__ = "action_proposals"
+class HomeGraphEntity(Base):
+    __tablename__ = "home_graph_entities"
 
-    id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    thread_id: Mapped[str] = mapped_column(ForeignKey("conversation_threads.id"))
-    turn_id: Mapped[str | None] = mapped_column(ForeignKey("conversation_turns.id"), nullable=True)
-    action_type: Mapped[str] = mapped_column(String(80))
+    id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"))
+    entity_type: Mapped[str] = mapped_column(String(60))
+    source_type: Mapped[str] = mapped_column(String(60), default="")
+    source_id: Mapped[str] = mapped_column(String(96), default="")
+    display_name: Mapped[str] = mapped_column(String(180), default="")
+    semantic_type: Mapped[str] = mapped_column(String(80), default="")
+    status: Mapped[str] = mapped_column(String(60), default="observed")
+    properties: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        onupdate=utcnow,
+    )
+
+
+class ProtocolEndpoint(Base):
+    __tablename__ = "protocol_endpoints"
+
+    id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"))
+    owner_ref: Mapped[str] = mapped_column(String(96))
+    protocol: Mapped[str] = mapped_column(String(80))
+    address: Mapped[str] = mapped_column(String(180), default="")
+    port: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    service_name: Mapped[str] = mapped_column(String(180), default="")
+    status: Mapped[str] = mapped_column(String(60), default="observed")
+    properties: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        onupdate=utcnow,
+    )
+
+
+class HomeGraphEvidence(Base):
+    __tablename__ = "home_graph_evidence"
+
+    id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"))
+    subject_ref: Mapped[str] = mapped_column(String(96))
+    evidence_type: Mapped[str] = mapped_column(String(80))
+    source: Mapped[str] = mapped_column(String(80), default="system")
     summary: Mapped[str] = mapped_column(Text, default="")
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
-    status: Mapped[str] = mapped_column(String(40), default="pending")
+    confidence: Mapped[float] = mapped_column(default=0.0)
+    trust: Mapped[str] = mapped_column(String(60), default="observed")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class DeviceAssessment(Base):
+    __tablename__ = "device_assessments"
+
+    id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"))
+    subject_ref: Mapped[str] = mapped_column(String(96))
+    summary: Mapped[str] = mapped_column(Text, default="")
+    possible_roles: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    evidence_refs: Mapped[list[str]] = mapped_column(JSON, default=list)
+    confidence: Mapped[float] = mapped_column(default=0.0)
+    status: Mapped[str] = mapped_column(String(60), default="tentative")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        onupdate=utcnow,
+    )
+
+
+class AgentTask(Base):
+    __tablename__ = "agent_tasks"
+
+    id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"))
+    thread_id: Mapped[str | None] = mapped_column(ForeignKey("conversation_threads.id"), nullable=True)
+    turn_id: Mapped[str | None] = mapped_column(ForeignKey("conversation_turns.id"), nullable=True)
+    task_type: Mapped[str] = mapped_column(String(80))
+    title: Mapped[str] = mapped_column(String(180), default="")
+    goal: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(60), default="open")
+    target_refs: Mapped[list[str]] = mapped_column(JSON, default=list)
+    context: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        onupdate=utcnow,
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class TaskStep(Base):
+    __tablename__ = "task_steps"
+
+    id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    task_id: Mapped[str] = mapped_column(ForeignKey("agent_tasks.id"))
+    step_key: Mapped[str] = mapped_column(String(80))
+    title: Mapped[str] = mapped_column(String(180), default="")
+    status: Mapped[str] = mapped_column(String(60), default="pending")
+    summary: Mapped[str] = mapped_column(Text, default="")
+    result: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        onupdate=utcnow,
+    )
+
+
+class Blocker(Base):
+    __tablename__ = "blockers"
+
+    id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    task_id: Mapped[str | None] = mapped_column(ForeignKey("agent_tasks.id"), nullable=True)
+    subject_ref: Mapped[str] = mapped_column(String(96), default="")
+    blocker_type: Mapped[str] = mapped_column(String(80))
+    summary: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(60), default="open")
+    details: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class Proposal(Base):
+    __tablename__ = "proposals"
+
+    id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"))
+    thread_id: Mapped[str | None] = mapped_column(ForeignKey("conversation_threads.id"), nullable=True)
+    turn_id: Mapped[str | None] = mapped_column(ForeignKey("conversation_turns.id"), nullable=True)
+    task_id: Mapped[str | None] = mapped_column(ForeignKey("agent_tasks.id"), nullable=True)
+    proposal_type: Mapped[str] = mapped_column(String(80))
+    title: Mapped[str] = mapped_column(String(180), default="")
+    summary: Mapped[str] = mapped_column(Text, default="")
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    target_refs: Mapped[list[str]] = mapped_column(JSON, default=list)
+    risk_level: Mapped[str] = mapped_column(String(40), default="medium")
+    status: Mapped[str] = mapped_column(String(60), default="awaiting_user_decision")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -566,8 +723,64 @@ class ActionProposal(Base):
     )
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
-    thread: Mapped[ConversationThread] = relationship(back_populates="proposals")
-    turn: Mapped[ConversationTurn | None] = relationship(back_populates="proposals")
+
+class UserDecisionRequest(Base):
+    __tablename__ = "user_decision_requests"
+
+    id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"))
+    thread_id: Mapped[str | None] = mapped_column(ForeignKey("conversation_threads.id"), nullable=True)
+    turn_id: Mapped[str | None] = mapped_column(ForeignKey("conversation_turns.id"), nullable=True)
+    proposal_id: Mapped[str] = mapped_column(ForeignKey("proposals.id"))
+    question: Mapped[str] = mapped_column(Text, default="")
+    options: Mapped[list[str]] = mapped_column(JSON, default=list)
+    risk_level: Mapped[str] = mapped_column(String(40), default="medium")
+    status: Mapped[str] = mapped_column(String(60), default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class UserDecision(Base):
+    __tablename__ = "user_decisions"
+
+    id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    request_id: Mapped[str] = mapped_column(ForeignKey("user_decision_requests.id"))
+    proposal_id: Mapped[str] = mapped_column(ForeignKey("proposals.id"))
+    decision: Mapped[str] = mapped_column(String(40))
+    actor: Mapped[str] = mapped_column(String(80), default="user")
+    comment: Mapped[str] = mapped_column(Text, default="")
+    details: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ToolInvocation(Base):
+    __tablename__ = "tool_invocations"
+
+    id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"))
+    thread_id: Mapped[str | None] = mapped_column(ForeignKey("conversation_threads.id"), nullable=True)
+    turn_id: Mapped[str | None] = mapped_column(ForeignKey("conversation_turns.id"), nullable=True)
+    tool_name: Mapped[str] = mapped_column(String(120))
+    risk_level: Mapped[str] = mapped_column(String(40), default="low")
+    confirmation_policy: Mapped[str] = mapped_column(String(80), default="none")
+    status: Mapped[str] = mapped_column(String(60), default="running")
+    input_payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    output_payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    error: Mapped[str] = mapped_column(Text, default="")
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class AgentUiEvent(Base):
+    __tablename__ = "agent_ui_events"
+
+    id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"))
+    thread_id: Mapped[str | None] = mapped_column(ForeignKey("conversation_threads.id"), nullable=True)
+    turn_id: Mapped[str | None] = mapped_column(ForeignKey("conversation_turns.id"), nullable=True)
+    event_type: Mapped[str] = mapped_column(String(80))
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class HemsPolicy(Base):

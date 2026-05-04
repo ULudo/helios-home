@@ -10,6 +10,7 @@ from app.db.models import Asset, Device, DeviceCandidate, Site
 from app.db.seed import seed_demo_data
 from app.db.session import get_engine, get_session_factory, init_database
 from app.hems.models import ForecastBundle
+from app.hems.bindings import upsert_system_binding
 from app.hems.service import get_hems_summary, list_hems_assets, run_hems_replan
 from app.hems.site_model import build_site_model
 from app.main import create_app
@@ -193,6 +194,36 @@ def test_site_model_maps_current_discovery_assets_into_canonical_hems_assets(tmp
         assert assets_by_type["battery"].command_contract.validation_state == "unavailable"
         assert assets_by_type["heat_pump"].command_contract is not None
         assert assets_by_type["heat_pump"].command_contract.maximum == 2.5
+    finally:
+        session.close()
+
+
+def test_site_model_prefers_confirmed_binding_role_and_label(tmp_path, monkeypatch):
+    session = _build_session(tmp_path, monkeypatch, "binding-site-model.db")
+    try:
+        run_discovery(session)
+        grid_device = session.get(Device, "dev-shelly-3em")
+        assert grid_device is not None
+
+        binding = upsert_system_binding(
+            session,
+            system_type="grid_meter",
+            label="Main Grid Meter",
+            device_id=grid_device.id,
+            asset_id="asset-grid",
+            source="agent",
+            confidence=0.95,
+            evidence={"test": True},
+        )
+        session.add(binding)
+        session.commit()
+
+        site_model = build_site_model(session)
+        grid_asset = next(asset for asset in site_model.assets if asset.device_id == grid_device.id)
+        assert grid_asset.asset_type == "grid_meter"
+        assert grid_asset.label == "Main Grid Meter"
+        assert grid_asset.binding_id == binding.id
+        assert grid_asset.connection_status == "connected"
     finally:
         session.close()
 

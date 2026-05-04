@@ -1,9 +1,18 @@
-import type { AgentUiAction, NavigationMode, TimeRange, ViewKey } from "./types";
+import type { AgentUiEvent, NavigationMode, TimeRange, ViewKey } from "./types";
 
 export type ExplanationCard = {
   title: string;
   body: string;
   severity: "info" | "caution" | "critical";
+} | null;
+
+export type ActiveTaskHint = {
+  taskRef: string;
+  mode: "progress" | "blockers" | "summary";
+  title: string;
+  status: string;
+  summary: string;
+  blockers: Array<Record<string, unknown>>;
 } | null;
 
 export type UIState = {
@@ -18,12 +27,35 @@ export type UIState = {
     timeRange: TimeRange;
   };
   explanation: ExplanationCard;
+  activeTask: ActiveTaskHint;
   viewLock: boolean;
   lastAgentNavigationAt: string | null;
 };
 
+type UIStateEffect =
+  | { type: "open_view"; payload: { view: ViewKey; mode?: NavigationMode } }
+  | { type: "focus_system"; payload: { system_type: string | null } }
+  | { type: "select_devices"; payload: { device_ids: string[] } }
+  | { type: "highlight_devices"; payload: { device_ids: string[] } }
+  | {
+      type: "show_monitoring";
+      payload: { device_ids: string[]; metric_keys: string[]; time_range: TimeRange; mode?: NavigationMode };
+    }
+  | {
+      type: "show_task";
+      payload: {
+        task_ref: string;
+        mode?: "progress" | "blockers" | "summary";
+        title?: string;
+        status?: string;
+        summary?: string;
+        blockers?: Array<Record<string, unknown>>;
+      };
+    }
+  | { type: "clear_focus"; payload: Record<string, never> };
+
 export type UIStateAction =
-  | { type: "apply_actions"; actions: AgentUiAction[]; occurredAt: string }
+  | { type: "apply_actions"; actions: UIStateEffect[]; occurredAt: string }
   | { type: "set_view"; view: ViewKey }
   | { type: "toggle_view_lock" }
   | { type: "toggle_device_selection"; deviceId: string }
@@ -44,6 +76,7 @@ export function createInitialUIState(): UIState {
       timeRange: "last_24h",
     },
     explanation: null,
+    activeTask: null,
     viewLock: false,
     lastAgentNavigationAt: null,
   };
@@ -53,7 +86,7 @@ function normalizeSupportedView(view: ViewKey): ViewKey {
   return view === "settings" ? "settings" : "overview";
 }
 
-function applySingleUiAction(state: UIState, action: AgentUiAction, occurredAt: string): UIState {
+function applySingleUiAction(state: UIState, action: UIStateEffect, occurredAt: string): UIState {
   if (action.type === "open_view") {
     const mode = action.payload.mode ?? "focus";
     if (mode === "peek") {
@@ -123,13 +156,16 @@ function applySingleUiAction(state: UIState, action: AgentUiAction, occurredAt: 
     return nextState;
   }
 
-  if (action.type === "show_explanation") {
+  if (action.type === "show_task") {
     return {
       ...state,
-      explanation: {
-        title: action.payload.title,
-        body: action.payload.body,
-        severity: action.payload.severity ?? "info",
+      activeTask: {
+        taskRef: action.payload.task_ref,
+        mode: action.payload.mode ?? "summary",
+        title: action.payload.title ?? "",
+        status: action.payload.status ?? "",
+        summary: action.payload.summary ?? "",
+        blockers: action.payload.blockers ?? [],
       },
     };
   }
@@ -210,16 +246,64 @@ export function uiStateReducer(state: UIState, action: UIStateAction): UIState {
   return state;
 }
 
-export function parseUiActions(input: unknown): AgentUiAction[] {
+function deviceIdsFromEntityRefs(entityRefs: string[]): string[] {
+  return entityRefs
+    .map((ref) => (ref.startsWith("device:") ? ref.slice("device:".length) : ""))
+    .filter(Boolean);
+}
+
+function uiEventToActions(event: AgentUiEvent): UIStateEffect[] {
+  if (event.event_type === "view.open") {
+    return [{ type: "open_view", payload: event.payload }];
+  }
+  if (event.event_type === "entity.focus") {
+    const deviceIds = deviceIdsFromEntityRefs(event.payload.entity_refs);
+    if (event.payload.mode === "highlight") {
+      return deviceIds.length > 0 ? [{ type: "highlight_devices", payload: { device_ids: deviceIds } }] : [];
+    }
+    return deviceIds.length > 0
+      ? [
+          { type: "open_view", payload: { view: "overview", mode: "focus" } },
+          { type: "select_devices", payload: { device_ids: deviceIds } },
+          { type: "highlight_devices", payload: { device_ids: deviceIds } },
+        ]
+      : [];
+  }
+  if (event.event_type === "assessment.show") {
+    const deviceIds = deviceIdsFromEntityRefs([event.payload.entity_ref]);
+    return deviceIds.length > 0
+      ? [
+          { type: "open_view", payload: { view: "overview", mode: "focus" } },
+          { type: "select_devices", payload: { device_ids: deviceIds } },
+          { type: "highlight_devices", payload: { device_ids: deviceIds } },
+        ]
+      : [];
+  }
+  if (event.event_type === "task.show") {
+    return [{ type: "show_task", payload: event.payload }];
+  }
+  return [];
+}
+
+export function parseUiEvents(input: unknown): UIStateEffect[] {
   if (!Array.isArray(input)) {
     return [];
   }
   return input
-    .filter((entry): entry is { type: string; payload?: Record<string, unknown> } => {
-      return typeof entry === "object" && entry !== null && typeof (entry as { type?: unknown }).type === "string";
+    .filter((entry): entry is AgentUiEvent => {
+      if (typeof entry !== "object" || entry === null) {
+        return false;
+      }
+      const eventType = (entry as { event_type?: unknown }).event_type;
+      return (
+        eventType === "view.open" ||
+        eventType === "entity.focus" ||
+        eventType === "entity.relationship.show" ||
+        eventType === "task.show" ||
+        eventType === "proposal.present" ||
+        eventType === "evidence.recorded" ||
+        eventType === "assessment.show"
+      );
     })
-    .map((entry) => ({
-      type: entry.type,
-      payload: (entry.payload ?? {}) as AgentUiAction["payload"],
-    })) as AgentUiAction[];
+    .flatMap((event) => uiEventToActions(event));
 }

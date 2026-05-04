@@ -35,6 +35,20 @@ Current built-in options:
 
 Provider credentials are stored only on the local machine in the agent config path and are never returned by the API after saving. The repository does not contain any provider keys or checked-in model configuration.
 
+## EEBus / SHIP support
+
+Helios discovers EEBus SHIP peers as a standard local protocol and translates EEBus LoadControl limits into HEMS planning constraints.
+
+Current EEBus scope:
+
+- `_ship._tcp.local` discovery through the bundled `eebus-sdk` integration
+- visible inventory records for discovered SHIP peers
+- LPC, `limitationOfPowerConsumption`, mapped to `grid_import_limit_kw`
+- LPP, `limitationOfPowerProduction`, mapped to `grid_export_limit_kw`
+- HEMS replanning after active LPC/LPP limits are accepted
+
+The integration uses the Python SDK from `https://github.com/ULudo/eebus-sdk`. EEBus SHIP discovery runs with normal local/live device discovery; `HELIOS_EEBUS_INTERFACE_IP` may be set only when the host has multiple interfaces and automatic interface selection is not sufficient. Trust commissioning, certificate identity management and production-grade EEBus daemon lifecycle remain explicit operational steps.
+
 ## Repository layout
 
 ```text
@@ -93,6 +107,7 @@ Implemented now:
 - local HTTP discovery
 - mDNS / SSDP discovery
 - native Modbus / SunSpec probing
+- EEBus / SHIP discovery, with LPC/LPP load-control distribution
 - candidate reconciliation across native live sources
 - device inventory materialization into the local SQLite store
 - agent conversation thread with streaming activity and confirmation proposals

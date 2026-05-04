@@ -12,8 +12,12 @@ class SetupSystemBindingRead(BaseModel):
     system_type: str
     label: str
     device_id: str | None = None
+    asset_id: str | None = None
     device_name: str | None = None
     status: str = "confirmed"
+    connection_status: str = "unknown"
+    telemetry_status: str = "unknown"
+    control_status: str = "unknown"
 
 
 class SetupItemRead(BaseModel):
@@ -40,20 +44,46 @@ class AgentMessageRead(BaseModel):
     turn_id: str | None = None
 
 
-class AgentUiActionRead(BaseModel):
-    type: str
-    payload: dict[str, Any] = Field(default_factory=dict)
-
-
 class ActionProposalRead(BaseModel):
     id: str
     action_type: str
     summary: str
     payload: dict[str, Any] = Field(default_factory=dict)
     status: str
+    title: str = ""
+    risk_level: str = "medium"
+    target_refs: list[str] = Field(default_factory=list)
+    decision_request_id: str | None = None
+    decision_question: str | None = None
     created_at: datetime
     updated_at: datetime
     resolved_at: datetime | None = None
+
+
+class AgentBlockerRead(BaseModel):
+    id: str
+    task_id: str | None = None
+    subject_ref: str = ""
+    blocker_type: str
+    summary: str
+    status: str
+    details: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+    resolved_at: datetime | None = None
+
+
+class AgentTaskRead(BaseModel):
+    id: str
+    task_type: str
+    title: str
+    goal: str
+    status: str
+    target_refs: list[str] = Field(default_factory=list)
+    context: dict[str, Any] = Field(default_factory=dict)
+    blockers: list[AgentBlockerRead] = Field(default_factory=list)
+    created_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None = None
 
 
 class AgentThreadRead(BaseModel):
@@ -62,6 +92,8 @@ class AgentThreadRead(BaseModel):
     status: str
     messages: list[AgentMessageRead] = Field(default_factory=list)
     pending_proposals: list[ActionProposalRead] = Field(default_factory=list)
+    active_tasks: list[AgentTaskRead] = Field(default_factory=list)
+    open_blockers: list[AgentBlockerRead] = Field(default_factory=list)
     setup_profile: SiteSetupProfileRead
     latest_debug_case: DebugCaseRead | None = None
     created_at: datetime
@@ -70,6 +102,7 @@ class AgentThreadRead(BaseModel):
 
 class AgentMessageCreate(BaseModel):
     content: str
+    context: dict[str, Any] = Field(default_factory=dict)
 
 
 class AgentTurnAcceptedRead(BaseModel):
@@ -88,6 +121,11 @@ class AgentTurnEventRead(BaseModel):
 class ActionProposalDecisionRead(BaseModel):
     proposal: ActionProposalRead
     thread: AgentThreadRead
+
+
+class UserDecisionCreate(BaseModel):
+    decision: str
+    comment: str = ""
 
 
 class AgentProviderOptionRead(BaseModel):

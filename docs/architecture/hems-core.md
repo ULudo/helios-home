@@ -7,9 +7,11 @@ The HEMS core coordinates already-integrated household assets without embedding 
 It consumes:
 
 - the local device and asset inventory
+- confirmed HEMS system bindings created by the agent setup flow
 - validated telemetry
 - validated write-path capability
 - site policy
+- EEBus LPC/LPP grid-side load-control limits
 - local forecast heuristics or future external feeds
 
 It produces:
@@ -35,11 +37,15 @@ The optimizer does not see vendor-specific device metadata directly. Discovery a
 
 Each canonical asset carries:
 
+- binding id and user-facing label when the system was confirmed
+- binding, connection, telemetry, and control status
 - telemetry snapshot
 - extracted constraints
 - control capability
 - execution eligibility
 - explanation for blocked or plan-only states
+
+Discovery classification is treated as evidence, not as the final product truth. When the user or agent confirms that a physical device belongs to a HEMS role, the confirmed binding overrides the raw discovered label and role inside the canonical site model while preserving the original discovered identity.
 
 ### Eligibility gates
 
@@ -122,6 +128,16 @@ The write adapter is responsible for turning these into:
 - device-specific command parameters
 - applied-state bookkeeping
 - explicit dispatch failures when the path is not validated
+
+### EEBus LPC/LPP distribution
+
+EEBus LoadControl limits enter the HEMS as grid-connection constraints:
+
+- `limitationOfPowerConsumption` uses LoadControl limit id `0` and maps to the policy import limit.
+- `limitationOfPowerProduction` uses LoadControl limit id `1` and maps to the policy export limit.
+- Helios only tightens the current policy limit for an active command, then replans and lets the existing guarded dispatcher distribute the resulting commands to eligible assets.
+
+This keeps EEBus standard handling at the grid boundary while preserving the planner's vendor-neutral internal model.
 
 ### Audit and persistence
 

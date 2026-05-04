@@ -17,6 +17,7 @@ The active local adapters are:
 - subnet HTTP probing
 - mDNS / SSDP parsing
 - native Modbus / SunSpec probing
+- EEBus / SHIP discovery for `_ship._tcp.local` peers
 
 Each adapter produces raw candidate evidence.
 
@@ -81,3 +82,12 @@ It does not currently try to solve:
 - shared cloud knowledge
 - automated adapter patch generation
 - user-facing debug workflows in the frontend
+
+## EEBus scope
+
+EEBus support is intentionally split into two layers:
+
+- SHIP peer discovery is part of the normal local/live discovery pipeline and materializes visible inventory records with SKI, SHIP id, DNS-SD metadata and TLS probe evidence when available.
+- LPC/LPP LoadControl commands are translated into HEMS grid import/export constraints and trigger a replan.
+
+Trust commissioning and long-running production SHIP server lifecycle are not implicit side effects of discovery. They must be configured explicitly before live SPINE exchange is used.

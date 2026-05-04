@@ -10,23 +10,42 @@ from app.agent.schemas import (
     AgentThreadRead,
     AgentTurnAcceptedRead,
     SiteSetupProfileRead,
+    UserDecisionCreate,
 )
 from app.agent.service import (
-    confirm_action_proposal,
     create_agent_message,
     get_agent_provider_config,
     get_agent_thread,
     get_setup_profile,
-    reject_action_proposal,
+    respond_to_user_decision_request,
     stream_turn_events,
     update_agent_provider_config,
 )
+from app.core.config import get_settings
 from app.db.session import get_session
 from app.domain.schemas import DiscoveryRunRead, OverviewResponse, ReachableSubnetRead, SiteRead, SiteUpdate
-from app.hems.schemas import HemsAssetRead, HemsPlanRead, HemsPolicyRead, HemsPolicyUpdate, HemsSummaryRead
-from app.hems.service import get_hems_summary, get_latest_hems_plan, list_hems_assets, patch_hems_policy, run_hems_replan
+from app.hems.schemas import (
+    EebusLoadPowerLimitCreate,
+    EebusLoadPowerLimitDistributionRead,
+    EebusShipServiceRead,
+    HemsAssetRead,
+    HemsPlanRead,
+    HemsPolicyRead,
+    HemsPolicyUpdate,
+    HemsSummaryRead,
+    HemsSystemBindingRead,
+)
+from app.hems.service import (
+    get_hems_summary,
+    get_latest_hems_plan,
+    list_hems_assets,
+    list_hems_system_bindings,
+    patch_hems_policy,
+    run_hems_replan,
+)
 from app.services.dashboard import build_overview, update_site
 from app.services.discovery import run_discovery
+from app.services.eebus import distribute_load_power_limit, list_eebus_ship_services
 from app.services.network_scope import list_reachable_subnets
 
 router = APIRouter()
@@ -93,20 +112,18 @@ def read_agent_turn_events(turn_id: str):
     )
 
 
-@router.post("/agent/proposals/{proposal_id}/confirm", response_model=ActionProposalDecisionRead)
-def confirm_agent_proposal(proposal_id: str, session: Session = Depends(get_session)) -> ActionProposalDecisionRead:
+@router.post("/agent/decision-requests/{decision_request_id}/responses", response_model=ActionProposalDecisionRead)
+def respond_to_agent_decision_request(
+    decision_request_id: str,
+    payload: UserDecisionCreate,
+    session: Session = Depends(get_session),
+) -> ActionProposalDecisionRead:
     try:
-        return confirm_action_proposal(session, proposal_id)
+        return respond_to_user_decision_request(session, decision_request_id, payload)
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail="Proposal not found.") from exc
-
-
-@router.post("/agent/proposals/{proposal_id}/reject", response_model=ActionProposalDecisionRead)
-def reject_agent_proposal(proposal_id: str, session: Session = Depends(get_session)) -> ActionProposalDecisionRead:
-    try:
-        return reject_action_proposal(session, proposal_id)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail="Proposal not found.") from exc
+        raise HTTPException(status_code=404, detail="Decision request not found.") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/hems/summary", response_model=HemsSummaryRead)
@@ -117,6 +134,11 @@ def read_hems_summary(session: Session = Depends(get_session)) -> HemsSummaryRea
 @router.get("/hems/assets", response_model=list[HemsAssetRead])
 def read_hems_assets(session: Session = Depends(get_session)) -> list[HemsAssetRead]:
     return list_hems_assets(session)
+
+
+@router.get("/hems/bindings", response_model=list[HemsSystemBindingRead])
+def read_hems_bindings(session: Session = Depends(get_session)) -> list[HemsSystemBindingRead]:
+    return list_hems_system_bindings(session)
 
 
 @router.get("/hems/plans/latest", response_model=HemsPlanRead | None)
@@ -132,3 +154,28 @@ def update_hems_policy_route(payload: HemsPolicyUpdate, session: Session = Depen
 @router.post("/hems/replan", response_model=HemsPlanRead)
 def create_hems_replan(session: Session = Depends(get_session)) -> HemsPlanRead:
     return run_hems_replan(session)
+
+
+@router.get("/eebus/ship-services", response_model=list[EebusShipServiceRead])
+def read_eebus_ship_services() -> list[EebusShipServiceRead]:
+    settings = get_settings()
+    try:
+        services = list_eebus_ship_services(
+            interface_ip=settings.eebus_interface_ip or None,
+            timeout_seconds=settings.eebus_timeout_seconds,
+            tls_check=settings.eebus_tls_check_enabled,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return [EebusShipServiceRead(**service) for service in services]
+
+
+@router.post("/eebus/load-power-limits/distribute", response_model=EebusLoadPowerLimitDistributionRead)
+def distribute_eebus_load_power_limit_route(
+    payload: EebusLoadPowerLimitCreate,
+    session: Session = Depends(get_session),
+) -> EebusLoadPowerLimitDistributionRead:
+    try:
+        return distribute_load_power_limit(session, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

@@ -30,10 +30,11 @@ from app.services.discovery_blueprints import (
     classify_candidate,
     diagnose_candidate,
 )
+from app.services.eebus import EEBUS_SOURCE_NAME, discover_eebus_site
 from app.services.local_network import discover_local_network_site
 from app.services.modbus import discover_modbus_site
 from app.services.mqtt import discover_mqtt_site
-from app.services.network_scope import parse_configured_subnets
+from app.services.network_scope import list_reachable_subnets, parse_configured_subnets
 
 
 @dataclass(slots=True)
@@ -125,6 +126,7 @@ MANAGED_SOURCE_NAMES = {
     "modbus_live",
     "mqtt_live",
     "network_broadcast_live",
+    EEBUS_SOURCE_NAME,
 }
 
 
@@ -196,8 +198,18 @@ def _discover_batches(site: Site) -> tuple[list[SourceDiscoveryBatch], list[Sour
     settings = get_settings()
     attempted_batches: list[SourceDiscoveryBatch] = []
     configured_subnets = parse_configured_subnets(site.local_subnet)
+    reachable_subnets = [option.cidr for option in list_reachable_subnets()]
+    scan_subnets = configured_subnets or reachable_subnets
+    scope_kind = "configured" if configured_subnets else "reachable"
+    live_discovery_requested = (
+        settings.local_scan_enabled
+        or settings.broadcast_discovery_enabled
+        or settings.modbus_live_enabled
+        or (bool(site.mqtt_broker_url) and settings.mqtt_live_enabled)
+        or not settings.demo_mode
+    )
 
-    if configured_subnets and settings.local_scan_enabled:
+    if scan_subnets and settings.local_scan_enabled:
         batches = [
             (
                 subnet,
@@ -208,13 +220,13 @@ def _discover_batches(site: Site) -> tuple[list[SourceDiscoveryBatch], list[Sour
                     max_hosts=settings.local_scan_max_hosts,
                 ),
             )
-            for subnet in configured_subnets
+            for subnet in scan_subnets
         ]
         batch = _combine_batches(
             source_name="local_network_live",
             batches=batches,
-            success_message="Imported {candidate_count} energy-relevant local HTTP device candidates from {scope_count} configured subnet scan(s).",
-            empty_message="Local network discovery completed across {scope_count} configured subnet scan(s), but no energy-relevant HTTP interfaces were identified.",
+            success_message=f"Imported {{candidate_count}} energy-relevant local HTTP device candidates from {{scope_count}} {scope_kind} subnet scan(s).",
+            empty_message=f"Local network discovery completed across {{scope_count}} {scope_kind} subnet scan(s), but no energy-relevant HTTP interfaces were identified.",
         )
         attempted_batches.append(batch)
 
@@ -231,7 +243,7 @@ def _discover_batches(site: Site) -> tuple[list[SourceDiscoveryBatch], list[Sour
         )
         attempted_batches.append(broadcast_batch)
 
-    if configured_subnets and settings.modbus_live_enabled:
+    if scan_subnets and settings.modbus_live_enabled:
         batches = [
             (
                 subnet,
@@ -242,13 +254,13 @@ def _discover_batches(site: Site) -> tuple[list[SourceDiscoveryBatch], list[Sour
                     max_hosts=settings.modbus_max_hosts,
                 ),
             )
-            for subnet in configured_subnets
+            for subnet in scan_subnets
         ]
         batch = _combine_batches(
             source_name="modbus_live",
             batches=batches,
-            success_message="Imported {candidate_count} candidates from native Modbus/TCP probing across {scope_count} configured subnet scan(s).",
-            empty_message="Modbus discovery completed across {scope_count} configured subnet scan(s), but no native Modbus/TCP devices exposed a usable identity or SunSpec signature.",
+            success_message=f"Imported {{candidate_count}} candidates from native Modbus/TCP probing across {{scope_count}} {scope_kind} subnet scan(s).",
+            empty_message=f"Modbus discovery completed across {{scope_count}} {scope_kind} subnet scan(s), but no native Modbus/TCP devices exposed a usable identity or SunSpec signature.",
         )
         attempted_batches.append(batch)
 
@@ -266,6 +278,20 @@ def _discover_batches(site: Site) -> tuple[list[SourceDiscoveryBatch], list[Sour
         )
         attempted_batches.append(mqtt_batch)
 
+    if live_discovery_requested:
+        batch = discover_eebus_site(
+            interface_ip=settings.eebus_interface_ip or None,
+            timeout_seconds=settings.eebus_timeout_seconds,
+            tls_check=settings.eebus_tls_check_enabled,
+        )
+        eebus_batch = SourceDiscoveryBatch(
+            source_name=batch.source_name,
+            status=batch.status,
+            message=batch.message,
+            candidates=batch.candidates,
+        )
+        attempted_batches.append(eebus_batch)
+
     if attempted_batches:
         selected_batches = [batch for batch in attempted_batches if batch.candidates]
         return attempted_batches, selected_batches
@@ -279,7 +305,7 @@ def _discover_batches(site: Site) -> tuple[list[SourceDiscoveryBatch], list[Sour
         status="failed",
         message=(
             "No live discovery source is configured and demo mode is disabled. Configure local subnet scanning, "
-            "network broadcast discovery, native Modbus discovery, or MQTT live discovery."
+            "network broadcast discovery, native Modbus discovery, MQTT live discovery, or EEBus SHIP discovery."
         ),
         candidates=[],
     )

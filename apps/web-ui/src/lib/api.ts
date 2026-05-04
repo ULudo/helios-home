@@ -17,6 +17,7 @@ import type {
   SiteSetupProfileRead,
   SiteRead,
   SiteUpdate,
+  UserDecisionCreate,
 } from "./types";
 
 const apiBase = (import.meta.env.VITE_API_BASE as string | undefined)?.replace(/\/$/, "") ?? "/api/v1";
@@ -93,13 +94,10 @@ export const api = {
       method: "POST",
       body: JSON.stringify(payload),
     }),
-  confirmAgentProposal: (proposalId: string) =>
-    request<ActionProposalDecisionRead>(`/agent/proposals/${proposalId}/confirm`, {
+  respondToDecisionRequest: (decisionRequestId: string, payload: UserDecisionCreate) =>
+    request<ActionProposalDecisionRead>(`/agent/decision-requests/${decisionRequestId}/responses`, {
       method: "POST",
-    }),
-  rejectAgentProposal: (proposalId: string) =>
-    request<ActionProposalDecisionRead>(`/agent/proposals/${proposalId}/reject`, {
-      method: "POST",
+      body: JSON.stringify(payload),
     }),
   getOverview: () => request<OverviewResponse>("/overview"),
   listReachableSubnets: () => request<ReachableSubnetRead[]>("/network/reachable-subnets"),

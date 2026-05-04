@@ -146,10 +146,21 @@ Returns:
 Returns the canonical HEMS asset view used by the planner, including:
 
 - canonical asset type
+- confirmed binding and connection state, when present
 - control capability
 - execution eligibility
 - extracted constraints
 - latest telemetry snapshot
+
+### `GET /hems/bindings`
+
+Returns confirmed HEMS system bindings created through the agent setup flow, including:
+
+- canonical HEMS role
+- user-facing system label
+- linked device and asset ids
+- binding, connection, telemetry, and control status
+- resolver evidence used when the binding was confirmed
 
 ### `GET /hems/plans/latest`
 
@@ -179,3 +190,30 @@ Example body:
 ### `POST /hems/replan`
 
 Builds the current canonical site model, solves a new plan and runs guarded dispatch for the current interval.
+
+## EEBus
+
+### `GET /eebus/ship-services`
+
+Runs an EEBus SHIP DNS-SD discovery pass through the standard `eebus-sdk` integration and returns discovered `_ship._tcp.local` services.
+
+### `POST /eebus/load-power-limits/distribute`
+
+Accepts an EEBus LoadControl LPC/LPP limit, maps it into the HEMS grid policy, and replans.
+
+Example LPC body:
+
+```json
+{
+  "use_case": "lpc",
+  "limit_watts": 4200,
+  "duration_seconds": 7200,
+  "source": "eebus",
+  "peer_ski": "0123456789abcdef0123456789abcdef01234567"
+}
+```
+
+Mapping:
+
+- `lpc` / `limitationOfPowerConsumption` / `limit_id: 0` updates `grid_import_limit_kw`
+- `lpp` / `limitationOfPowerProduction` / `limit_id: 1` updates `grid_export_limit_kw`
