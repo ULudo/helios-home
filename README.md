@@ -76,13 +76,13 @@ Install backend dependencies once:
 ```
 
 ```bash
-export HELIOS_LOCAL_SCAN_ENABLED=true
-export HELIOS_BROADCAST_DISCOVERY_ENABLED=true
 export HELIOS_MODBUS_LIVE_ENABLED=true
 ./scripts/run-backend.sh
 ```
 
 The backend listens on `http://127.0.0.1:8000`.
+
+Local HTTP discovery, mDNS / SSDP discovery, and EEBus / SHIP discovery are part of the standard local backend discovery policy. Native Modbus probing remains opt-in with `HELIOS_MODBUS_LIVE_ENABLED=true`.
 
 ### Frontend
 

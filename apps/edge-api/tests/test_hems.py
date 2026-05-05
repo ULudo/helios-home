@@ -7,7 +7,7 @@ from sqlalchemy import select
 
 from app.core.config import get_settings
 from app.db.models import Asset, Device, DeviceCandidate, Site
-from app.db.seed import seed_demo_data
+from app.db.seed import seed_default_site
 from app.db.session import get_engine, get_session_factory, init_database
 from app.hems.models import ForecastBundle
 from app.hems.bindings import upsert_system_binding
@@ -15,6 +15,7 @@ from app.hems.service import get_hems_summary, list_hems_assets, run_hems_replan
 from app.hems.site_model import build_site_model
 from app.main import create_app
 from app.services.discovery import run_discovery
+from discovery_catalog import install_catalog_discovery
 
 
 def _build_session(tmp_path, monkeypatch, name="test.db"):
@@ -24,7 +25,7 @@ def _build_session(tmp_path, monkeypatch, name="test.db"):
     init_database()
     session_factory = get_session_factory()
     session = session_factory()
-    seed_demo_data(session)
+    seed_default_site(session)
     return session
 
 
@@ -180,6 +181,7 @@ def _add_controllable_load(
 def test_site_model_maps_current_discovery_assets_into_canonical_hems_assets(tmp_path, monkeypatch):
     session = _build_session(tmp_path, monkeypatch)
     try:
+        install_catalog_discovery(session, monkeypatch)
         run_discovery(session)
         site_model = build_site_model(session)
         assets_by_type = {asset.asset_type: asset for asset in site_model.assets}
@@ -201,6 +203,7 @@ def test_site_model_maps_current_discovery_assets_into_canonical_hems_assets(tmp
 def test_site_model_prefers_confirmed_binding_role_and_label(tmp_path, monkeypatch):
     session = _build_session(tmp_path, monkeypatch, "binding-site-model.db")
     try:
+        install_catalog_discovery(session, monkeypatch)
         run_discovery(session)
         grid_device = session.get(Device, "dev-shelly-3em")
         assert grid_device is not None
@@ -231,6 +234,7 @@ def test_site_model_prefers_confirmed_binding_role_and_label(tmp_path, monkeypat
 def test_hems_replan_persists_intervals_and_simulated_dispatch(tmp_path, monkeypatch):
     session = _build_session(tmp_path, monkeypatch)
     try:
+        install_catalog_discovery(session, monkeypatch)
         run_discovery(session)
         _make_dispatchable(session)
 
@@ -263,6 +267,7 @@ def test_native_write_runtime_gate_demotes_native_contracts_to_plan_only(tmp_pat
     get_settings.cache_clear()
     session = _build_session(tmp_path, monkeypatch, name="native-disabled.db")
     try:
+        install_catalog_discovery(session, monkeypatch)
         run_discovery(session)
         _make_dispatchable(session)
         battery_candidate = session.get(DeviceCandidate, "cand-byd-battery")

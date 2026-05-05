@@ -297,6 +297,7 @@ class DiscoveryRunRead(BaseModel):
     status: str | None = None
     source_names: list[str] = Field(default_factory=list)
     source_results: list[DiscoverySourceResultRead] = Field(default_factory=list)
+    scope: dict[str, Any] = Field(default_factory=dict)
     executed_at: datetime
     message: str
     new_device_ids: list[str]

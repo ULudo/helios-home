@@ -400,6 +400,16 @@ def test_discovery_tool_is_available_for_model_operated_network_scan(tmp_path, m
             "candidate_count": 1,
             "integrated_devices": 1,
             "new_device_ids": ["dev-found"],
+            "result": "candidates_found",
+            "scope": {"scan_subnets": ["198.51.100.0/24"]},
+            "source_results": [
+                {
+                    "source_name": "local_network_live",
+                    "status": "completed",
+                    "message": "completed: 1 local HTTP candidate from 1 configured subnet scan.",
+                    "candidate_count": 1,
+                }
+            ],
         }
 
     monkeypatch.setattr("app.agent.tools.discovery.inspect_home_network", fake_inspect_home_network)

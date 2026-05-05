@@ -1,5 +1,5 @@
 from app.core.config import get_settings
-from app.db.seed import seed_demo_data
+from app.db.seed import seed_default_site
 from app.db.session import get_engine, get_session_factory, init_database
 from app.domain.schemas import DebugExplainRequest
 from app.services.discovery import run_discovery
@@ -7,6 +7,7 @@ from app.services.discovery_blueprints import RawCandidate
 from app.services.knowledge import create_debug_case, promote_debug_case_to_knowledge
 from app.services.modbus import ModbusProbeResult, SunSpecModelBlock
 from app.services.targeted_probe import run_targeted_probe
+from discovery_catalog import install_empty_standard_discovery
 
 
 def _build_session(tmp_path, monkeypatch, name="test.db"):
@@ -16,13 +17,14 @@ def _build_session(tmp_path, monkeypatch, name="test.db"):
     init_database()
     session_factory = get_session_factory()
     session = session_factory()
-    seed_demo_data(session)
+    seed_default_site(session)
     return session
 
 
 def test_targeted_probe_confirms_dry_contact_path_for_legacy_heat_pump(tmp_path, monkeypatch):
     session = _build_session(tmp_path, monkeypatch)
     try:
+        install_empty_standard_discovery(monkeypatch)
         run_discovery(session)
         debug_case = create_debug_case(
             session,
@@ -50,6 +52,7 @@ def test_targeted_probe_confirms_dry_contact_path_for_legacy_heat_pump(tmp_path,
 def test_targeted_probe_upgrades_reachable_host_to_network_native_but_unsupported(tmp_path, monkeypatch):
     session = _build_session(tmp_path, monkeypatch)
     try:
+        install_empty_standard_discovery(monkeypatch)
         run_discovery(session)
         debug_case = create_debug_case(
             session,
@@ -82,6 +85,7 @@ def test_targeted_probe_upgrades_reachable_host_to_network_native_but_unsupporte
 def test_targeted_probe_uses_http_fingerprint_to_confirm_network_native_path(tmp_path, monkeypatch):
     session = _build_session(tmp_path, monkeypatch)
     try:
+        install_empty_standard_discovery(monkeypatch)
         run_discovery(session)
         debug_case = create_debug_case(
             session,
@@ -135,6 +139,7 @@ def test_targeted_probe_uses_http_fingerprint_to_confirm_network_native_path(tmp
 def test_targeted_probe_uses_modbus_probe_to_confirm_native_endpoint(tmp_path, monkeypatch):
     session = _build_session(tmp_path, monkeypatch)
     try:
+        install_empty_standard_discovery(monkeypatch)
         run_discovery(session)
         debug_case = create_debug_case(
             session,

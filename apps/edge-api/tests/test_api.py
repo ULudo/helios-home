@@ -2,7 +2,7 @@ import pytest
 
 from app.core.config import get_settings
 from app.db.models import Site
-from app.db.seed import seed_demo_data
+from app.db.seed import seed_default_site
 from app.db.session import get_engine, get_session_factory, init_database
 from app.services.dashboard import build_overview
 from app.services.discovery import list_device_candidates, list_discovery_runs, run_discovery
@@ -26,8 +26,18 @@ def _empty_eebus_batch(interface_ip=None, timeout_seconds=3.0, tls_check=False):
 
 
 @pytest.fixture(autouse=True)
-def _use_deterministic_eebus_discovery(monkeypatch):
+def _isolate_standard_discovery_sources(monkeypatch):
     monkeypatch.setattr("app.services.discovery.discover_eebus_site", _empty_eebus_batch)
+    monkeypatch.setattr("app.services.discovery.list_reachable_subnets", lambda: [])
+    monkeypatch.setattr(
+        "app.services.discovery.discover_network_broadcast",
+        lambda timeout_seconds, max_service_types: BroadcastDiscoveryBatch(
+            source_name="network_broadcast_live",
+            status="completed",
+            message="Network broadcast discovery completed, but no energy-relevant advertisements were identified.",
+            candidates=[],
+        ),
+    )
 
 
 def _build_session(tmp_path, monkeypatch):
@@ -37,7 +47,7 @@ def _build_session(tmp_path, monkeypatch):
     init_database()
     session_factory = get_session_factory()
     session = session_factory()
-    seed_demo_data(session)
+    seed_default_site(session)
     return session
 
 
@@ -208,6 +218,88 @@ def _modbus_grid_meter_candidate() -> RawCandidate:
     )
 
 
+def _battery_recovery_candidate() -> RawCandidate:
+    return RawCandidate(
+        candidate_id="cand-byd-battery",
+        device_id="dev-byd-battery",
+        asset_id="asset-battery",
+        asset_name="Battery Buffer",
+        display_name="Battery Storage",
+        manufacturer="BYD",
+        model="Battery-Box Premium HVS",
+        firmware="3.14.1",
+        device_type="battery",
+        discovery_sources=["local_network_live"],
+        protocols=["modbus_tcp"],
+        telemetry={"soc_pct": 48, "power_kw": -1.2, "available_capacity_kwh": 9.1},
+        evidence={
+            "modbus_host": "198.51.100.22",
+            "register_issue": "unit_id_mismatch",
+            "validated_read_paths": ["soc_pct", "power_kw"],
+        },
+        recovery_zone="guarded_apply",
+        issue_code="modbus_unit_id_mismatch",
+        explanation_hint="Read telemetry is available but command registers no longer line up with the expected profile.",
+        next_step_hint="Run guarded recovery to validate a new Modbus unit-id mapping.",
+        capabilities_hint={
+            "visible": True,
+            "monitorable": True,
+            "controllable": True,
+            "optimizable": False,
+        },
+    )
+
+
+def _human_gated_wallbox_candidate() -> RawCandidate:
+    return RawCandidate(
+        candidate_id="cand-easee-wallbox",
+        device_id="dev-easee-wallbox",
+        asset_id="asset-wallbox",
+        asset_name="EV Charging",
+        display_name="EV Charger",
+        manufacturer="Easee",
+        model="Home",
+        firmware="309B",
+        device_type="wallbox",
+        discovery_sources=["local_network_live"],
+        protocols=["vendor_cloud"],
+        telemetry={"vehicle_connected": True, "session_energy_kwh": 0.0},
+        evidence={"cloud_pairing_required": True, "vendor_app": "Easee"},
+        recovery_zone="human_gated",
+        issue_code="auth_required",
+        explanation_hint="The available integration path still needs human-approved pairing.",
+        next_step_hint="Complete vendor pairing before retrying integration.",
+        capabilities_hint={
+            "visible": True,
+            "monitorable": False,
+            "controllable": False,
+            "optimizable": False,
+        },
+    )
+
+
+def _install_local_test_discovery(session, monkeypatch, candidates: list[RawCandidate] | None = None) -> None:
+    site = session.get(Site, 1)
+    assert site is not None
+    site.local_subnet = "198.51.100.0/24"
+    session.add(site)
+    session.commit()
+    selected_candidates = candidates or [
+        _local_http_candidate(),
+        _battery_recovery_candidate(),
+        _human_gated_wallbox_candidate(),
+    ]
+    monkeypatch.setattr(
+        "app.services.discovery.discover_local_network_site",
+        lambda subnet, timeout_seconds, concurrency, max_hosts: LocalNetworkDiscoveryBatch(
+            source_name="local_network_live",
+            status="completed",
+            message=f"Imported {len(selected_candidates)} explicit test candidate(s).",
+            candidates=selected_candidates,
+        ),
+    )
+
+
 def test_overview_starts_with_seeded_site_only(tmp_path, monkeypatch):
     session = _build_session(tmp_path, monkeypatch)
     try:
@@ -221,9 +313,10 @@ def test_overview_starts_with_seeded_site_only(tmp_path, monkeypatch):
 def test_discovery_materializes_candidates_devices_and_runs(tmp_path, monkeypatch):
     session = _build_session(tmp_path, monkeypatch)
     try:
+        _install_local_test_discovery(session, monkeypatch)
         discovery = run_discovery(session)
-        assert discovery.candidate_count == 5
-        assert discovery.source_names == ["fixture_registry"]
+        assert discovery.candidate_count == 3
+        assert discovery.source_names == ["local_network_live"]
         assert "dev-byd-battery" in discovery.new_device_ids
 
         overview = build_overview(session)
@@ -233,7 +326,7 @@ def test_discovery_materializes_candidates_devices_and_runs(tmp_path, monkeypatc
         runs = list_discovery_runs(session)
         assert len(runs) == 1
         assert runs[0].new_device_ids == discovery.new_device_ids
-        assert runs[0].source_results[0].source_name == "fixture_registry"
+        assert runs[0].source_results[0].source_name == "local_network_live"
     finally:
         session.close()
 
@@ -241,17 +334,40 @@ def test_discovery_materializes_candidates_devices_and_runs(tmp_path, monkeypatc
 def test_discovery_rerun_preserves_materialized_devices_and_assets(tmp_path, monkeypatch):
     session = _build_session(tmp_path, monkeypatch)
     try:
+        _install_local_test_discovery(session, monkeypatch)
         first_run = run_discovery(session)
         first_overview = build_overview(session)
         second_run = run_discovery(session)
 
         overview = build_overview(session)
 
-        assert first_run.candidate_count == 5
-        assert second_run.candidate_count == 5
-        assert len(overview.devices) == 5
+        assert first_run.candidate_count == 3
+        assert second_run.candidate_count == 3
+        assert len(overview.devices) == 3
         assert {device.id for device in overview.devices} == {device.id for device in first_overview.devices}
-        assert len(list_device_candidates(session)) == 5
+        assert len(list_device_candidates(session)) == 3
+    finally:
+        session.close()
+
+
+def test_discovery_returns_empty_live_result_without_fixture_fallback(tmp_path, monkeypatch):
+    session = _build_session(tmp_path, monkeypatch)
+    try:
+        discovery = run_discovery(session)
+        overview = build_overview(session)
+
+        assert discovery.status == "completed"
+        assert discovery.candidate_count == 0
+        assert discovery.message == "Discovery completed; no device candidates were found."
+        assert overview.devices == []
+        source_names = {result.source_name for result in discovery.source_results}
+        assert "fixture_registry" not in source_names
+        assert source_names == {
+            "local_network_live",
+            "network_broadcast_live",
+            "eebus_ship_live",
+        }
+        assert next(result for result in discovery.source_results if result.source_name == "local_network_live").status == "skipped"
     finally:
         session.close()
 
@@ -265,10 +381,7 @@ def test_discovery_reconciles_candidates_across_native_live_sources(tmp_path, mo
         site.mqtt_broker_url = "mqtt://mqtt.example:1883"
         session.add(site)
         session.commit()
-        monkeypatch.setenv("HELIOS_LOCAL_SCAN_ENABLED", "true")
-        monkeypatch.setenv("HELIOS_BROADCAST_DISCOVERY_ENABLED", "true")
         monkeypatch.setenv("HELIOS_MODBUS_LIVE_ENABLED", "true")
-        monkeypatch.setenv("HELIOS_MQTT_LIVE_ENABLED", "true")
         get_settings.cache_clear()
         monkeypatch.setattr(
             "app.services.discovery.discover_local_network_site",
@@ -339,9 +452,6 @@ def test_distinct_live_sources_materialize_together_when_not_reconciled(tmp_path
         site.mqtt_broker_url = "mqtt://mqtt.example:1883"
         session.add(site)
         session.commit()
-        monkeypatch.setenv("HELIOS_LOCAL_SCAN_ENABLED", "true")
-        monkeypatch.setenv("HELIOS_BROADCAST_DISCOVERY_ENABLED", "true")
-        monkeypatch.setenv("HELIOS_MQTT_LIVE_ENABLED", "true")
         get_settings.cache_clear()
         monkeypatch.setattr(
             "app.services.discovery.discover_local_network_site",
@@ -399,10 +509,7 @@ def test_mqtt_is_used_when_other_live_sources_find_no_candidates(tmp_path, monke
         site.mqtt_broker_url = "mqtt://mqtt.example:1883"
         session.add(site)
         session.commit()
-        monkeypatch.setenv("HELIOS_LOCAL_SCAN_ENABLED", "true")
-        monkeypatch.setenv("HELIOS_BROADCAST_DISCOVERY_ENABLED", "true")
         monkeypatch.setenv("HELIOS_MODBUS_LIVE_ENABLED", "true")
-        monkeypatch.setenv("HELIOS_MQTT_LIVE_ENABLED", "true")
         get_settings.cache_clear()
         monkeypatch.setattr(
             "app.services.discovery.discover_local_network_site",
@@ -460,7 +567,6 @@ def test_mqtt_is_used_when_other_live_sources_find_no_candidates(tmp_path, monke
 def test_local_discovery_combines_multiple_configured_subnets(tmp_path, monkeypatch):
     session = _build_session(tmp_path, monkeypatch)
     try:
-        monkeypatch.setenv("HELIOS_LOCAL_SCAN_ENABLED", "true")
         get_settings.cache_clear()
         site = session.get(Site, 1)
         assert site is not None
@@ -536,7 +642,6 @@ def test_local_discovery_combines_multiple_configured_subnets(tmp_path, monkeypa
 def test_local_discovery_uses_reachable_subnets_when_scope_is_empty(tmp_path, monkeypatch):
     session = _build_session(tmp_path, monkeypatch)
     try:
-        monkeypatch.setenv("HELIOS_LOCAL_SCAN_ENABLED", "true")
         get_settings.cache_clear()
         site = session.get(Site, 1)
         assert site is not None
@@ -590,7 +695,6 @@ def test_failed_live_mqtt_run_records_source_failure_without_fallback(tmp_path, 
         site.mqtt_broker_url = "mqtt://mqtt.example:1883"
         session.add(site)
         session.commit()
-        monkeypatch.setenv("HELIOS_MQTT_LIVE_ENABLED", "true")
         get_settings.cache_clear()
         monkeypatch.setattr(
             "app.services.discovery.discover_mqtt_site",
@@ -606,8 +710,13 @@ def test_failed_live_mqtt_run_records_source_failure_without_fallback(tmp_path, 
         overview = build_overview(session)
 
         assert discovery.status == "failed"
-        assert discovery.source_names == ["mqtt_live", "eebus_ship_live"]
-        assert discovery.source_results[0].status == "failed"
+        assert discovery.source_names == [
+            "local_network_live",
+            "network_broadcast_live",
+            "mqtt_live",
+            "eebus_ship_live",
+        ]
+        assert next(result for result in discovery.source_results if result.source_name == "mqtt_live").status == "failed"
         assert overview.devices == []
     finally:
         session.close()
@@ -616,6 +725,7 @@ def test_failed_live_mqtt_run_records_source_failure_without_fallback(tmp_path, 
 def test_guarded_battery_recovery_restores_optimization(tmp_path, monkeypatch):
     session = _build_session(tmp_path, monkeypatch)
     try:
+        _install_local_test_discovery(session, monkeypatch)
         run_discovery(session)
         recovery = run_recovery(session, "dev-byd-battery")
         assert recovery.agent_run.status == "completed"
@@ -628,6 +738,7 @@ def test_guarded_battery_recovery_restores_optimization(tmp_path, monkeypatch):
 def test_human_gated_recovery_stays_blocked(tmp_path, monkeypatch):
     session = _build_session(tmp_path, monkeypatch)
     try:
+        _install_local_test_discovery(session, monkeypatch)
         run_discovery(session)
         recovery = run_recovery(session, "dev-easee-wallbox")
         assert recovery.agent_run.status == "blocked"

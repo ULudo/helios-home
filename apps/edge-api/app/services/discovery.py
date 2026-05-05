@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from uuid import uuid4
 
 from sqlalchemy import select
@@ -26,7 +26,6 @@ from app.services.network_broadcast import discover_network_broadcast
 from app.services.discovery_blueprints import (
     RawCandidate,
     assess_connectors,
-    build_fixture_candidates,
     classify_candidate,
     diagnose_candidate,
 )
@@ -43,6 +42,13 @@ class SourceDiscoveryBatch:
     status: str
     message: str
     candidates: list[RawCandidate]
+
+
+@dataclass(slots=True)
+class DiscoveryBatchSelection:
+    attempted_batches: list[SourceDiscoveryBatch]
+    selected_batches: list[SourceDiscoveryBatch]
+    scope: dict[str, object]
 
 
 def _serialize_candidate(candidate: DeviceCandidate) -> DeviceCandidateRead:
@@ -91,6 +97,7 @@ def list_discovery_runs(session: Session) -> list[DiscoveryRunRead]:
                 for payload in (run.notes or {}).get("source_results", [])
                 if isinstance(payload, dict)
             ],
+            scope=(run.notes or {}).get("scope", {}),
             executed_at=run.finished_at or run.started_at,
             message=run.summary,
             new_device_ids=(run.notes or {}).get("new_device_ids", []),
@@ -121,35 +128,15 @@ def _batch_as_read(batch: SourceDiscoveryBatch) -> DiscoverySourceResultRead:
 
 
 MANAGED_SOURCE_NAMES = {
-    "fixture_registry",
     "local_network_live",
     "modbus_live",
     "mqtt_live",
     "network_broadcast_live",
     EEBUS_SOURCE_NAME,
+    # Pre-release fixture materialization is removed, but the source name stays
+    # managed so the next real discovery run prunes stale local records.
+    "fixture_registry",
 }
-
-
-def _build_fixture_batch(site: Site) -> SourceDiscoveryBatch:
-    candidates = [
-        replace(
-            candidate,
-            discovery_sources=sorted(
-                {
-                    "fixture_registry",
-                    *(candidate.discovery_sources or []),
-                }
-            ),
-        )
-        for candidate in build_fixture_candidates(site)
-    ]
-    message = "Fixture-backed discovery populated the current demo integration graph."
-    return SourceDiscoveryBatch(
-        source_name="fixture_registry",
-        status="completed",
-        message=message,
-        candidates=candidates,
-    )
 
 
 def _combine_batches(
@@ -194,22 +181,31 @@ def _combine_batches(
     )
 
 
-def _discover_batches(site: Site) -> tuple[list[SourceDiscoveryBatch], list[SourceDiscoveryBatch]]:
+def _skipped_batch(source_name: str, message: str) -> SourceDiscoveryBatch:
+    return SourceDiscoveryBatch(
+        source_name=source_name,
+        status="skipped",
+        message=message,
+        candidates=[],
+    )
+
+
+def _discover_batches(site: Site) -> DiscoveryBatchSelection:
     settings = get_settings()
     attempted_batches: list[SourceDiscoveryBatch] = []
     configured_subnets = parse_configured_subnets(site.local_subnet)
-    reachable_subnets = [option.cidr for option in list_reachable_subnets()]
+    reachable_options = list_reachable_subnets()
+    reachable_subnets = [option.cidr for option in reachable_options]
     scan_subnets = configured_subnets or reachable_subnets
     scope_kind = "configured" if configured_subnets else "reachable"
-    live_discovery_requested = (
-        settings.local_scan_enabled
-        or settings.broadcast_discovery_enabled
-        or settings.modbus_live_enabled
-        or (bool(site.mqtt_broker_url) and settings.mqtt_live_enabled)
-        or not settings.demo_mode
-    )
+    scope = {
+        "scope_kind": scope_kind,
+        "configured_subnets": configured_subnets,
+        "reachable_subnets": reachable_subnets,
+        "scan_subnets": scan_subnets,
+    }
 
-    if scan_subnets and settings.local_scan_enabled:
+    if scan_subnets:
         batches = [
             (
                 subnet,
@@ -225,23 +221,29 @@ def _discover_batches(site: Site) -> tuple[list[SourceDiscoveryBatch], list[Sour
         batch = _combine_batches(
             source_name="local_network_live",
             batches=batches,
-            success_message=f"Imported {{candidate_count}} energy-relevant local HTTP device candidates from {{scope_count}} {scope_kind} subnet scan(s).",
-            empty_message=f"Local network discovery completed across {{scope_count}} {scope_kind} subnet scan(s), but no energy-relevant HTTP interfaces were identified.",
+            success_message=f"completed: {{candidate_count}} local HTTP candidate(s) from {{scope_count}} {scope_kind} subnet scan(s).",
+            empty_message=f"completed: 0 local HTTP candidates from {{scope_count}} {scope_kind} subnet scan(s).",
         )
         attempted_batches.append(batch)
+    else:
+        attempted_batches.append(
+            _skipped_batch(
+                "local_network_live",
+                "skipped: no configured or reachable IPv4 subnet is available for local HTTP scanning.",
+            )
+        )
 
-    if settings.broadcast_discovery_enabled:
-        batch = discover_network_broadcast(
-            timeout_seconds=settings.broadcast_timeout_seconds,
-            max_service_types=settings.broadcast_max_service_types,
-        )
-        broadcast_batch = SourceDiscoveryBatch(
-            source_name=batch.source_name,
-            status=batch.status,
-            message=batch.message,
-            candidates=batch.candidates,
-        )
-        attempted_batches.append(broadcast_batch)
+    batch = discover_network_broadcast(
+        timeout_seconds=settings.broadcast_timeout_seconds,
+        max_service_types=settings.broadcast_max_service_types,
+    )
+    broadcast_batch = SourceDiscoveryBatch(
+        source_name=batch.source_name,
+        status=batch.status,
+        message=batch.message,
+        candidates=batch.candidates,
+    )
+    attempted_batches.append(broadcast_batch)
 
     if scan_subnets and settings.modbus_live_enabled:
         batches = [
@@ -259,12 +261,19 @@ def _discover_batches(site: Site) -> tuple[list[SourceDiscoveryBatch], list[Sour
         batch = _combine_batches(
             source_name="modbus_live",
             batches=batches,
-            success_message=f"Imported {{candidate_count}} candidates from native Modbus/TCP probing across {{scope_count}} {scope_kind} subnet scan(s).",
-            empty_message=f"Modbus discovery completed across {{scope_count}} {scope_kind} subnet scan(s), but no native Modbus/TCP devices exposed a usable identity or SunSpec signature.",
+            success_message=f"completed: {{candidate_count}} Modbus/TCP candidate(s) from {{scope_count}} {scope_kind} subnet scan(s).",
+            empty_message=f"completed: 0 Modbus/TCP candidates from {{scope_count}} {scope_kind} subnet scan(s).",
         )
         attempted_batches.append(batch)
+    elif settings.modbus_live_enabled:
+        attempted_batches.append(
+            _skipped_batch(
+                "modbus_live",
+                "skipped: no configured or reachable IPv4 subnet is available for Modbus/TCP probing.",
+            )
+        )
 
-    if site.mqtt_broker_url and settings.mqtt_live_enabled:
+    if site.mqtt_broker_url:
         batch = discover_mqtt_site(
             broker_url=site.mqtt_broker_url,
             connect_timeout_seconds=settings.mqtt_timeout_seconds,
@@ -278,38 +287,25 @@ def _discover_batches(site: Site) -> tuple[list[SourceDiscoveryBatch], list[Sour
         )
         attempted_batches.append(mqtt_batch)
 
-    if live_discovery_requested:
-        batch = discover_eebus_site(
-            interface_ip=settings.eebus_interface_ip or None,
-            timeout_seconds=settings.eebus_timeout_seconds,
-            tls_check=settings.eebus_tls_check_enabled,
-        )
-        eebus_batch = SourceDiscoveryBatch(
-            source_name=batch.source_name,
-            status=batch.status,
-            message=batch.message,
-            candidates=batch.candidates,
-        )
-        attempted_batches.append(eebus_batch)
-
-    if attempted_batches:
-        selected_batches = [batch for batch in attempted_batches if batch.candidates]
-        return attempted_batches, selected_batches
-
-    if settings.demo_mode:
-        fixture_batch = _build_fixture_batch(site)
-        return [fixture_batch], [fixture_batch]
-
-    failure_batch = SourceDiscoveryBatch(
-        source_name="discovery",
-        status="failed",
-        message=(
-            "No live discovery source is configured and demo mode is disabled. Configure local subnet scanning, "
-            "network broadcast discovery, native Modbus discovery, MQTT live discovery, or EEBus SHIP discovery."
-        ),
-        candidates=[],
+    batch = discover_eebus_site(
+        interface_ip=settings.eebus_interface_ip or None,
+        timeout_seconds=settings.eebus_timeout_seconds,
+        tls_check=settings.eebus_tls_check_enabled,
     )
-    return [failure_batch], []
+    eebus_batch = SourceDiscoveryBatch(
+        source_name=batch.source_name,
+        status=batch.status,
+        message=batch.message,
+        candidates=batch.candidates,
+    )
+    attempted_batches.append(eebus_batch)
+
+    selected_batches = [batch for batch in attempted_batches if batch.candidates]
+    return DiscoveryBatchSelection(
+        attempted_batches=attempted_batches,
+        selected_batches=selected_batches,
+        scope=scope,
+    )
 
 
 def _upsert_candidate(session: Session, site: Site, raw_candidate: RawCandidate, classification, now) -> None:
@@ -466,18 +462,32 @@ def _remove_materialization_for_sources(
             session.delete(device)
 
 
+def prune_legacy_fixture_inventory(session: Session) -> None:
+    _remove_materialization_for_sources(
+        session,
+        {"fixture_registry"},
+        keep_candidate_ids=set(),
+        keep_device_ids=set(),
+        keep_asset_ids=set(),
+    )
+    session.commit()
+
+
 def _build_discovery_status(batches: list[SourceDiscoveryBatch], candidate_count: int) -> str:
-    if any(batch.status == "failed" for batch in batches) and candidate_count == 0:
+    runnable_batches = [batch for batch in batches if batch.status != "skipped"]
+    if not runnable_batches:
+        return DiscoveryRunStatus.FAILED.value
+    if any(batch.status == "failed" for batch in runnable_batches) and candidate_count == 0:
         return DiscoveryRunStatus.FAILED.value
     return DiscoveryRunStatus.COMPLETED.value
 
 
 def _build_discovery_message(batches: list[SourceDiscoveryBatch], candidate_count: int) -> str:
-    if len(batches) == 1:
-        return batches[0].message
     if candidate_count == 0:
-        return "Discovery completed without materializing any device candidates."
-    return f"Discovery reconciled {candidate_count} candidates across {len(batches)} sources."
+        if any(batch.status == "failed" for batch in batches):
+            return "Discovery found no device candidates; at least one source failed."
+        return "Discovery completed; no device candidates were found."
+    return f"Discovery completed; {candidate_count} device candidate(s) were materialized."
 
 
 def run_discovery(session: Session) -> DiscoveryRunRead:
@@ -486,7 +496,9 @@ def run_discovery(session: Session) -> DiscoveryRunRead:
     if site is None:
         raise RuntimeError("Site has not been seeded.")
 
-    attempted_batches, selected_batches = _discover_batches(site)
+    batch_selection = _discover_batches(site)
+    attempted_batches = batch_selection.attempted_batches
+    selected_batches = batch_selection.selected_batches
     source_names = [batch.source_name for batch in selected_batches] or [batch.source_name for batch in attempted_batches]
 
     discovery_run = DiscoveryRun(
@@ -541,6 +553,7 @@ def run_discovery(session: Session) -> DiscoveryRunRead:
         "sources": source_names,
         "new_device_ids": new_device_ids,
         "source_results": [_batch_as_note(batch) for batch in attempted_batches],
+        "scope": batch_selection.scope,
     }
     discovery_run.finished_at = now
 
@@ -556,6 +569,7 @@ def run_discovery(session: Session) -> DiscoveryRunRead:
                 "new_device_ids": new_device_ids,
                 "source_names": source_names,
                 "source_results": [_batch_as_note(batch) for batch in attempted_batches],
+                "scope": batch_selection.scope,
             },
             created_at=now,
         )
@@ -567,6 +581,7 @@ def run_discovery(session: Session) -> DiscoveryRunRead:
         status=discovery_run.status,
         source_names=source_names,
         source_results=[_batch_as_read(batch) for batch in attempted_batches],
+        scope=batch_selection.scope,
         executed_at=now,
         message=discovery_message,
         new_device_ids=new_device_ids,

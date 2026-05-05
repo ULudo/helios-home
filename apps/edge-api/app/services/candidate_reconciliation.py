@@ -13,7 +13,6 @@ SOURCE_PRIORITY = {
     "eebus_ship_live": 2,
     "network_broadcast_live": 3,
     "mqtt_live": 4,
-    "fixture_registry": 5,
 }
 GENERIC_LABELS = {
     "",

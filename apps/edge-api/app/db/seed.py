@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from app.db.models import AuditEvent, HemsPolicy, Site, utcnow
 
 
-def seed_demo_data(session: Session) -> None:
+def seed_default_site(session: Session) -> None:
     site_exists = session.scalar(select(Site.id).limit(1))
     if site_exists:
         return

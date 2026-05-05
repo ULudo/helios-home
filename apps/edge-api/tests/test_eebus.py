@@ -115,8 +115,17 @@ def test_load_power_payload_maps_lpc_and_lpp_limit_ids():
 
 def test_eebus_discovery_source_participates_in_discovery_pipeline(tmp_path, monkeypatch):
     app = _bootstrap_app(tmp_path, monkeypatch, "eebus-discovery.db")
-    monkeypatch.setenv("HELIOS_DEMO_MODE", "false")
     get_settings.cache_clear()
+    monkeypatch.setattr("app.services.discovery.list_reachable_subnets", lambda: [])
+    monkeypatch.setattr(
+        "app.services.discovery.discover_network_broadcast",
+        lambda timeout_seconds, max_service_types: SimpleNamespace(
+            source_name="network_broadcast_live",
+            status="completed",
+            message="Network broadcast discovery completed, but no energy-relevant advertisements were identified.",
+            candidates=[],
+        ),
+    )
 
     def discover_ship_services(interface_ip, *, timeout, tls_check):
         return [_fake_ship_service()]

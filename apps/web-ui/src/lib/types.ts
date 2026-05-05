@@ -49,6 +49,7 @@ export interface DiscoveryRunRead {
   status?: string;
   source_names: string[];
   source_results: DiscoverySourceResultRead[];
+  scope?: Record<string, unknown>;
   executed_at: string;
   message: string;
   new_device_ids: string[];

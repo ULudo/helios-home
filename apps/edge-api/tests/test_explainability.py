@@ -1,9 +1,10 @@
 from app.core.config import get_settings
-from app.db.seed import seed_demo_data
+from app.db.seed import seed_default_site
 from app.db.session import get_engine, get_session_factory, init_database
 from app.domain.schemas import DebugExplainRequest
 from app.services.discovery import run_discovery
 from app.services.explainability import explain_manual_claim, get_candidate_debug_report, get_device_debug_report
+from discovery_catalog import install_catalog_discovery
 
 
 def _build_session(tmp_path, monkeypatch):
@@ -13,13 +14,14 @@ def _build_session(tmp_path, monkeypatch):
     init_database()
     session_factory = get_session_factory()
     session = session_factory()
-    seed_demo_data(session)
+    seed_default_site(session)
     return session
 
 
 def test_device_debug_report_marks_integrated_native_device(tmp_path, monkeypatch):
     session = _build_session(tmp_path, monkeypatch)
     try:
+        install_catalog_discovery(session, monkeypatch)
         run_discovery(session)
         report = get_device_debug_report(session, "dev-fronius-gen24")
         assert report is not None
@@ -34,6 +36,7 @@ def test_device_debug_report_marks_integrated_native_device(tmp_path, monkeypatc
 def test_device_debug_report_marks_auth_blocked_device(tmp_path, monkeypatch):
     session = _build_session(tmp_path, monkeypatch)
     try:
+        install_catalog_discovery(session, monkeypatch)
         run_discovery(session)
         report = get_device_debug_report(session, "dev-easee-wallbox")
         assert report is not None
@@ -49,6 +52,7 @@ def test_device_debug_report_marks_auth_blocked_device(tmp_path, monkeypatch):
 def test_candidate_debug_report_keeps_candidate_context(tmp_path, monkeypatch):
     session = _build_session(tmp_path, monkeypatch)
     try:
+        install_catalog_discovery(session, monkeypatch)
         run_discovery(session)
         report = get_candidate_debug_report(session, "cand-vaillant-heatpump")
         assert report is not None
@@ -63,6 +67,7 @@ def test_candidate_debug_report_keeps_candidate_context(tmp_path, monkeypatch):
 def test_manual_claim_matches_existing_device_when_model_aligns(tmp_path, monkeypatch):
     session = _build_session(tmp_path, monkeypatch)
     try:
+        install_catalog_discovery(session, monkeypatch)
         run_discovery(session)
         report = explain_manual_claim(
             session,
@@ -84,6 +89,7 @@ def test_manual_claim_matches_existing_device_when_model_aligns(tmp_path, monkey
 def test_manual_claim_for_legacy_heat_pump_returns_retrofit_path(tmp_path, monkeypatch):
     session = _build_session(tmp_path, monkeypatch)
     try:
+        install_catalog_discovery(session, monkeypatch)
         run_discovery(session)
         report = explain_manual_claim(
             session,

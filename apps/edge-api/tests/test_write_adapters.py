@@ -6,7 +6,7 @@ import httpx
 
 from app.core.config import get_settings
 from app.db.models import Asset, Device, DeviceCandidate
-from app.db.seed import seed_demo_data
+from app.db.seed import seed_default_site
 from app.db.session import get_engine, get_session_factory, init_database
 from app.domain.enums import HemsExecutionMode
 from app.hems.dispatcher import dispatch_current_interval
@@ -20,7 +20,7 @@ def _build_session(tmp_path, monkeypatch, name="write-adapter.db"):
     init_database()
     session_factory = get_session_factory()
     session = session_factory()
-    seed_demo_data(session)
+    seed_default_site(session)
     return session
 
 

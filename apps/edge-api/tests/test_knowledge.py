@@ -1,5 +1,5 @@
 from app.core.config import get_settings
-from app.db.seed import seed_demo_data
+from app.db.seed import seed_default_site
 from app.db.session import get_engine, get_session_factory, init_database
 from app.domain.schemas import DebugExplainRequest, KnowledgePackWrite, ResearchFindingCreate
 from app.services.discovery import run_discovery
@@ -13,6 +13,7 @@ from app.services.knowledge import (
     list_knowledge_entries,
     promote_debug_case_to_knowledge,
 )
+from discovery_catalog import install_empty_standard_discovery
 
 
 def _build_session(tmp_path, monkeypatch, name="test.db"):
@@ -22,7 +23,7 @@ def _build_session(tmp_path, monkeypatch, name="test.db"):
     init_database()
     session_factory = get_session_factory()
     session = session_factory()
-    seed_demo_data(session)
+    seed_default_site(session)
     return session
 
 
@@ -38,6 +39,7 @@ def _legacy_heat_pump_claim() -> DebugExplainRequest:
 def test_debug_case_can_be_promoted_into_local_knowledge(tmp_path, monkeypatch):
     session = _build_session(tmp_path, monkeypatch)
     try:
+        install_empty_standard_discovery(monkeypatch)
         run_discovery(session)
         debug_case = create_debug_case(session, _legacy_heat_pump_claim())
         assert debug_case.status == "open"
@@ -76,6 +78,7 @@ def test_debug_case_can_be_promoted_into_local_knowledge(tmp_path, monkeypatch):
 def test_knowledge_pack_can_be_exported_and_imported(tmp_path, monkeypatch):
     source_session = _build_session(tmp_path, monkeypatch, name="source.db")
     try:
+        install_empty_standard_discovery(monkeypatch)
         run_discovery(source_session)
         debug_case = create_debug_case(source_session, _legacy_heat_pump_claim())
         promote_debug_case_to_knowledge(source_session, debug_case.id)

@@ -69,6 +69,9 @@ class DiscoveryInspectHomeNetworkTool:
             output={
                 "task_ref": task.id,
                 "run_ref": result["run"].get("id"),
+                "result": result["result"],
+                "scope": result["scope"],
+                "source_results": result["source_results"],
                 "candidate_count": result["candidate_count"],
                 "integrated_devices": result["integrated_devices"],
                 "new_device_ids": result["new_device_ids"],

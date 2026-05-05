@@ -5,8 +5,9 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes import router as api_router
 from app.core.config import get_settings
-from app.db.seed import seed_demo_data
+from app.db.seed import seed_default_site
 from app.db.session import get_session_factory, init_database
+from app.services.discovery import prune_legacy_fixture_inventory
 
 
 def create_app() -> FastAPI:
@@ -17,7 +18,8 @@ def create_app() -> FastAPI:
         init_database()
         session_factory = get_session_factory()
         with session_factory() as session:
-            seed_demo_data(session)
+            seed_default_site(session)
+            prune_legacy_fixture_inventory(session)
         yield
 
     application = FastAPI(
@@ -46,7 +48,7 @@ def create_app() -> FastAPI:
     def health() -> dict[str, str | bool]:
         return {
             "status": "ok",
-            "mode": "demo" if settings.demo_mode else "standard",
+            "mode": "standard",
             "database_ready": True,
         }
 
