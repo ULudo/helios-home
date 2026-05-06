@@ -383,7 +383,6 @@ def _context_snapshot(
                     key: value
                     for key, value in list(device.telemetry.items())[:6]
                 },
-                "next_step": device.next_step,
             }
             for device in overview.devices
         ],

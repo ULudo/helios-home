@@ -102,7 +102,6 @@ def _serialize_knowledge_entry(entry: KnowledgeEntry) -> KnowledgeEntryRead:
         confidence=entry.confidence,
         summary=entry.summary,
         evidence=entry.evidence or [],
-        next_actions=entry.next_actions or [],
         retrofit_options=entry.retrofit_options or [],
         raw_diagnostics=entry.raw_diagnostics or {},
     )
@@ -118,7 +117,6 @@ def _serialize_knowledge_entry(entry: KnowledgeEntry) -> KnowledgeEntryRead:
         feasibility=entry.feasibility,
         confidence=entry.confidence,
         summary=entry.summary,
-        next_actions=diagnosis.next_actions,
         retrofit_options=diagnosis.retrofit_options,
         evidence=diagnosis.evidence,
         raw_diagnostics=diagnosis.raw_diagnostics,
@@ -298,7 +296,6 @@ def promote_debug_case_to_knowledge(session: Session, case_id: int) -> Knowledge
     entry.feasibility = diagnosis.feasibility
     entry.confidence = diagnosis.confidence
     entry.summary = diagnosis.summary
-    entry.next_actions = diagnosis.next_actions
     entry.retrofit_options = [option.model_dump() if hasattr(option, "model_dump") else option for option in diagnosis.retrofit_options]
     entry.evidence = [item.model_dump() if hasattr(item, "model_dump") else item for item in evidence]
     entry.raw_diagnostics = diagnosis.raw_diagnostics
@@ -357,7 +354,6 @@ def import_knowledge_pack(session: Session, payload: KnowledgePackWrite) -> Know
         entry.feasibility = item.feasibility
         entry.confidence = item.confidence
         entry.summary = item.summary
-        entry.next_actions = item.next_actions
         entry.retrofit_options = [option.model_dump() for option in item.retrofit_options]
         entry.evidence = [item_evidence.model_dump() for item_evidence in item.evidence]
         entry.raw_diagnostics = item.raw_diagnostics

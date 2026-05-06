@@ -44,7 +44,6 @@ def test_device_debug_report_marks_auth_blocked_device(tmp_path, monkeypatch):
         assert report.diagnosis.reason_family == "auth"
         assert report.diagnosis.reason_code == "auth_required"
         assert report.diagnosis.feasibility == "network_native_but_auth_blocked"
-        assert any("pairing" in action.lower() or "oauth" in action.lower() for action in report.diagnosis.next_actions)
     finally:
         session.close()
 

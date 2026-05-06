@@ -32,8 +32,6 @@ export interface DeviceRead {
   protocols: string[];
   capabilities: CapabilityRead;
   telemetry: Record<string, string | number | boolean>;
-  explanation: string;
-  next_step: string;
   last_seen_at: string;
 }
 
@@ -323,7 +321,6 @@ export interface DebugDiagnosisRead {
   confidence: number;
   summary: string;
   evidence: DebugEvidenceRead[];
-  next_actions: string[];
   retrofit_options: RetrofitOptionRead[];
   raw_diagnostics: Record<string, unknown>;
 }

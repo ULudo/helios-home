@@ -24,8 +24,6 @@ def _local_candidate() -> RawCandidate:
         },
         recovery_zone="auto_apply",
         issue_code=None,
-        explanation_hint="Local HTTP telemetry is available.",
-        next_step_hint="Keep the device monitorable through the local API.",
         capabilities_hint={
             "visible": True,
             "monitorable": True,
@@ -56,8 +54,6 @@ def _modbus_candidate() -> RawCandidate:
         },
         recovery_zone="auto_apply",
         issue_code=None,
-        explanation_hint="Native SunSpec telemetry is available.",
-        next_step_hint="Keep the device monitorable through Modbus TCP.",
         capabilities_hint={
             "visible": True,
             "monitorable": True,
@@ -89,8 +85,6 @@ def _mqtt_candidate() -> RawCandidate:
         },
         recovery_zone="auto_apply",
         issue_code=None,
-        explanation_hint="MQTT telemetry is available.",
-        next_step_hint="Keep the device monitorable through MQTT.",
         capabilities_hint={
             "visible": True,
             "monitorable": True,
@@ -121,8 +115,6 @@ def _broadcast_evcc_ipv4_candidate() -> RawCandidate:
         },
         recovery_zone="auto_apply",
         issue_code=None,
-        explanation_hint="Broadcast evidence indicates an EV charging integration endpoint.",
-        next_step_hint="Probe the local HTTP path for a telemetry adapter.",
         capabilities_hint={
             "visible": True,
             "monitorable": False,
@@ -157,8 +149,6 @@ def _broadcast_evcc_ipv6_candidate() -> RawCandidate:
         },
         recovery_zone="auto_apply",
         issue_code=None,
-        explanation_hint="Broadcast evidence indicates an EV charging integration endpoint.",
-        next_step_hint="Probe the local HTTP path for a telemetry adapter.",
         capabilities_hint={
             "visible": True,
             "monitorable": False,
@@ -189,8 +179,6 @@ def _eebus_evcc_candidate() -> RawCandidate:
         },
         recovery_zone="human_gated",
         issue_code=None,
-        explanation_hint="Helios discovered an EEBus SHIP peer.",
-        next_step_hint="Pair a trusted EEBus identity.",
         capabilities_hint={
             "visible": True,
             "monitorable": False,

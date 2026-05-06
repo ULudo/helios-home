@@ -4,7 +4,7 @@ from uuid import uuid4
 
 from sqlalchemy.orm import Session
 
-from app.db.models import AgentRun, Asset, AuditEvent, ConnectorAttempt, Device, Incident, Recommendation, utcnow
+from app.db.models import AgentRun, Asset, AuditEvent, ConnectorAttempt, Device, utcnow
 from app.domain.enums import AgentRunStatus, ConnectorOutcome, IntegrationStatus, RecoveryZone
 from app.domain.schemas import AgentRunRead, RecoveryRunRead
 from app.services.dashboard import get_device
@@ -76,12 +76,6 @@ def run_recovery(session: Session, device_id: str) -> RecoveryRunRead:
             "controllable": True,
             "optimizable": restored_status == IntegrationStatus.OPTIMIZABLE.value,
         }
-        device.problem_summary = ""
-        device.explanation = (
-            "Guarded recovery validated an updated connector mapping and restored the safe "
-            "write path without leaving the policy envelope."
-        )
-        device.next_step = "Observe charge and discharge telemetry for the next 24 hours."
         device.confidence = 0.93
         agent_run.status = AgentRunStatus.COMPLETED.value
         agent_run.summary = f"Applied a guarded {_protocol_label(device)} connector patch and revalidated the safe write path."
@@ -99,19 +93,6 @@ def run_recovery(session: Session, device_id: str) -> RecoveryRunRead:
                 outcome=ConnectorOutcome.SUCCESS.value,
                 detail="A guarded connector patch restored the validated write path and passed safety validation.",
                 attempted_at=now,
-            )
-        )
-        session.add(
-            Recommendation(
-                site_id=device.site_id,
-                device_id=device.id,
-                title="Observe battery post-recovery",
-                description="The write path is restored. Monitor telemetry drift and command acknowledgement for 24 hours.",
-                priority="medium",
-                action_type="observation",
-                zone=RecoveryZone.HUMAN_GATED.value,
-                auto_applicable=False,
-                created_at=now,
             )
         )
         _resolve_open_incidents(device)
@@ -132,11 +113,6 @@ def run_recovery(session: Session, device_id: str) -> RecoveryRunRead:
             IntegrationStatus.PARTIALLY_INTEGRABLE.value,
             IntegrationStatus.IN_ANALYSIS.value,
         ]
-        device.explanation = (
-            "A template-based adapter proposal was generated, but Helios keeps the device "
-            "in monitor-only mode until the write path passes manual policy review."
-        )
-        device.next_step = "Review the generated adapter proposal before enabling control."
         agent_run.status = AgentRunStatus.PROPOSAL_READY.value
         agent_run.summary = "Prepared a monitor-first adapter scaffold and blocked activation pending review."
         agent_run.action_plan = [
@@ -174,19 +150,6 @@ def run_recovery(session: Session, device_id: str) -> RecoveryRunRead:
         ]
         agent_run.rollback_ready = False
         agent_run.finished_at = now
-        session.add(
-            Recommendation(
-                site_id=device.site_id,
-                device_id=device.id,
-                title="Complete the blocked pairing step",
-                description="Autonomous recovery is paused until the required vendor authentication has been approved.",
-                priority="high",
-                action_type="user_action",
-                zone=RecoveryZone.HUMAN_GATED.value,
-                auto_applicable=False,
-                created_at=now,
-            )
-        )
         message = "Recovery is blocked until the required human-gated pairing step is completed."
     else:
         agent_run.status = AgentRunStatus.COMPLETED.value

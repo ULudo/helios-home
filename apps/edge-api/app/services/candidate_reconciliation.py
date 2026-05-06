@@ -197,9 +197,6 @@ def _merge_cluster(candidates: list[RawCandidate]) -> RawCandidate:
     }
     merged_sources = sorted({source for candidate in candidates for source in (candidate.discovery_sources or [])})
     merged_protocols = sorted({protocol for candidate in candidates for protocol in (candidate.protocols or [])})
-    explanation_source_names = ", ".join(source.replace("_", " ") for source in merged_sources)
-    merged_explanation = f"{primary.explanation_hint} Reconciled evidence across {explanation_source_names}."
-
     return replace(
         primary,
         display_name=_pick_display_name(candidates, primary.display_name),
@@ -211,12 +208,6 @@ def _merge_cluster(candidates: list[RawCandidate]) -> RawCandidate:
         evidence=_merge_evidence(candidates),
         recovery_zone=_pick_recovery_zone(candidates, primary.recovery_zone),
         issue_code=_pick_issue_code(candidates, any_monitorable),
-        explanation_hint=merged_explanation,
-        next_step_hint=(
-            primary.next_step_hint
-            if any_monitorable
-            else "No validated telemetry path is stable yet; review the merged evidence and add the strongest local adapter."
-        ),
         capabilities_hint=merged_capabilities,
     )
 

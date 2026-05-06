@@ -91,6 +91,11 @@ class HomeGraphResolveEntityReferenceInput(BaseModel):
     max_results: int = Field(default=5, ge=1, le=12)
 
 
+class HomeGraphGetEntityDetailsInput(BaseModel):
+    entity_ref: str
+    include_evidence: bool = True
+
+
 class EvidenceRecordUserAssertionInput(BaseModel):
     subject_ref: str
     assertion_type: Literal["identity", "role_hint", "location", "alias", "correction"]
@@ -115,6 +120,8 @@ class DeviceAssessInput(BaseModel):
 class RolePrepareBindingProposalInput(BaseModel):
     entity_ref: str
     role: HemsRole
+    endpoint_ref: str = ""
+    integration_path: str = ""
     label: str = ""
     rationale: str = ""
 

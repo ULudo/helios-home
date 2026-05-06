@@ -15,7 +15,6 @@ from app.db.models import (
     DeviceCandidate,
     DiscoveryRun,
     Incident,
-    Recommendation,
     Site,
     utcnow,
 )
@@ -332,7 +331,6 @@ def _upsert_candidate(session: Session, site: Site, raw_candidate: RawCandidate,
 def _clear_related_records(session: Session, device_id: str) -> None:
     session.query(ConnectorAttempt).filter(ConnectorAttempt.device_id == device_id).delete(synchronize_session=False)
     session.query(Incident).filter(Incident.device_id == device_id).delete(synchronize_session=False)
-    session.query(Recommendation).filter(Recommendation.device_id == device_id).delete(synchronize_session=False)
 
 
 def _upsert_device(session: Session, site: Site, raw_candidate: RawCandidate, diagnosis, classification, now) -> None:
@@ -353,9 +351,6 @@ def _upsert_device(session: Session, site: Site, raw_candidate: RawCandidate, di
     device.protocols = raw_candidate.protocols
     device.capabilities = diagnosis.capabilities
     device.telemetry = raw_candidate.telemetry
-    device.problem_summary = diagnosis.problem_summary
-    device.explanation = diagnosis.explanation
-    device.next_step = diagnosis.next_step
     device.last_seen_at = now
 
     _clear_related_records(session, device.id)
@@ -369,36 +364,6 @@ def _upsert_device(session: Session, site: Site, raw_candidate: RawCandidate, di
                 outcome=assessment.outcome,
                 detail=assessment.detail,
                 attempted_at=now,
-            )
-        )
-
-    if diagnosis.incident_title and diagnosis.incident_summary and diagnosis.incident_severity:
-        session.add(
-            Incident(
-                site_id=site.id,
-                device_id=device.id,
-                severity=diagnosis.incident_severity,
-                title=diagnosis.incident_title,
-                summary=diagnosis.incident_summary,
-                status="open",
-                confidence=classification.confidence,
-                created_at=now,
-                updated_at=now,
-            )
-        )
-
-    for recommendation in diagnosis.recommendations:
-        session.add(
-            Recommendation(
-                site_id=site.id,
-                device_id=device.id,
-                title=recommendation["title"],
-                description=recommendation["description"],
-                priority=recommendation["priority"],
-                action_type=recommendation["action_type"],
-                zone=recommendation["zone"],
-                auto_applicable=recommendation["auto_applicable"],
-                created_at=now,
             )
         )
 

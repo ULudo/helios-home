@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
+from typing import Any
+from urllib.parse import urlparse
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from sqlalchemy import select
@@ -69,11 +72,14 @@ def _upsert_endpoint(
     owner_ref: str,
     protocol: str,
     service_name: str = "",
-    address: str = "",
+    host: str = "",
     port: int | None = None,
+    source: str = "",
+    last_seen_at: datetime | None = None,
+    confidence: float | None = None,
     properties: dict | None = None,
 ) -> ProtocolEndpoint:
-    endpoint_id = _stable_ref("endpoint", f"{owner_ref}:{protocol}:{service_name}:{address}:{port or ''}")
+    endpoint_id = _stable_ref("endpoint", f"{owner_ref}:{protocol}:{service_name}:{host}:{port or ''}")
     endpoint = session.get(ProtocolEndpoint, endpoint_id)
     if endpoint is None:
         endpoint = ProtocolEndpoint(id=endpoint_id, site_id=site_id, created_at=utcnow())
@@ -81,12 +87,212 @@ def _upsert_endpoint(
     endpoint.owner_ref = owner_ref
     endpoint.protocol = protocol
     endpoint.service_name = service_name
-    endpoint.address = address
+    endpoint.host = host
     endpoint.port = port
     endpoint.status = "observed"
-    endpoint.properties = properties or {}
+    clean_properties = dict(properties or {})
+    if source:
+        clean_properties["source"] = source
+    if last_seen_at is not None:
+        clean_properties["last_seen_at"] = last_seen_at.isoformat()
+    if confidence is not None:
+        clean_properties["confidence"] = confidence
+    if host:
+        clean_properties["host"] = host
+    endpoint.properties = clean_properties
     endpoint.updated_at = utcnow()
     return endpoint
+
+
+def _first_string(*values: Any) -> str:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _first_int(*values: Any) -> int | None:
+    for value in values:
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+    return None
+
+
+def _http_host_from_payload(evidence: dict, telemetry: dict) -> str:
+    host = _first_string(evidence.get("http_host"), evidence.get("host"), telemetry.get("http_host"))
+    if host:
+        return host
+    base_url = _first_string(evidence.get("http_base_url"), telemetry.get("http_base_url"))
+    if base_url:
+        return urlparse(base_url).hostname or ""
+    return ""
+
+
+def _http_port_from_payload(evidence: dict, telemetry: dict) -> int | None:
+    explicit = _first_int(evidence.get("http_port"), telemetry.get("http_port"))
+    if explicit is not None:
+        return explicit
+    base_url = _first_string(evidence.get("http_base_url"), telemetry.get("http_base_url"))
+    if not base_url:
+        return None
+    parsed = urlparse(base_url)
+    if parsed.port is not None:
+        return parsed.port
+    if parsed.scheme == "https":
+        return 443
+    if parsed.scheme == "http":
+        return 80
+    return None
+
+
+def _ship_payload(evidence: dict) -> dict:
+    payload = evidence.get("ship_service")
+    return payload if isinstance(payload, dict) else {}
+
+
+def _ship_host(payload: dict, evidence: dict) -> str:
+    addresses = payload.get("addresses") if isinstance(payload.get("addresses"), dict) else {}
+    ipv4_addresses = [str(value) for value in addresses.get("ipv4", [])] if isinstance(addresses, dict) else []
+    return _first_string(*(ipv4_addresses[:1]), payload.get("target"), evidence.get("host"))
+
+
+def _mqtt_properties(evidence: dict) -> dict:
+    properties: dict[str, Any] = {}
+    topics = evidence.get("mqtt_topics")
+    if isinstance(topics, list):
+        properties["topics"] = [str(topic) for topic in topics[:12]]
+    slug = evidence.get("mqtt_device_slug")
+    if slug:
+        properties["device_slug"] = str(slug)
+    return properties
+
+
+def _broadcast_endpoint_specs(protocol: str, evidence: dict) -> list[dict]:
+    announcements = evidence.get("broadcast_announcements")
+    if not isinstance(announcements, list):
+        return []
+    specs: list[dict] = []
+    for announcement in announcements:
+        if not isinstance(announcement, dict) or announcement.get("protocol") != protocol:
+            continue
+        specs.append(
+            {
+                "protocol": protocol,
+                "host": _first_string(announcement.get("host")),
+                "port": None,
+                "service_name": _first_string(announcement.get("service_name")),
+                "properties": {
+                    "service_type": _first_string(announcement.get("service_type")),
+                    "server": _first_string(announcement.get("server")),
+                    "location": _first_string(announcement.get("location")),
+                    "txt": announcement.get("txt") if isinstance(announcement.get("txt"), list) else [],
+                },
+            }
+        )
+    return specs
+
+
+def _source_for_protocol(protocol: str, discovery_sources: list[str]) -> str:
+    preferred_sources = {
+        "http_local": "local_network_live",
+        "modbus_tcp": "modbus_live",
+        "mqtt": "mqtt_live",
+        "eebus_ship": "eebus_ship_live",
+        "mdns": "network_broadcast_live",
+        "ssdp": "network_broadcast_live",
+        "vendor_cloud": "local_network_live",
+    }
+    preferred = preferred_sources.get(protocol)
+    if preferred and preferred in discovery_sources:
+        return preferred
+    return discovery_sources[0] if discovery_sources else "inventory"
+
+
+def _endpoint_specs(
+    *,
+    protocols: list[str],
+    evidence: dict,
+    telemetry: dict,
+    discovery_sources: list[str],
+    last_seen_at: datetime,
+    confidence: float,
+) -> list[dict]:
+    specs: list[dict] = []
+    for protocol in protocols:
+        protocol = str(protocol)
+        if protocol == "http_local":
+            specs.append(
+                {
+                    "protocol": protocol,
+                    "host": _http_host_from_payload(evidence, telemetry),
+                    "port": _http_port_from_payload(evidence, telemetry),
+                    "service_name": _first_string(evidence.get("service_name"), evidence.get("fingerprint_profile"), "local_http"),
+                    "properties": {
+                        "base_url": _first_string(evidence.get("http_base_url")),
+                        "paths": evidence.get("http_paths") if isinstance(evidence.get("http_paths"), list) else [],
+                        "server": _first_string(evidence.get("http_server")),
+                    },
+                }
+            )
+        elif protocol == "modbus_tcp":
+            specs.append(
+                {
+                    "protocol": protocol,
+                    "host": _first_string(evidence.get("modbus_host"), evidence.get("host")),
+                    "port": _first_int(evidence.get("modbus_port")) or 502,
+                    "service_name": "modbus_tcp",
+                    "properties": {
+                        "unit_id": evidence.get("modbus_unit_id"),
+                        "sunspec_model_ids": evidence.get("sunspec_model_ids") if isinstance(evidence.get("sunspec_model_ids"), list) else [],
+                        "dispatch_profile": _first_string(evidence.get("dispatch_profile")),
+                    },
+                }
+            )
+        elif protocol == "eebus_ship":
+            ship = _ship_payload(evidence)
+            specs.append(
+                {
+                    "protocol": protocol,
+                    "host": _ship_host(ship, evidence),
+                    "port": _first_int(ship.get("port"), telemetry.get("ship_port")),
+                    "service_name": _first_string(ship.get("service_name"), "eebus_ship"),
+                    "properties": {
+                        "path": _first_string(ship.get("path")),
+                        "ship_id": _first_string(ship.get("ship_id")),
+                        "ski": _first_string(ship.get("ski")),
+                        "supported_use_cases": evidence.get("supported_use_cases") if isinstance(evidence.get("supported_use_cases"), list) else [],
+                        "tls_probe": ship.get("tls_probe"),
+                    },
+                }
+            )
+        elif protocol == "mqtt":
+            specs.append(
+                {
+                    "protocol": protocol,
+                    "host": _first_string(evidence.get("mqtt_host")),
+                    "port": _first_int(evidence.get("mqtt_port")),
+                    "service_name": _first_string(evidence.get("mqtt_device_slug"), "mqtt"),
+                    "properties": _mqtt_properties(evidence),
+                }
+            )
+        elif protocol in {"mdns", "ssdp"}:
+            broadcast_specs = _broadcast_endpoint_specs(protocol, evidence)
+            specs.extend(broadcast_specs or [{"protocol": protocol, "host": _first_string(evidence.get("host")), "port": None, "service_name": protocol, "properties": {}}])
+        else:
+            specs.append({"protocol": protocol, "host": _first_string(evidence.get("host")), "port": None, "service_name": protocol, "properties": {}})
+
+    identity_keys = evidence.get("identity_keys") if isinstance(evidence.get("identity_keys"), list) else []
+    for spec in specs:
+        properties = dict(spec.get("properties") or {})
+        if identity_keys:
+            properties["identity_keys"] = [str(key) for key in identity_keys]
+        spec["properties"] = properties
+        spec["source"] = _source_for_protocol(str(spec.get("protocol") or ""), discovery_sources)
+        spec["last_seen_at"] = last_seen_at
+        spec["confidence"] = confidence
+    return specs
 
 
 def _record_evidence(
@@ -124,6 +330,8 @@ def sync_inventory_to_home_graph(session: Session, site_id: int | None = None) -
 
     refs: list[str] = []
     candidates = session.scalars(select(DeviceCandidate).where(DeviceCandidate.site_id == site.id)).all()
+    candidate_by_device_id = {candidate.matched_device_id: candidate for candidate in candidates if candidate.matched_device_id}
+    session.query(ProtocolEndpoint).filter(ProtocolEndpoint.site_id == site.id).delete(synchronize_session=False)
     for candidate in candidates:
         ref = entity_ref("candidate", candidate.id)
         refs.append(ref)
@@ -149,15 +357,26 @@ def sync_inventory_to_home_graph(session: Session, site_id: int | None = None) -
                 "evidence": candidate.evidence or {},
             },
         )
-        for protocol in candidate.protocols or []:
+        for spec in _endpoint_specs(
+            protocols=[str(protocol) for protocol in candidate.protocols or []],
+            evidence=candidate.evidence or {},
+            telemetry={},
+            discovery_sources=[str(source) for source in candidate.discovery_sources or []],
+            last_seen_at=candidate.last_seen_at,
+            confidence=candidate.classification_confidence,
+        ):
             _upsert_endpoint(
                 session,
                 site_id=site.id,
                 owner_ref=ref,
-                protocol=str(protocol),
-                service_name=str((candidate.evidence or {}).get("service_name", "")),
-                address=str((candidate.evidence or {}).get("host", "")),
-                properties={"source": "candidate"},
+                protocol=str(spec["protocol"]),
+                service_name=str(spec.get("service_name") or ""),
+                host=str(spec.get("host") or ""),
+                port=spec.get("port") if isinstance(spec.get("port"), int) else None,
+                source=str(spec.get("source") or "candidate"),
+                last_seen_at=spec.get("last_seen_at") if isinstance(spec.get("last_seen_at"), datetime) else None,
+                confidence=float(spec.get("confidence") or 0.0),
+                properties=spec.get("properties") if isinstance(spec.get("properties"), dict) else {},
             )
 
     devices = session.scalars(select(Device).where(Device.site_id == site.id)).all()
@@ -181,34 +400,37 @@ def sync_inventory_to_home_graph(session: Session, site_id: int | None = None) -
                 "protocols": device.protocols or [],
                 "capabilities": device.capabilities or {},
                 "telemetry": device.telemetry or {},
-                "explanation": device.explanation,
-                "next_step": device.next_step,
                 "confidence": device.confidence,
             },
         )
-        for protocol in device.protocols or []:
+        candidate = candidate_by_device_id.get(device.id)
+        candidate_evidence = candidate.evidence if candidate is not None else {}
+        candidate_sources = candidate.discovery_sources if candidate is not None else []
+        confidence = candidate.classification_confidence if candidate is not None else device.confidence
+        for spec in _endpoint_specs(
+            protocols=[str(protocol) for protocol in device.protocols or []],
+            evidence=candidate_evidence or {},
+            telemetry=device.telemetry or {},
+            discovery_sources=[str(source) for source in candidate_sources or []],
+            last_seen_at=device.last_seen_at,
+            confidence=float(confidence or 0.0),
+        ):
             _upsert_endpoint(
                 session,
                 site_id=site.id,
                 owner_ref=ref,
-                protocol=str(protocol),
-                service_name=str((device.telemetry or {}).get("service_name", "")),
-                port=_extract_port(device.telemetry or {}),
-                properties={"source": "device"},
+                protocol=str(spec["protocol"]),
+                service_name=str(spec.get("service_name") or ""),
+                host=str(spec.get("host") or ""),
+                port=spec.get("port") if isinstance(spec.get("port"), int) else None,
+                source=str(spec.get("source") or "device"),
+                last_seen_at=spec.get("last_seen_at") if isinstance(spec.get("last_seen_at"), datetime) else None,
+                confidence=float(spec.get("confidence") or 0.0),
+                properties=spec.get("properties") if isinstance(spec.get("properties"), dict) else {},
             )
 
     session.commit()
     return refs
-
-
-def _extract_port(payload: dict) -> int | None:
-    for key in ("port", "ship_port", "http_port"):
-        value = payload.get(key)
-        if isinstance(value, int):
-            return value
-        if isinstance(value, str) and value.isdigit():
-            return int(value)
-    return None
 
 
 def query_entities(
@@ -248,6 +470,37 @@ def query_entities(
         "entities": [_entity_as_dict(entity) for entity in entities],
         "evidence": evidence,
         "relationships": _relationships_for_entities(session, entities) if include_relationships else [],
+    }
+
+
+def get_entity_details(
+    session: Session,
+    *,
+    entity_ref: str,
+    include_evidence: bool = True,
+) -> dict:
+    entity = resolve_entity(session, entity_ref)
+    if entity is None:
+        raise ValueError(f"Unknown Home Graph entity: {entity_ref}")
+
+    endpoint_rows = session.scalars(
+        select(ProtocolEndpoint)
+        .where(ProtocolEndpoint.owner_ref == entity.id)
+        .order_by(ProtocolEndpoint.protocol, ProtocolEndpoint.service_name, ProtocolEndpoint.host)
+    ).all()
+    evidence_rows: list[HomeGraphEvidence] = []
+    if include_evidence:
+        evidence_rows = session.scalars(
+            select(HomeGraphEvidence)
+            .where(HomeGraphEvidence.subject_ref == entity.id)
+            .order_by(HomeGraphEvidence.created_at.desc())
+            .limit(20)
+        ).all()
+    return {
+        "entity": _entity_as_dict(entity),
+        "protocol_endpoints": [_endpoint_as_dict(endpoint) for endpoint in endpoint_rows],
+        "evidence": [_evidence_as_dict(row) for row in evidence_rows],
+        "relationships": _relationships_for_entities(session, [entity]),
     }
 
 
@@ -389,6 +642,24 @@ def _evidence_as_dict(evidence: HomeGraphEvidence) -> dict:
     }
 
 
+def _endpoint_as_dict(endpoint: ProtocolEndpoint) -> dict:
+    properties = endpoint.properties or {}
+    return {
+        "endpoint_ref": endpoint.id,
+        "owner_ref": endpoint.owner_ref,
+        "protocol": endpoint.protocol,
+        "host": endpoint.host,
+        "port": endpoint.port,
+        "service_name": endpoint.service_name,
+        "status": endpoint.status,
+        "source": properties.get("source", ""),
+        "last_seen_at": properties.get("last_seen_at", ""),
+        "confidence": properties.get("confidence", 0.0),
+        "properties": properties,
+        "updated_at": endpoint.updated_at,
+    }
+
+
 def _relationships_for_entities(session: Session, entities: list[HomeGraphEntity]) -> list[dict]:
     relationships: list[dict] = []
     for entity in entities:
@@ -412,9 +683,12 @@ def _relationships_for_entities(session: Session, entities: list[HomeGraphEntity
                 "relationship": "has_protocol_endpoint",
                 "properties": {
                     "protocol": endpoint.protocol,
-                    "address": endpoint.address,
+                    "host": endpoint.host,
                     "port": endpoint.port,
                     "service_name": endpoint.service_name,
+                    "source": (endpoint.properties or {}).get("source", ""),
+                    "last_seen_at": (endpoint.properties or {}).get("last_seen_at", ""),
+                    "confidence": (endpoint.properties or {}).get("confidence", 0.0),
                 },
             }
         )

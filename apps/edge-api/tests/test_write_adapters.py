@@ -61,9 +61,6 @@ def _create_dispatchable_target(session, *, device_id: str, asset_id: str, evide
             protocols=["http_local"],
             capabilities={"visible": True, "monitorable": True, "controllable": True, "optimizable": False},
             telemetry=dict(telemetry or {}),
-            problem_summary="",
-            explanation="",
-            next_step="",
         )
     )
     session.add(

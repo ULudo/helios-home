@@ -33,6 +33,8 @@ class RolePrepareBindingProposalTool:
             turn_id=context.turn.id,
             entity_ref=payload.entity_ref,
             role=payload.role,
+            endpoint_ref=payload.endpoint_ref,
+            integration_path=payload.integration_path,
             label=payload.label,
             rationale=payload.rationale or context.user_message,
         )

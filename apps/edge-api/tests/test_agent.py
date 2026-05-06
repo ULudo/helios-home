@@ -13,12 +13,14 @@ from app.db.models import (
     DeviceCandidate,
     HemsSystemBinding,
     HomeGraphEntity,
+    ProtocolEndpoint,
     Proposal,
     ToolInvocation,
     UserDecisionRequest,
     Site,
 )
 from app.db.session import get_engine, get_session_factory
+from app.home_graph.service import sync_inventory_to_home_graph
 from app.main import create_app
 from app.agent.provider import (
     ModelFinalAnswer,
@@ -116,9 +118,6 @@ def _add_device(
                 "optimizable": False,
             },
             telemetry={"eebus_ship_advertised": True, "ship_port": 4711},
-            problem_summary="",
-            explanation="Visible peer; protocol readiness still needs validation.",
-            next_step="Assess readiness before commissioning.",
         )
         session.add(device)
         session.commit()
@@ -148,6 +147,22 @@ def _add_wallbox_candidate(device_id: str, candidate_id: str, display_name: str)
         )
         session.add(candidate)
         session.commit()
+
+
+def _endpoint_ref_for_device(device_id: str, protocol: str) -> str:
+    session_factory = get_session_factory()
+    with session_factory() as session:
+        site = session.get(Site, _site_id())
+        assert site is not None
+        sync_inventory_to_home_graph(session, site.id)
+        endpoint = session.scalar(
+            select(ProtocolEndpoint).where(
+                ProtocolEndpoint.owner_ref == f"device:{device_id}",
+                ProtocolEndpoint.protocol == protocol,
+            )
+        )
+        assert endpoint is not None
+        return endpoint.id
 
 
 def _send_and_stream(client: TestClient, content: str, context: dict[str, Any] | None = None) -> list[dict]:
@@ -237,6 +252,7 @@ def test_runtime_uses_model_actions_tool_observations_and_model_final_answer(tmp
 
         runtime_started = next(event for event in events if event["event_type"] == "agent_runtime_started")
         assert "home_graph.query" in runtime_started["payload"]["available_tools"]
+        assert "home_graph.get_entity_details" in runtime_started["payload"]["available_tools"]
         assert "discovery.inspect_home_network" in runtime_started["payload"]["available_tools"]
         assert "ui.focus_entities" in runtime_started["payload"]["available_tools"]
         assert "home_graph.find_system_role" not in runtime_started["payload"]["available_tools"]
@@ -342,6 +358,113 @@ def test_binding_request_creates_proposal_and_decision_request_without_binding_a
             assert session.scalar(select(Proposal)) is not None
             assert session.scalar(select(UserDecisionRequest)) is not None
             assert session.scalar(select(HemsSystemBinding)) is None
+
+
+def test_entity_details_tool_returns_protocol_endpoints_without_backend_advice(tmp_path, monkeypatch):
+    app = _bootstrap_app(tmp_path, monkeypatch, "entity-details.db")
+    _use_scripted_provider(
+        monkeypatch,
+        ScriptedModelProvider(
+            [
+                ModelToolCall("home_graph.get_entity_details", {"entity_ref": "device:dev-ppc"}),
+                ModelFinalAnswer("I inspected the PPC SMGW details."),
+            ]
+        ),
+    )
+
+    with TestClient(app) as client:
+        client.get("/api/v1/agent/thread")
+        _add_device(device_id="dev-ppc", name="PPC SMGW", device_type="grid_meter", manufacturer="PPC")
+        events = _send_and_stream(client, "Schau dir das PPC SMGW an.")
+
+        tool_finished = next(event for event in events if event["event_type"] == "tool_finished")
+        result = tool_finished["payload"]["result"]
+        assert tool_finished["payload"]["tool_name"] == "home_graph.get_entity_details"
+        assert result["entity"]["ref"] == "device:dev-ppc"
+        assert "next_step" not in result["entity"]["properties"]
+        assert "explanation" not in result["entity"]["properties"]
+        assert result["protocol_endpoints"][0]["protocol"] == "eebus_ship"
+        assert result["protocol_endpoints"][0]["port"] == 4711
+        assert "recommended_option" not in result
+
+
+def test_binding_proposal_records_model_selected_endpoint_and_integration_path(tmp_path, monkeypatch):
+    app = _bootstrap_app(tmp_path, monkeypatch, "proposal-path.db")
+
+    with TestClient(app) as client:
+        client.get("/api/v1/agent/thread")
+        _add_device(device_id="dev-ppc", name="PPC SMGW", device_type="grid_meter", manufacturer="PPC")
+        endpoint_ref = _endpoint_ref_for_device("dev-ppc", "eebus_ship")
+        _use_scripted_provider(
+            monkeypatch,
+            ScriptedModelProvider(
+                [
+                    ModelToolCall(
+                        "role.prepare_binding_proposal",
+                        {
+                            "entity_ref": "device:dev-ppc",
+                            "role": "grid_meter",
+                            "endpoint_ref": endpoint_ref,
+                            "integration_path": "eebus_spine",
+                            "label": "PPC SMGW",
+                            "rationale": "User asked to bind the PPC SMGW through EEBus.",
+                        },
+                    ),
+                    ModelFinalAnswer("I prepared the EEBus binding proposal for your decision."),
+                ]
+            ),
+        )
+
+        _send_and_stream(client, "Bitte das PPC SMGW per EEBus als Smart Meter Gateway anbinden.")
+
+        session_factory = get_session_factory()
+        with session_factory() as session:
+            proposal = session.scalar(select(Proposal))
+            assert proposal is not None
+            assert proposal.payload["entity_ref"] == "device:dev-ppc"
+            assert proposal.payload["role"] == "grid_meter"
+            assert proposal.payload["endpoint_ref"] == endpoint_ref
+            assert proposal.payload["endpoint_protocol"] == "eebus_ship"
+            assert proposal.payload["integration_path"] == "eebus_spine"
+            assert endpoint_ref in proposal.target_refs
+            assert session.scalar(select(HemsSystemBinding)) is None
+
+
+def test_binding_proposal_rejects_incompatible_selected_endpoint_path(tmp_path, monkeypatch):
+    app = _bootstrap_app(tmp_path, monkeypatch, "proposal-path-invalid.db")
+
+    with TestClient(app) as client:
+        client.get("/api/v1/agent/thread")
+        _add_device(device_id="dev-ppc", name="PPC SMGW", device_type="grid_meter", manufacturer="PPC")
+        endpoint_ref = _endpoint_ref_for_device("dev-ppc", "eebus_ship")
+        _use_scripted_provider(
+            monkeypatch,
+            ScriptedModelProvider(
+                [
+                    ModelToolCall(
+                        "role.prepare_binding_proposal",
+                        {
+                            "entity_ref": "device:dev-ppc",
+                            "role": "grid_meter",
+                            "endpoint_ref": endpoint_ref,
+                            "integration_path": "modbus_tcp",
+                            "label": "PPC SMGW",
+                            "rationale": "Invalid path test.",
+                        },
+                    ),
+                    ModelFinalAnswer("That endpoint cannot be used through Modbus/TCP."),
+                ]
+            ),
+        )
+
+        events = _send_and_stream(client, "Bitte das PPC SMGW per Modbus anbinden.")
+
+        assert any(event["event_type"] == "tool_failed" for event in events)
+        observation = next(event for event in events if event["event_type"] == "model_observation")
+        assert "not compatible" in observation["payload"]["error"]
+        session_factory = get_session_factory()
+        with session_factory() as session:
+            assert session.scalar(select(Proposal)) is None
 
 
 def test_model_cannot_approve_decisions_by_tool_call(tmp_path, monkeypatch):

@@ -85,7 +85,6 @@ def _load_device(session: Session, device_id: str) -> Device | None:
         .where(Device.id == device_id)
         .options(
             selectinload(Device.connector_attempts),
-            selectinload(Device.recommendations),
             selectinload(Device.incidents),
         )
     )
@@ -112,8 +111,6 @@ def _get_site(session: Session) -> Site | None:
 
 
 def _summary_from_status(device: Device) -> str:
-    if device.problem_summary:
-        return device.problem_summary
     if device.primary_status in {
         IntegrationStatus.MONITORABLE.value,
         IntegrationStatus.CONTROLLABLE.value,
@@ -234,10 +231,6 @@ def _device_diagnosis(device: Device, candidate: DeviceCandidate | None) -> Debu
             )
         )
 
-    next_actions = _dedupe_text(
-        [device.next_step, *(recommendation.description for recommendation in device.recommendations)]
-    )
-
     if candidate is not None and (
         candidate.device_type == "unclassified_energy_device" or candidate.classification_confidence < 0.65
     ):
@@ -249,7 +242,6 @@ def _device_diagnosis(device: Device, candidate: DeviceCandidate | None) -> Debu
             confidence=max(candidate.classification_confidence, 0.35),
             summary="Helios saw energy-relevant evidence, but the classification confidence is still too low for a stable device profile.",
             evidence=evidence,
-            next_actions=next_actions or ["Capture more protocol evidence or identify the device manually."],
             retrofit_options=[],
             raw_diagnostics={
                 "primary_status": device.primary_status,
@@ -270,7 +262,6 @@ def _device_diagnosis(device: Device, candidate: DeviceCandidate | None) -> Debu
             confidence=max(device.confidence, 0.75),
             summary=_summary_from_status(device),
             evidence=evidence,
-            next_actions=next_actions or ["No action required."],
             retrofit_options=[],
             raw_diagnostics={
                 "primary_status": device.primary_status,
@@ -287,7 +278,6 @@ def _device_diagnosis(device: Device, candidate: DeviceCandidate | None) -> Debu
             confidence=max(device.confidence, 0.7),
             summary=_summary_from_status(device),
             evidence=evidence,
-            next_actions=next_actions or ["Complete the required pairing or OAuth step and rerun discovery."],
             retrofit_options=_retrofit_options_for_device_type(device.device_type, "auth blocked"),
             raw_diagnostics={
                 "primary_status": device.primary_status,
@@ -309,7 +299,6 @@ def _device_diagnosis(device: Device, candidate: DeviceCandidate | None) -> Debu
             confidence=max(device.confidence, 0.68),
             summary=_summary_from_status(device),
             evidence=evidence,
-            next_actions=next_actions or ["Review the adapter gap and validate a safe read/write profile."],
             retrofit_options=_retrofit_options_for_device_type(device.device_type),
             raw_diagnostics={
                 "primary_status": device.primary_status,
@@ -327,7 +316,6 @@ def _device_diagnosis(device: Device, candidate: DeviceCandidate | None) -> Debu
             confidence=max(device.confidence, 0.65),
             summary=_summary_from_status(device),
             evidence=evidence,
-            next_actions=next_actions or ["Check whether the device exposes any supported local network interface."],
             retrofit_options=_retrofit_options_for_device_type(device.device_type),
             raw_diagnostics={
                 "primary_status": device.primary_status,
@@ -344,7 +332,6 @@ def _device_diagnosis(device: Device, candidate: DeviceCandidate | None) -> Debu
         confidence=max(device.confidence, 0.6),
         summary=_summary_from_status(device),
         evidence=evidence,
-        next_actions=next_actions or ["Collect richer protocol evidence and validate a stable read path."],
         retrofit_options=_retrofit_options_for_device_type(device.device_type),
         raw_diagnostics={
             "primary_status": device.primary_status,
@@ -425,7 +412,6 @@ def get_candidate_debug_report(session: Session, candidate_id: str) -> DebugRepo
             confidence=max(candidate.classification_confidence, 0.35),
             summary="Helios captured a candidate, but the evidence is still too weak for a stable device classification.",
             evidence=evidence,
-            next_actions=["Capture a richer local protocol fingerprint or map the device manually."],
             retrofit_options=[],
             raw_diagnostics={"candidate_state": candidate.state},
         )
@@ -438,7 +424,6 @@ def get_candidate_debug_report(session: Session, candidate_id: str) -> DebugRepo
             confidence=max(candidate.classification_confidence, 0.55),
             summary="Helios classified the candidate, but there is no materialized device integration yet.",
             evidence=evidence,
-            next_actions=["Rerun discovery after validating a stable local read path."],
             retrofit_options=_retrofit_options_for_device_type(candidate.device_type),
             raw_diagnostics={"candidate_state": candidate.state},
         )
@@ -559,7 +544,6 @@ def _debug_report_from_knowledge(
             *evidence,
             *knowledge_evidence,
         ],
-        next_actions=entry.next_actions or ["Review the stored local guidance."],
         retrofit_options=[RetrofitOptionRead.model_validate(item) for item in (entry.retrofit_options or [])],
         raw_diagnostics={
             **raw_diagnostics,
@@ -603,11 +587,6 @@ def _build_not_found_claim_diagnosis(session: Session, payload: DebugExplainRequ
             confidence=0.8 if sg_ready_hint or legacy_hints else 0.68,
             summary="No network-reachable interface was matched for the claimed heat pump. The device likely lacks a supported local LAN, WLAN, or API path.",
             evidence=evidence,
-            next_actions=[
-                "Check whether the manufacturer offers a LAN, WLAN, or gateway module.",
-                "Inspect whether the controller exposes SG Ready or another dry-contact input.",
-                "Use external metering if direct heat-pump telemetry is unavailable.",
-            ],
             retrofit_options=_retrofit_options_for_device_type("heat_pump", notes),
             raw_diagnostics=raw_diagnostics,
         )
@@ -621,11 +600,6 @@ def _build_not_found_claim_diagnosis(session: Session, payload: DebugExplainRequ
             confidence=0.72,
             summary="The claim suggests a network-reachable interface, but the latest discovery runs did not match it to any device candidate.",
             evidence=evidence,
-            next_actions=[
-                "Confirm the device is on the same subnet as the Helios runtime.",
-                "Verify that the local interface is enabled and reachable without a firewall block.",
-                "Rerun discovery after checking protocol-specific settings or credentials.",
-            ],
             retrofit_options=[],
             raw_diagnostics=raw_diagnostics,
         )
@@ -639,10 +613,6 @@ def _build_not_found_claim_diagnosis(session: Session, payload: DebugExplainRequ
             confidence=0.67,
             summary="The claim points to a vendor-managed integration path. Helios did not find a direct local network interface for the device.",
             evidence=evidence,
-            next_actions=[
-                "Check whether the manufacturer provides a local gateway or bridge.",
-                "Avoid cloud-only integrations when a local network module is available.",
-            ],
             retrofit_options=_retrofit_options_for_device_type(device_type or "unclassified_energy_device", notes),
             raw_diagnostics=raw_diagnostics,
         )
@@ -660,10 +630,6 @@ def _build_not_found_claim_diagnosis(session: Session, payload: DebugExplainRequ
         confidence=0.58,
         summary="Helios did not match the claimed device in the latest discovery runs and does not yet have enough evidence to identify the limiting factor.",
         evidence=evidence,
-        next_actions=[
-            "Provide any known network capability such as LAN, WLAN, MQTT, Modbus TCP, or a local web interface.",
-            "Rerun discovery after confirming the device is powered and on the local network.",
-        ],
         retrofit_options=_retrofit_options_for_device_type(device_type or "unclassified_energy_device", notes),
         raw_diagnostics=raw_diagnostics,
     )

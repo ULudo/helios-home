@@ -485,16 +485,6 @@ def _check_map(checks: list[ProbeCheck]) -> dict[str, ProbeCheck]:
     return {check.name: check for check in checks}
 
 
-def _source_actions(missing_sources: list[str]) -> list[str]:
-    mapping = {
-        "local_network_live": "Enable local subnet HTTP discovery and rerun discovery.",
-        "network_broadcast_live": "Enable local mDNS / SSDP discovery and rerun discovery.",
-        "modbus_live": "Enable native Modbus / SunSpec probing if the device might expose Modbus TCP.",
-        "mqtt_live": "Configure the MQTT broker and enable MQTT discovery if the device publishes MQTT telemetry.",
-    }
-    return [mapping[source] for source in missing_sources if source in mapping]
-
-
 def _probe_evidence(checks: list[ProbeCheck]) -> list[DebugEvidenceRead]:
     return [
         DebugEvidenceRead(
@@ -520,37 +510,12 @@ def _refine_diagnosis(
     check_map = _check_map(checks)
 
     evidence = list(diagnosis.evidence) + _probe_evidence(checks)
-    next_actions = list(diagnosis.next_actions)
-
-    source_check = check_map["source_coverage"]
     host_check = check_map["host_reachability"]
     http_check = check_map["http_fingerprint"]
     modbus_check = check_map["modbus_protocol_probe"]
     dry_contact_check = check_map["dry_contact_path"]
     gateway_check = check_map["gateway_path"]
     metering_check = check_map["metering_fallback"]
-
-    missing_sources = source_check.details.get("missing_sources", []) if isinstance(source_check.details, dict) else []
-    if isinstance(missing_sources, list):
-        next_actions.extend(_source_actions([str(item) for item in missing_sources]))
-    if host_check.outcome == ProbeCheckOutcome.PASSED.value:
-        next_actions.append("Inspect the reachable local host and validate a stable adapter for the exposed port set.")
-    elif host_check.outcome == ProbeCheckOutcome.FAILED.value:
-        next_actions.append("Verify the claimed host is powered, on the site subnet, and reachable without firewall blocks.")
-    if http_check.outcome == ProbeCheckOutcome.PASSED.value:
-        next_actions.append("Rerun discovery or materialize the validated HTTP-local fingerprint into the site inventory.")
-    elif http_check.outcome == ProbeCheckOutcome.WARNING.value:
-        next_actions.append("Inspect the local HTTP interface manually and add a more specific adapter if it is energy-relevant.")
-    if modbus_check.outcome == ProbeCheckOutcome.PASSED.value:
-        next_actions.append("Rerun discovery or bind the validated Modbus/TCP endpoint into a monitored device profile.")
-    elif modbus_check.outcome == ProbeCheckOutcome.WARNING.value and "modbus" in debug_case.notes.lower():
-        next_actions.append("Verify Modbus/TCP is enabled on the device and that the expected unit id and TCP port are correct.")
-    if dry_contact_check.outcome in {ProbeCheckOutcome.PASSED.value, ProbeCheckOutcome.WARNING.value}:
-        next_actions.append("If native networking is unavailable, evaluate an SG Ready dry-contact relay path.")
-    if gateway_check.outcome == ProbeCheckOutcome.WARNING.value:
-        next_actions.append("Check whether the manufacturer offers a local LAN, WLAN, or gateway module.")
-    if metering_check.outcome == ProbeCheckOutcome.PASSED.value:
-        next_actions.append("Use external energy metering if direct integration remains unavailable.")
 
     state = diagnosis.state
     reason_family = diagnosis.reason_family
@@ -629,7 +594,6 @@ def _refine_diagnosis(
             "summary": summary,
             "confidence": confidence,
             "evidence": evidence,
-            "next_actions": _dedupe_text(next_actions),
             "raw_diagnostics": raw_diagnostics,
         }
     )

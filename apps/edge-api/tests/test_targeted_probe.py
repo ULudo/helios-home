@@ -117,8 +117,6 @@ def test_targeted_probe_uses_http_fingerprint_to_confirm_network_native_path(tmp
                 },
                 recovery_zone="auto_apply",
                 issue_code=None,
-                explanation_hint="Validated a local HTTP telemetry path.",
-                next_step_hint="Rerun discovery to materialize the device.",
                 capabilities_hint={
                     "visible": True,
                     "monitorable": True,

@@ -226,10 +226,6 @@ def _build_announcement_candidate(group_key: str, announcements: list[BroadcastA
         },
         recovery_zone=RecoveryZone.AUTO_APPLY.value,
         issue_code=None,
-        explanation_hint=(
-            "Helios identified an energy-relevant local network advertisement, but has not validated a telemetry path yet."
-        ),
-        next_step_hint="Use the broadcast evidence to probe a local HTTP, MQTT or protocol-specific read path.",
         capabilities_hint={
             "visible": True,
             "monitorable": False,

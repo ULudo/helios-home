@@ -342,8 +342,6 @@ def _build_candidate(
     telemetry: dict[str, Any],
     reasoning: str,
     confidence: float,
-    explanation_hint: str,
-    next_step_hint: str,
     evidence: dict[str, Any],
 ) -> RawCandidate:
     capabilities_hint = {
@@ -392,8 +390,6 @@ def _build_candidate(
         },
         recovery_zone=RecoveryZone.AUTO_APPLY.value,
         issue_code=None,
-        explanation_hint=explanation_hint,
-        next_step_hint=next_step_hint,
         capabilities_hint=capabilities_hint,
     )
 
@@ -441,21 +437,9 @@ def _build_tasmota_candidate(context: HttpDeviceContext) -> RawCandidate | None:
         if status_payload
         else {"fingerprint_profile": "tasmota_http", "hostnames": [value for value in [hostname] if value], "identity_keys": identity_keys}
     )
-    explanation_hint = (
-        "Helios identified a Tasmota HTTP interface and validated a read-only telemetry path."
-        if telemetry
-        else "Helios identified a Tasmota HTTP interface, but no validated energy telemetry path is available yet."
-    )
-    next_step_hint = (
-        "Keep the device monitorable through the local HTTP status endpoint."
-        if telemetry
-        else "Probe the local status endpoint again or add a more specific adapter profile."
-    )
     if device_type == "smart_appliance":
         evidence["dispatch_profile"] = "tasmota_http_power"
         evidence["dispatch_capabilities"] = ["binary_switch"]
-        explanation_hint = "Helios validated local Tasmota telemetry and the native HTTP power command path for binary switching."
-        next_step_hint = "The device can now participate in guarded local actuation through the validated Tasmota HTTP command path."
     return _build_candidate(
         context=context,
         stable_identifier=stable_identifier,
@@ -467,8 +451,6 @@ def _build_tasmota_candidate(context: HttpDeviceContext) -> RawCandidate | None:
         telemetry=telemetry,
         reasoning=reasoning,
         confidence=max(confidence, 0.86 if telemetry else 0.8),
-        explanation_hint=explanation_hint,
-        next_step_hint=next_step_hint,
         evidence=evidence,
     )
 
@@ -565,24 +547,12 @@ def _build_shelly_candidate(context: HttpDeviceContext) -> RawCandidate | None:
         or _parse_numeric((status_payload or {}).get("gen"))
         or (2 if "/rpc/Shelly.GetStatus" in context.documents else 1 if "/status" in context.documents else None)
     )
-    explanation_hint = (
-        "Helios identified a Shelly local interface and validated a read-only telemetry path."
-        if telemetry
-        else "Helios identified a Shelly local interface, but no validated telemetry endpoint is available yet."
-    )
-    next_step_hint = (
-        "Keep the device monitorable through the Shelly local API."
-        if telemetry
-        else "Probe the local Shelly API again or add a more specific adapter profile."
-    )
     if device_type == "smart_appliance":
         evidence["dispatch_profile"] = "shelly_http_relay"
         evidence["dispatch_capabilities"] = ["binary_switch"]
         evidence["dispatch_channel"] = 0
         if shelly_generation is not None:
             evidence["dispatch_generation"] = int(shelly_generation)
-        explanation_hint = "Helios validated local Shelly telemetry and a native relay control path for guarded binary switching."
-        next_step_hint = "The device can now participate in guarded local actuation through the validated Shelly relay API."
     return _build_candidate(
         context=context,
         stable_identifier=stable_identifier,
@@ -594,8 +564,6 @@ def _build_shelly_candidate(context: HttpDeviceContext) -> RawCandidate | None:
         telemetry=telemetry,
         reasoning=reasoning,
         confidence=confidence,
-        explanation_hint=explanation_hint,
-        next_step_hint=next_step_hint,
         evidence=evidence,
     )
 
@@ -621,10 +589,6 @@ def _build_generic_candidate(context: HttpDeviceContext) -> RawCandidate | None:
         telemetry={},
         reasoning=reasoning,
         confidence=confidence,
-        explanation_hint=(
-            "Helios identified an energy-relevant local HTTP interface, but no validated telemetry path is available yet."
-        ),
-        next_step_hint="Probe vendor-specific local APIs or add an adapter profile for telemetry validation.",
         evidence={
             "fingerprint_profile": "generic_http_energy",
             "identity_keys": [f"http-host:{_slugify(context.host)}"],

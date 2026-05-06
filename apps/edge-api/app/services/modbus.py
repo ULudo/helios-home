@@ -1308,22 +1308,6 @@ def build_candidate_from_modbus_probe(probe: ModbusProbeResult) -> RawCandidate:
         capabilities_hint["optimizable"] = True
         telemetry["curtailment_supported"] = True
 
-    explanation_hint = (
-        "Helios validated a native Modbus/TCP endpoint and mapped standardized SunSpec telemetry."
-        if monitorable
-        else "Helios validated a native Modbus/TCP endpoint and, when available, a SunSpec directory, but no stable telemetry mapping succeeded yet."
-    )
-    next_step_hint = (
-        "Keep the device monitorable through the native SunSpec read path and extend validated write profiles when safe."
-        if monitorable
-        else "Promote the validated Modbus endpoint into a device-specific telemetry profile."
-    )
-    if evidence.get("dispatch_profile") == "sunspec_storage_basic_rate":
-        explanation_hint = "Helios validated native SunSpec storage telemetry and a guarded battery rate-control profile through model 124."
-        next_step_hint = "The battery can now participate in guarded local charge and discharge control through validated SunSpec storage points."
-    elif evidence.get("dispatch_profile") == "sunspec_der_wmax_pct":
-        explanation_hint = "Helios validated native SunSpec inverter telemetry and a guarded active-power curtailment profile through IEEE 1547 model 704."
-        next_step_hint = "The inverter can now participate in guarded local active-power limiting through validated SunSpec DER control points."
     return RawCandidate(
         candidate_id=f"cand-modbus-{_slugify(probe.host)}-u{probe.unit_id}",
         device_id=f"dev-modbus-{_slugify(probe.host)}-u{probe.unit_id}",
@@ -1340,8 +1324,6 @@ def build_candidate_from_modbus_probe(probe: ModbusProbeResult) -> RawCandidate:
         evidence=evidence,
         recovery_zone=RecoveryZone.AUTO_APPLY.value,
         issue_code=None,
-        explanation_hint=explanation_hint,
-        next_step_hint=next_step_hint,
         capabilities_hint=capabilities_hint,
     )
 

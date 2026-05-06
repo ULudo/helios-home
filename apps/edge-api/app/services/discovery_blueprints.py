@@ -23,8 +23,6 @@ class RawCandidate:
     evidence: dict[str, Any]
     recovery_zone: str
     issue_code: str | None
-    explanation_hint: str
-    next_step_hint: str
     capabilities_hint: dict[str, bool]
 
 
@@ -48,13 +46,6 @@ class DiagnosisResult:
     primary_status: str
     status_tags: list[str]
     capabilities: dict[str, bool]
-    problem_summary: str
-    explanation: str
-    next_step: str
-    incident_title: str | None
-    incident_summary: str | None
-    incident_severity: str | None
-    recommendations: list[dict[str, Any]]
 
 
 def classify_candidate(candidate: RawCandidate) -> CandidateClassification:
@@ -190,22 +181,6 @@ def diagnose_candidate(candidate: RawCandidate, assessments: list[ConnectorAsses
                 IntegrationStatus.AUTHENTICATION_REQUIRED.value,
             ],
             capabilities=candidate.capabilities_hint,
-            problem_summary="The device was recognized, but the available connector requires human-approved vendor pairing.",
-            explanation=candidate.explanation_hint,
-            next_step=candidate.next_step_hint,
-            incident_title="Authentication is required before integration can continue.",
-            incident_summary="The device is visible, but telemetry and control remain blocked until the pairing step is completed.",
-            incident_severity="high",
-            recommendations=[
-                {
-                    "title": "Complete vendor pairing",
-                    "description": candidate.next_step_hint,
-                    "priority": "high",
-                    "action_type": "user_action",
-                    "zone": RecoveryZone.HUMAN_GATED.value,
-                    "auto_applicable": False,
-                }
-            ],
         )
 
     if candidate.issue_code == "modbus_unit_id_mismatch":
@@ -219,22 +194,6 @@ def diagnose_candidate(candidate: RawCandidate, assessments: list[ConnectorAsses
                 IntegrationStatus.RECOVERY_RUNNING.value,
             ],
             capabilities=candidate.capabilities_hint,
-            problem_summary="The Modbus read path works, but the command register group appears to have shifted after a firmware change.",
-            explanation=candidate.explanation_hint,
-            next_step=candidate.next_step_hint,
-            incident_title="Command path degraded after register shift",
-            incident_summary="The device is partially integrated and needs a guarded remap before it becomes fully usable again.",
-            incident_severity="medium",
-            recommendations=[
-                {
-                    "title": "Run guarded Modbus remap",
-                    "description": candidate.next_step_hint,
-                    "priority": "high",
-                    "action_type": "recovery",
-                    "zone": RecoveryZone.GUARDED_APPLY.value,
-                    "auto_applicable": False,
-                }
-            ],
         )
 
     if candidate.issue_code == "protocol_gap":
@@ -248,22 +207,6 @@ def diagnose_candidate(candidate: RawCandidate, assessments: list[ConnectorAsses
                 IntegrationStatus.PROTOCOL_INCOMPLETE.value,
             ],
             capabilities=candidate.capabilities_hint,
-            problem_summary="The telemetry path is available, but the control path is still missing a validated adapter profile.",
-            explanation=candidate.explanation_hint,
-            next_step=candidate.next_step_hint,
-            incident_title="Protocol support is still incomplete",
-            incident_summary="Monitor-only mode is available, but safe write support still needs to be generated and reviewed.",
-            incident_severity="low",
-            recommendations=[
-                {
-                    "title": "Generate adapter proposal",
-                    "description": candidate.next_step_hint,
-                    "priority": "medium",
-                    "action_type": "adapter_scaffold",
-                    "zone": RecoveryZone.GUARDED_APPLY.value,
-                    "auto_applicable": False,
-                }
-            ],
         )
 
     if not candidate.capabilities_hint.get("monitorable"):
@@ -274,13 +217,6 @@ def diagnose_candidate(candidate: RawCandidate, assessments: list[ConnectorAsses
                 IntegrationStatus.VISIBLE_ONLY.value,
             ],
             capabilities=candidate.capabilities_hint,
-            problem_summary="The device was identified, but no validated telemetry path is available yet.",
-            explanation=candidate.explanation_hint,
-            next_step=candidate.next_step_hint,
-            incident_title=None,
-            incident_summary=None,
-            incident_severity=None,
-            recommendations=[],
         )
 
     if candidate.capabilities_hint.get("optimizable"):
@@ -312,11 +248,4 @@ def diagnose_candidate(candidate: RawCandidate, assessments: list[ConnectorAsses
         primary_status=primary_status,
         status_tags=status_tags,
         capabilities=candidate.capabilities_hint,
-        problem_summary="",
-        explanation=candidate.explanation_hint,
-        next_step=candidate.next_step_hint,
-        incident_title=None,
-        incident_summary=None,
-        incident_severity=None,
-        recommendations=[],
     )

@@ -49,8 +49,6 @@ def _catalog_candidates() -> list[RawCandidate]:
             evidence={"modbus_host": "198.51.100.12", "modbus_register_profile": "validated"},
             recovery_zone="auto_apply",
             issue_code=None,
-            explanation_hint="Validated native Modbus telemetry paths.",
-            next_step_hint="No action required.",
             capabilities_hint={"visible": True, "monitorable": True, "controllable": True, "optimizable": True},
         ),
         RawCandidate(
@@ -73,8 +71,6 @@ def _catalog_candidates() -> list[RawCandidate]:
             },
             recovery_zone="guarded_apply",
             issue_code="modbus_unit_id_mismatch",
-            explanation_hint="Read telemetry is available but command registers no longer line up with the expected profile.",
-            next_step_hint="Run guarded recovery to validate a new Modbus unit-id mapping.",
             capabilities_hint={"visible": True, "monitorable": True, "controllable": True, "optimizable": False},
         ),
         RawCandidate(
@@ -93,8 +89,6 @@ def _catalog_candidates() -> list[RawCandidate]:
             evidence={"mqtt_topics": ["shellies/gridmeter/emeter/0/power"]},
             recovery_zone="auto_apply",
             issue_code=None,
-            explanation_hint="Stable MQTT telemetry makes the grid meter immediately usable.",
-            next_step_hint="No action required.",
             capabilities_hint={"visible": True, "monitorable": True, "controllable": False, "optimizable": True},
         ),
         RawCandidate(
@@ -113,8 +107,6 @@ def _catalog_candidates() -> list[RawCandidate]:
             evidence={"cloud_pairing_required": True, "vendor_app": "Easee"},
             recovery_zone="human_gated",
             issue_code="auth_required",
-            explanation_hint="The available integration path is the vendor cloud and it still needs human-approved pairing.",
-            next_step_hint="Complete vendor OAuth or app pairing before retrying integration.",
             capabilities_hint={"visible": True, "monitorable": False, "controllable": False, "optimizable": False},
         ),
         RawCandidate(
@@ -133,8 +125,6 @@ def _catalog_candidates() -> list[RawCandidate]:
             evidence={"write_profile": "unverified"},
             recovery_zone="guarded_apply",
             issue_code="protocol_gap",
-            explanation_hint="Telemetry is stable, but the control path has not been validated yet.",
-            next_step_hint="Generate an adapter proposal or keep the device monitor-only.",
             capabilities_hint={"visible": True, "monitorable": True, "controllable": False, "optimizable": False},
         ),
     ]

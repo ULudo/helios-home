@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from app.agent.tools.schemas import (
     AgentToolContext,
+    HomeGraphGetEntityDetailsInput,
     HomeGraphQueryInput,
     ToolExecutionResult,
 )
-from app.home_graph.service import query_entities, sync_inventory_to_home_graph
+from app.home_graph.service import get_entity_details, query_entities, sync_inventory_to_home_graph
 
 
 class HomeGraphQueryTool:
@@ -49,6 +50,30 @@ class HomeGraphQueryTool:
         if not payload.include_relationships:
             result["relationships"] = []
         return ToolExecutionResult(output=result)
+
+
+class HomeGraphGetEntityDetailsTool:
+    name = "home_graph.get_entity_details"
+    purpose = "Inspect one Home Graph entity with its factual properties, observed protocol endpoints, evidence, and relationships."
+    risk_level = "low"
+    confirmation_policy = "none"
+    contexts = ("conversation", "setup", "commissioning", "operation", "debug")
+    input_model = HomeGraphGetEntityDetailsInput
+    mutates_state = True
+    reads = ["home_graph", "protocol_endpoints", "home_graph_evidence"]
+    writes = ["home_graph", "protocol_endpoints"]
+    side_effects = ["materializes current inventory into Home Graph before reading details"]
+    emitted_ui_events: list[str] = []
+
+    def execute(self, context: AgentToolContext, payload: HomeGraphGetEntityDetailsInput) -> ToolExecutionResult:
+        sync_inventory_to_home_graph(context.session, context.site.id)
+        return ToolExecutionResult(
+            output=get_entity_details(
+                context.session,
+                entity_ref=payload.entity_ref,
+                include_evidence=payload.include_evidence,
+            )
+        )
 
 
 def _semantic_types_for_role(role: str) -> set[str]:

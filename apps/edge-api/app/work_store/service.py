@@ -215,6 +215,8 @@ def materialize_approved_role_candidate(
     entity_ref = str(payload.get("entity_ref") or "").strip()
     role = str(payload.get("role") or "").strip()
     label = str(payload.get("label") or entity_ref).strip()
+    endpoint_ref = str(payload.get("endpoint_ref") or "").strip()
+    integration_path = str(payload.get("integration_path") or "").strip()
     if not entity_ref or not role:
         return None
 
@@ -240,9 +242,10 @@ def materialize_approved_role_candidate(
         "label": label,
         "proposal_id": proposal.id,
         "decision_request_id": decision_request.id,
+        "endpoint_ref": endpoint_ref,
+        "integration_path": integration_path,
         "accepted_at": now.isoformat(),
         "readiness_status": "awaiting_commissioning",
-        "next_step": "commissioning_workflow_required",
     }
     existing.updated_at = now
 
@@ -260,6 +263,8 @@ def materialize_approved_role_candidate(
                 "decision_request_id": decision_request.id,
                 "role": role,
                 "label": label,
+                "endpoint_ref": endpoint_ref,
+                "integration_path": integration_path,
             },
             confidence=1.0,
             trust="user_approved",
@@ -278,11 +283,13 @@ def materialize_approved_role_candidate(
             title="commission_role_candidate",
             goal="commission_role_candidate",
             status="open",
-            target_refs=[entity_ref, candidate_ref, f"role:{role}"],
+            target_refs=[ref for ref in [entity_ref, candidate_ref, f"role:{role}", endpoint_ref] if ref],
             context={
                 "role_candidate_ref": candidate_ref,
                 "proposal_id": proposal.id,
                 "decision_request_id": decision_request.id,
+                "endpoint_ref": endpoint_ref,
+                "integration_path": integration_path,
                 "current_phase": "awaiting_commissioning_workflow",
             },
             created_at=now,
@@ -308,7 +315,7 @@ def materialize_approved_role_candidate(
             blocker_type="commissioning_workflow_not_started",
             summary="commissioning_workflow_not_started",
             details={
-                "next_capability": "eebus_trust_commissioning_readiness_validation",
+                "missing_capabilities": ["eebus_trust_commissioning_readiness_validation"],
                 "role": role,
                 "entity_ref": entity_ref,
             },
@@ -323,6 +330,8 @@ def materialize_approved_role_candidate(
                 "role_candidate_ref": candidate_ref,
                 "proposal_id": proposal.id,
                 "decision_request_id": decision_request.id,
+                "endpoint_ref": endpoint_ref,
+                "integration_path": integration_path,
                 "current_phase": "awaiting_commissioning_workflow",
             }
         )
@@ -342,6 +351,8 @@ def materialize_approved_role_candidate(
                 "task_id": task.id,
                 "entity_ref": entity_ref,
                 "role": role,
+                "endpoint_ref": endpoint_ref,
+                "integration_path": integration_path,
             },
             created_at=now,
         )
@@ -352,8 +363,9 @@ def materialize_approved_role_candidate(
         "entity_ref": entity_ref,
         "role": role,
         "label": label,
+        "endpoint_ref": endpoint_ref,
+        "integration_path": integration_path,
         "status": "accepted",
-        "next_step": existing.properties["next_step"],
     }
 
 
@@ -465,7 +477,8 @@ def accepted_role_candidates(session: Session, *, site_id: int) -> list[dict]:
             "label": row.display_name,
             "status": row.status,
             "readiness_status": (row.properties or {}).get("readiness_status", "unknown"),
-            "next_step": (row.properties or {}).get("next_step", ""),
+            "endpoint_ref": (row.properties or {}).get("endpoint_ref", ""),
+            "integration_path": (row.properties or {}).get("integration_path", ""),
             "proposal_id": (row.properties or {}).get("proposal_id", ""),
         }
         for row in rows
@@ -490,6 +503,7 @@ def latest_accepted_role_candidate_for_entity(
         "label": row.display_name,
         "status": row.status,
         "readiness_status": (row.properties or {}).get("readiness_status", "unknown"),
-        "next_step": (row.properties or {}).get("next_step", ""),
+        "endpoint_ref": (row.properties or {}).get("endpoint_ref", ""),
+        "integration_path": (row.properties or {}).get("integration_path", ""),
         "proposal_id": (row.properties or {}).get("proposal_id", ""),
     }

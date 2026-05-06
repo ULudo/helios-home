@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from app.agent.tools.device import DeviceAssessTool
 from app.agent.tools.discovery import DiscoveryInspectHomeNetworkTool
 from app.agent.tools.evidence import EvidenceRecordUserAssertionTool
-from app.agent.tools.home_graph import HomeGraphQueryTool
+from app.agent.tools.home_graph import HomeGraphGetEntityDetailsTool, HomeGraphQueryTool
 from app.agent.tools.reference import HomeGraphResolveEntityReferenceTool
 from app.agent.tools.roles import RolePrepareBindingProposalTool
 from app.agent.tools.schemas import AgentTool, AgentToolContext, ToolExecutionResult, ToolSpecRead
@@ -56,6 +56,7 @@ def create_default_tool_registry() -> ToolRegistry:
     return ToolRegistry(
         [
             HomeGraphQueryTool(),
+            HomeGraphGetEntityDetailsTool(),
             HomeGraphResolveEntityReferenceTool(),
             EvidenceRecordUserAssertionTool(),
             DiscoveryInspectHomeNetworkTool(),

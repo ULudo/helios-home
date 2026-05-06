@@ -868,14 +868,19 @@ export default function App() {
               <div className="grid gap-6 xl:grid-cols-[minmax(0,1.2fr)_360px]">
                 <div className="grid gap-6">
                   <section className="surface-subtle p-5">
-                    <p className="section-heading">Explanation</p>
-                    <p className="mt-3 text-sm leading-7 text-slate-700">{device.explanation}</p>
-                    {device.next_step ? (
-                      <div className="mt-4 rounded-[16px] border border-[#d8dfea] bg-[#fafcff] px-4 py-4">
-                        <p className="section-heading">Next step</p>
-                        <p className="m-0 mt-2 text-sm leading-6 text-slate-700">{device.next_step}</p>
+                    <p className="section-heading">State</p>
+                    <div className="mt-4 grid gap-3 md:grid-cols-2">
+                      <div className="rounded-[16px] border border-[#d8dfea] bg-white px-4 py-4">
+                        <p className="section-heading">Status</p>
+                        <p className="m-0 mt-2 text-sm font-medium text-slate-900">{humanize(device.primary_status)}</p>
                       </div>
-                    ) : null}
+                      <div className="rounded-[16px] border border-[#d8dfea] bg-white px-4 py-4">
+                        <p className="section-heading">Protocols</p>
+                        <p className="m-0 mt-2 text-sm font-medium text-slate-900">
+                          {device.protocols.length > 0 ? device.protocols.join(", ") : "None"}
+                        </p>
+                      </div>
+                    </div>
                   </section>
 
                   <section className="surface-subtle p-5">

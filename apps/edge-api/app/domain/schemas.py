@@ -54,17 +54,6 @@ class DeviceCandidateRead(BaseModel):
     last_seen_at: datetime
 
 
-class RecommendationRead(BaseModel):
-    id: int
-    title: str
-    description: str
-    priority: str
-    action_type: str
-    zone: str
-    auto_applicable: bool
-    created_at: datetime
-
-
 class DebugEvidenceRead(BaseModel):
     kind: str
     label: str
@@ -90,7 +79,6 @@ class DebugDiagnosisRead(BaseModel):
     confidence: float
     summary: str
     evidence: list[DebugEvidenceRead] = Field(default_factory=list)
-    next_actions: list[str] = Field(default_factory=list)
     retrofit_options: list[RetrofitOptionRead] = Field(default_factory=list)
     raw_diagnostics: dict[str, Any] = Field(default_factory=dict)
 
@@ -175,7 +163,6 @@ class KnowledgeEntryRead(BaseModel):
     feasibility: str
     confidence: float
     summary: str
-    next_actions: list[str] = Field(default_factory=list)
     retrofit_options: list[RetrofitOptionRead] = Field(default_factory=list)
     evidence: list[DebugEvidenceRead] = Field(default_factory=list)
     raw_diagnostics: dict[str, Any] = Field(default_factory=dict)
@@ -201,7 +188,6 @@ class KnowledgeEntryWrite(BaseModel):
     feasibility: str
     confidence: float
     summary: str
-    next_actions: list[str] = Field(default_factory=list)
     retrofit_options: list[RetrofitOptionRead] = Field(default_factory=list)
     evidence: list[DebugEvidenceRead] = Field(default_factory=list)
     raw_diagnostics: dict[str, Any] = Field(default_factory=dict)
@@ -232,12 +218,8 @@ class DeviceRead(BaseModel):
     protocols: list[str]
     capabilities: CapabilityRead
     telemetry: dict[str, Any]
-    problem_summary: str
-    explanation: str
-    next_step: str
     last_seen_at: datetime
     connector_attempts: list[ConnectorAttemptRead] = Field(default_factory=list)
-    recommendations: list[RecommendationRead] = Field(default_factory=list)
 
 
 class AssetRead(BaseModel):

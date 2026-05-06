@@ -45,10 +45,6 @@ class Site(Base):
         back_populates="site",
         cascade="all, delete-orphan",
     )
-    recommendations: Mapped[list["Recommendation"]] = relationship(
-        back_populates="site",
-        cascade="all, delete-orphan",
-    )
     incidents: Mapped[list["Incident"]] = relationship(
         back_populates="site",
         cascade="all, delete-orphan",
@@ -173,9 +169,6 @@ class Device(Base):
     protocols: Mapped[list[str]] = mapped_column(JSON, default=list)
     capabilities: Mapped[dict] = mapped_column(JSON, default=dict)
     telemetry: Mapped[dict] = mapped_column(JSON, default=dict)
-    problem_summary: Mapped[str] = mapped_column(Text, default="")
-    explanation: Mapped[str] = mapped_column(Text, default="")
-    next_step: Mapped[str] = mapped_column(Text, default="")
     last_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=utcnow,
@@ -195,11 +188,6 @@ class Device(Base):
         back_populates="device",
         cascade="all, delete-orphan",
         order_by="ConnectorAttempt.attempted_at.desc()",
-    )
-    recommendations: Mapped[list["Recommendation"]] = relationship(
-        back_populates="device",
-        cascade="all, delete-orphan",
-        order_by="Recommendation.created_at.desc()",
     )
     incidents: Mapped[list["Incident"]] = relationship(
         back_populates="device",
@@ -281,30 +269,6 @@ class HemsSystemBinding(Base):
     )
 
     site: Mapped[Site] = relationship(back_populates="hems_system_bindings")
-
-
-class Recommendation(Base):
-    __tablename__ = "recommendations"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"))
-    device_id: Mapped[str | None] = mapped_column(
-        ForeignKey("devices.id"),
-        nullable=True,
-    )
-    title: Mapped[str] = mapped_column(String(140))
-    description: Mapped[str] = mapped_column(Text)
-    priority: Mapped[str] = mapped_column(String(40))
-    action_type: Mapped[str] = mapped_column(String(60))
-    zone: Mapped[str] = mapped_column(String(40))
-    auto_applicable: Mapped[bool]
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        default=utcnow,
-    )
-
-    site: Mapped[Site] = relationship(back_populates="recommendations")
-    device: Mapped[Device | None] = relationship(back_populates="recommendations")
 
 
 class Incident(Base):
@@ -445,7 +409,6 @@ class KnowledgeEntry(Base):
     feasibility: Mapped[str] = mapped_column(String(80), default="")
     confidence: Mapped[float] = mapped_column(default=0.0)
     summary: Mapped[str] = mapped_column(Text, default="")
-    next_actions: Mapped[list[str]] = mapped_column(JSON, default=list)
     retrofit_options: Mapped[list[dict]] = mapped_column(JSON, default=list)
     evidence: Mapped[list[dict]] = mapped_column(JSON, default=list)
     raw_diagnostics: Mapped[dict] = mapped_column(JSON, default=dict)
@@ -599,7 +562,7 @@ class ProtocolEndpoint(Base):
     site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"))
     owner_ref: Mapped[str] = mapped_column(String(96))
     protocol: Mapped[str] = mapped_column(String(80))
-    address: Mapped[str] = mapped_column(String(180), default="")
+    host: Mapped[str] = mapped_column("address", String(180), default="")
     port: Mapped[int | None] = mapped_column(Integer, nullable=True)
     service_name: Mapped[str] = mapped_column(String(180), default="")
     status: Mapped[str] = mapped_column(String(60), default="observed")

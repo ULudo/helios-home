@@ -139,9 +139,6 @@ def _add_controllable_load(
             "minimum_runtime_minutes": 30,
             **({"simulation_supported": True} if simulation_supported else {}),
         },
-        problem_summary="",
-        explanation="Validated smart load",
-        next_step="No action required.",
     )
     asset = Asset(
         id="asset-laundry-relay",

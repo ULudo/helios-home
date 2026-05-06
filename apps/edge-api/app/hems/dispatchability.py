@@ -316,7 +316,7 @@ def assess_dispatchability(
     if device.primary_status in BLOCKING_DEVICE_STATUSES:
         return DispatchabilityAssessment(
             eligibility=HemsEligibility.BLOCKED.value,
-            reasons=[device.explanation or "The device is blocked by authentication or unsupported access."],
+            reasons=[f"Device status blocks dispatchability: {device.primary_status}."],
             command_contract=None,
         )
     if asset_type not in SUPPORTED_DISPATCH_ASSET_TYPES:

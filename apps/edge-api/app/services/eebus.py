@@ -200,11 +200,6 @@ def build_candidate_from_ship_service(service: Any) -> RawCandidate:
         },
         recovery_zone=RecoveryZone.HUMAN_GATED.value,
         issue_code=None,
-        explanation_hint=(
-            "Helios discovered an EEBus SHIP peer. Trust commissioning and SPINE exchange are required "
-            "before this peer can provide live telemetry or load-control commands."
-        ),
-        next_step_hint="Pair a trusted EEBus identity, then use SPINE for LPC/LPP load-control exchange.",
         capabilities_hint={
             "visible": True,
             "monitorable": False,

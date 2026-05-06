@@ -1,9 +1,11 @@
 import pytest
+from sqlalchemy import select
 
 from app.core.config import get_settings
-from app.db.models import Site
+from app.db.models import ProtocolEndpoint, Site
 from app.db.seed import seed_default_site
 from app.db.session import get_engine, get_session_factory, init_database
+from app.home_graph.service import query_entities, sync_inventory_to_home_graph
 from app.services.dashboard import build_overview
 from app.services.discovery import list_device_candidates, list_discovery_runs, run_discovery
 from app.services.discovery_blueprints import RawCandidate
@@ -72,8 +74,6 @@ def _live_mqtt_candidate() -> RawCandidate:
         },
         recovery_zone="auto_apply",
         issue_code=None,
-        explanation_hint="Imported energy telemetry directly from the configured MQTT broker.",
-        next_step_hint="Add a native protocol adapter if write-path validation is required.",
         capabilities_hint={
             "visible": True,
             "monitorable": True,
@@ -106,8 +106,6 @@ def _reconcilable_mqtt_grid_meter_candidate() -> RawCandidate:
         },
         recovery_zone="auto_apply",
         issue_code=None,
-        explanation_hint="Imported energy telemetry directly from the configured MQTT broker.",
-        next_step_hint="Keep the device monitorable through MQTT.",
         capabilities_hint={
             "visible": True,
             "monitorable": True,
@@ -141,8 +139,6 @@ def _local_http_candidate() -> RawCandidate:
         },
         recovery_zone="auto_apply",
         issue_code=None,
-        explanation_hint="Helios identified a Shelly local interface and validated a read-only telemetry path.",
-        next_step_hint="Keep the device monitorable through the Shelly local API.",
         capabilities_hint={
             "visible": True,
             "monitorable": True,
@@ -173,8 +169,6 @@ def _broadcast_grid_meter_candidate() -> RawCandidate:
         },
         recovery_zone="auto_apply",
         issue_code=None,
-        explanation_hint="Helios identified an energy-relevant local network advertisement.",
-        next_step_hint="Use the broadcast evidence to probe a local read path.",
         capabilities_hint={
             "visible": True,
             "monitorable": False,
@@ -207,8 +201,6 @@ def _modbus_grid_meter_candidate() -> RawCandidate:
         },
         recovery_zone="auto_apply",
         issue_code=None,
-        explanation_hint="Helios validated a native Modbus/TCP endpoint and mapped standardized SunSpec telemetry.",
-        next_step_hint="Keep the device monitorable through the native SunSpec read path.",
         capabilities_hint={
             "visible": True,
             "monitorable": True,
@@ -239,8 +231,6 @@ def _battery_recovery_candidate() -> RawCandidate:
         },
         recovery_zone="guarded_apply",
         issue_code="modbus_unit_id_mismatch",
-        explanation_hint="Read telemetry is available but command registers no longer line up with the expected profile.",
-        next_step_hint="Run guarded recovery to validate a new Modbus unit-id mapping.",
         capabilities_hint={
             "visible": True,
             "monitorable": True,
@@ -267,8 +257,6 @@ def _human_gated_wallbox_candidate() -> RawCandidate:
         evidence={"cloud_pairing_required": True, "vendor_app": "Easee"},
         recovery_zone="human_gated",
         issue_code="auth_required",
-        explanation_hint="The available integration path still needs human-approved pairing.",
-        next_step_hint="Complete vendor pairing before retrying integration.",
         capabilities_hint={
             "visible": True,
             "monitorable": False,
@@ -346,6 +334,38 @@ def test_discovery_rerun_preserves_materialized_devices_and_assets(tmp_path, mon
         assert len(overview.devices) == 3
         assert {device.id for device in overview.devices} == {device.id for device in first_overview.devices}
         assert len(list_device_candidates(session)) == 3
+    finally:
+        session.close()
+
+
+def test_discovery_materializes_factual_protocol_endpoints(tmp_path, monkeypatch):
+    session = _build_session(tmp_path, monkeypatch)
+    try:
+        _install_local_test_discovery(session, monkeypatch, candidates=[_local_http_candidate()])
+        run_discovery(session)
+        sync_inventory_to_home_graph(session)
+
+        endpoints = session.scalars(select(ProtocolEndpoint).order_by(ProtocolEndpoint.owner_ref)).all()
+        device_endpoint = next(endpoint for endpoint in endpoints if endpoint.owner_ref == "device:dev-local-http-shelly-3em-aa-bb")
+
+        assert device_endpoint.protocol == "http_local"
+        assert device_endpoint.host == "198.51.100.40"
+        assert device_endpoint.port == 80
+        assert device_endpoint.service_name == "local_http"
+        assert device_endpoint.properties["source"] == "local_network_live"
+        assert device_endpoint.properties["confidence"] == 0.9
+        assert device_endpoint.properties["host"] == "198.51.100.40"
+        assert "last_seen_at" in device_endpoint.properties
+        assert "network-host:198-51-100-40" in device_endpoint.properties["identity_keys"]
+
+        graph = query_entities(session, entity_refs=["device:dev-local-http-shelly-3em-aa-bb"])
+        endpoint_relationship = next(
+            relationship
+            for relationship in graph["relationships"]
+            if relationship["relationship"] == "has_protocol_endpoint"
+        )
+        assert endpoint_relationship["properties"]["host"] == "198.51.100.40"
+        assert "address" not in endpoint_relationship["properties"]
     finally:
         session.close()
 
@@ -439,6 +459,16 @@ def test_discovery_reconciles_candidates_across_native_live_sources(tmp_path, mo
         assert reconciled_grid_meter.telemetry["grid_power_kw"] == -2.4
         assert reconciled_grid_meter.telemetry["phase_0_power_w"] == -812.4
         assert reconciled_grid_meter.telemetry["grid_import_total_kwh"] == 123.4
+        sync_inventory_to_home_graph(session)
+        endpoints = session.scalars(
+            select(ProtocolEndpoint).where(ProtocolEndpoint.owner_ref == "device:dev-local-http-shelly-3em-aa-bb")
+        ).all()
+        source_by_protocol = {endpoint.protocol: endpoint.properties["source"] for endpoint in endpoints}
+        assert source_by_protocol["http_local"] == "local_network_live"
+        assert source_by_protocol["mdns"] == "network_broadcast_live"
+        assert source_by_protocol["modbus_tcp"] == "modbus_live"
+        assert source_by_protocol["mqtt"] == "mqtt_live"
+        assert source_by_protocol["ssdp"] == "network_broadcast_live"
     finally:
         session.close()
 
@@ -610,8 +640,6 @@ def test_local_discovery_combines_multiple_configured_subnets(tmp_path, monkeypa
                         },
                         recovery_zone="auto_apply",
                         issue_code=None,
-                        explanation_hint="Helios validated a local OpenDTU read path.",
-                        next_step_hint="Keep the inverter monitorable through the local HTTP endpoint.",
                         capabilities_hint={
                             "visible": True,
                             "monitorable": True,

@@ -166,8 +166,6 @@ def _build_tasmota_candidate(device_slug: str, messages: list[MqttMessage]) -> R
         },
         recovery_zone=RecoveryZone.AUTO_APPLY.value,
         issue_code=None,
-        explanation_hint="Imported energy telemetry directly from the configured MQTT broker.",
-        next_step_hint="Keep the device monitorable through MQTT or add a native protocol adapter for write-path validation.",
         capabilities_hint={
             "visible": True,
             "monitorable": True,
@@ -227,8 +225,6 @@ def _build_shelly_candidate(device_slug: str, messages: list[MqttMessage]) -> Ra
         },
         recovery_zone=RecoveryZone.AUTO_APPLY.value,
         issue_code=None,
-        explanation_hint="Imported energy telemetry directly from Shelly MQTT topics.",
-        next_step_hint="Keep the device monitorable through MQTT or add a validated write-path adapter.",
         capabilities_hint={
             "visible": True,
             "monitorable": True,
