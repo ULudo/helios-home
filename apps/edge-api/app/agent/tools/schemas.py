@@ -13,6 +13,7 @@ RiskLevel = Literal["low", "medium", "high"]
 ConfirmationPolicy = Literal["none", "user_decision_required", "user_message_required", "developer_mode_only"]
 ToolContextMode = Literal["conversation", "setup", "commissioning", "operation", "debug"]
 HemsRole = Literal["grid_meter", "ev_charger", "pv_inverter", "battery", "heat_pump", "controllable_load"]
+IntegrationPath = Literal["eebus_spine", "modbus_tcp", "sunspec_modbus", "http_local", "mqtt", "vendor_cloud"]
 UiEventType = Literal[
     "view.open",
     "entity.focus",
@@ -78,6 +79,7 @@ class AgentTool(Protocol):
 class HomeGraphQueryInput(BaseModel):
     entity_refs: list[str] = Field(default_factory=list)
     entity_types: list[str] = Field(default_factory=list)
+    scope: Literal["canonical_devices", "raw_artifacts", "all"] = "canonical_devices"
     role_hypothesis: HemsRole | None = None
     text: str = ""
     include_evidence: bool = False
@@ -121,15 +123,39 @@ class RolePrepareBindingProposalInput(BaseModel):
     entity_ref: str
     role: HemsRole
     endpoint_ref: str = ""
-    integration_path: str = ""
+    integration_path: IntegrationPath | Literal[""] = ""
     label: str = ""
     rationale: str = ""
 
 
-class ConnectionExplainReadinessInput(BaseModel):
-    role_candidate_ref: str = ""
+class ProtocolListEndpointsInput(BaseModel):
     entity_ref: str = ""
+    protocol: str = ""
+
+
+class ConnectionInspectReadinessInput(BaseModel):
+    entity_ref: str = ""
+    endpoint_ref: str = ""
+    integration_path: IntegrationPath | Literal[""] = ""
     role: HemsRole | None = None
+
+
+class EebusIdentityGetOrCreateInput(BaseModel):
+    common_name: str = "Helios Home HEMS"
+
+
+class CommissioningStartOrContinueInput(BaseModel):
+    entity_ref: str
+    endpoint_ref: str = ""
+    integration_path: IntegrationPath | Literal[""] = ""
+    role: HemsRole | None = None
+    reason: str = ""
+
+
+class CommissioningGetLogInput(BaseModel):
+    entity_ref: str = ""
+    diagnostic_run_refs: list[str] = Field(default_factory=list)
+    limit: int = Field(default=5, ge=1, le=20)
 
 
 class WorkGetStatusInput(BaseModel):

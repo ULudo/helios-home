@@ -11,11 +11,16 @@ from sqlalchemy.orm import Session
 
 from app.agent.semantics import HEMS_SYSTEM_TYPES
 from app.db.models import (
+    AgentTask,
+    Blocker,
     Device,
     DeviceAssessment,
     DeviceCandidate,
+    EebusLocalIdentity,
+    HemsSystemBinding,
     HomeGraphEntity,
     HomeGraphEvidence,
+    ProtocolDiagnosticRun,
     ProtocolEndpoint,
     Site,
     utcnow,
@@ -262,6 +267,7 @@ def _endpoint_specs(
                         "path": _first_string(ship.get("path")),
                         "ship_id": _first_string(ship.get("ship_id")),
                         "ski": _first_string(ship.get("ski")),
+                        "register": ship.get("register") if isinstance(ship.get("register"), bool) else None,
                         "supported_use_cases": evidence.get("supported_use_cases") if isinstance(evidence.get("supported_use_cases"), list) else [],
                         "tls_probe": ship.get("tls_probe"),
                     },
@@ -433,30 +439,80 @@ def sync_inventory_to_home_graph(session: Session, site_id: int | None = None) -
     return refs
 
 
+def canonical_inventory_summary(session: Session, site_id: int) -> dict:
+    devices = session.scalars(
+        select(Device)
+        .where(Device.site_id == site_id)
+        .order_by(Device.device_type, Device.name)
+    ).all()
+    candidates = session.scalars(select(DeviceCandidate).where(DeviceCandidate.site_id == site_id)).all()
+    graph_entities = session.scalars(select(HomeGraphEntity).where(HomeGraphEntity.site_id == site_id)).all()
+    by_type: dict[str, int] = {}
+    for device in devices:
+        by_type[device.device_type or "unknown"] = by_type.get(device.device_type or "unknown", 0) + 1
+    raw_candidates_by_type: dict[str, int] = {}
+    for candidate in candidates:
+        raw_candidates_by_type[candidate.device_type or "unknown"] = raw_candidates_by_type.get(candidate.device_type or "unknown", 0) + 1
+    raw_entities_by_type: dict[str, int] = {}
+    for entity in graph_entities:
+        raw_entities_by_type[entity.entity_type or "unknown"] = raw_entities_by_type.get(entity.entity_type or "unknown", 0) + 1
+    return {
+        "canonical_device_count": len(devices),
+        "canonical_device_counts_by_type": by_type,
+        "canonical_devices": [
+            {
+                "ref": entity_ref("device", device.id),
+                "id": device.id,
+                "label": device.name,
+                "device_type": device.device_type,
+                "manufacturer": device.manufacturer,
+                "model": device.model,
+                "status": device.primary_status,
+                "protocols": list(device.protocols or []),
+            }
+            for device in devices[:40]
+        ],
+        "raw_artifact_counts": {
+            "candidate_count": len(candidates),
+            "candidate_counts_by_type": raw_candidates_by_type,
+            "home_graph_entity_count": len(graph_entities),
+            "home_graph_counts_by_entity_type": raw_entities_by_type,
+        },
+        "notes": [
+            "canonical_devices are physical systems suitable for normal user-facing inventory",
+            "raw_artifacts are discovery candidates or graph implementation details available through tools when diagnostics require them",
+        ],
+    }
+
+
 def query_entities(
     session: Session,
     *,
     text: str = "",
     entity_refs: list[str] | None = None,
     entity_types: list[str] | None = None,
+    scope: str = "all",
     include_evidence: bool = False,
     include_relationships: bool = True,
+    text_match_mode: str = "filter",
 ) -> dict:
     statement = select(HomeGraphEntity).order_by(HomeGraphEntity.updated_at.desc())
     if entity_refs:
         statement = statement.where(HomeGraphEntity.id.in_(entity_refs))
+    elif scope == "canonical_devices" and not entity_types:
+        statement = statement.where(HomeGraphEntity.entity_type == "device")
+    elif scope == "raw_artifacts" and not entity_types:
+        statement = statement.where(HomeGraphEntity.entity_type.in_(["candidate"]))
     if entity_types:
         statement = statement.where(HomeGraphEntity.entity_type.in_(entity_types))
     entities = session.scalars(statement).all()
     if text:
         lowered = text.lower()
-        entities = [
-            entity
-            for entity in entities
-            if lowered in entity.display_name.lower()
-            or lowered in entity.semantic_type.lower()
-            or lowered in str(entity.properties or {}).lower()
-        ]
+        scored_entities = [(_entity_text_score(lowered, entity), entity) for entity in entities]
+        if text_match_mode == "rank":
+            entities = [entity for _score, entity in sorted(scored_entities, key=lambda item: item[0], reverse=True)]
+        else:
+            entities = [entity for score, entity in scored_entities if score > 0]
     evidence: list[dict] = []
     if include_evidence and entities:
         refs = [entity.id for entity in entities]
@@ -470,6 +526,7 @@ def query_entities(
         "entities": [_entity_as_dict(entity) for entity in entities],
         "evidence": evidence,
         "relationships": _relationships_for_entities(session, entities) if include_relationships else [],
+        "scope": scope,
     }
 
 
@@ -496,10 +553,36 @@ def get_entity_details(
             .order_by(HomeGraphEvidence.created_at.desc())
             .limit(20)
         ).all()
+    role_candidate_rows = _role_candidates_for_entity(session, entity)
+    task_rows = _tasks_for_entity(session, entity, role_candidate_rows)
+    blocker_rows = _blockers_for_entity(session, entity, role_candidate_rows, task_rows)
     return {
         "entity": _entity_as_dict(entity),
+        "canonical": entity.entity_type == "device",
         "protocol_endpoints": [_endpoint_as_dict(endpoint) for endpoint in endpoint_rows],
+        "connection_facets": connection_facets_for_entity(
+            session,
+            entity_ref=entity.id,
+            endpoints=endpoint_rows,
+            role_candidates=role_candidate_rows,
+            tasks=task_rows,
+            blockers=blocker_rows,
+        ),
+        "role_candidates": [_entity_as_dict(row) for row in role_candidate_rows],
+        "tasks": [_task_as_dict(row) for row in task_rows],
+        "blockers": [_blocker_as_dict(row) for row in blocker_rows],
         "evidence": [_evidence_as_dict(row) for row in evidence_rows],
+        "evidence_summary": [
+            {
+                "ref": row.id,
+                "evidence_type": row.evidence_type,
+                "source": row.source,
+                "summary": row.summary,
+                "confidence": row.confidence,
+                "trust": row.trust,
+            }
+            for row in evidence_rows[:8]
+        ],
         "relationships": _relationships_for_entities(session, [entity]),
     }
 
@@ -583,6 +666,207 @@ def assess_device(session: Session, *, entity_reference: str, question: str = ""
     session.add(assessment)
     session.commit()
     return AssessmentResult(assessment=assessment, evidence=evidence_rows)
+
+
+def connection_facets_for_entity(
+    session: Session,
+    *,
+    entity_ref: str,
+    endpoints: list[ProtocolEndpoint] | None = None,
+    role_candidates: list[HomeGraphEntity] | None = None,
+    tasks: list[AgentTask] | None = None,
+    blockers: list[Blocker] | None = None,
+) -> dict:
+    entity = resolve_entity(session, entity_ref)
+    if entity is None:
+        return {
+            "overall_connection_state": "unknown",
+            "facets": {
+                "identity_state": "unknown",
+                "endpoint_state": "unknown",
+                "role_state": "unknown",
+                "trust_state": "unknown",
+                "commissioning_state": "unknown",
+                "telemetry_state": "unknown",
+                "control_state": "unknown",
+            },
+            "blocker_refs": [],
+            "diagnostic_refs": [],
+        }
+    endpoint_rows = endpoints if endpoints is not None else session.scalars(
+        select(ProtocolEndpoint)
+        .where(ProtocolEndpoint.owner_ref == entity.id)
+        .order_by(ProtocolEndpoint.protocol, ProtocolEndpoint.service_name)
+    ).all()
+    role_candidate_rows = role_candidates if role_candidates is not None else _role_candidates_for_entity(session, entity)
+    task_rows = tasks if tasks is not None else _tasks_for_entity(session, entity, role_candidate_rows)
+    blocker_rows = blockers if blockers is not None else _blockers_for_entity(session, entity, role_candidate_rows, task_rows)
+    diagnostics = session.scalars(
+        select(ProtocolDiagnosticRun)
+        .where(
+            ProtocolDiagnosticRun.site_id == entity.site_id,
+            ProtocolDiagnosticRun.entity_ref == entity.id,
+        )
+        .order_by(ProtocolDiagnosticRun.created_at.desc())
+        .limit(3)
+    ).all()
+    binding = session.scalar(
+        select(HemsSystemBinding)
+        .where(
+            HemsSystemBinding.site_id == entity.site_id,
+            HemsSystemBinding.device_id == entity.source_id,
+            HemsSystemBinding.status.in_(["confirmed", "active"]),
+        )
+        .order_by(HemsSystemBinding.updated_at.desc())
+        .limit(1)
+    )
+    protocols = {endpoint.protocol for endpoint in endpoint_rows}
+    has_eebus = "eebus_ship" in protocols
+    local_identity = session.scalar(select(EebusLocalIdentity).where(EebusLocalIdentity.site_id == entity.site_id))
+    diagnostic_blocker_codes = {
+        str(code)
+        for diagnostic in diagnostics
+        for code in ((diagnostic.result or {}).get("blocker_codes") or [])
+    }
+
+    endpoint_state = "visible" if endpoint_rows else "none"
+    role_state = "bound" if binding is not None else ("user_accepted" if role_candidate_rows else "none")
+    trust_state = "unknown"
+    if has_eebus:
+        trust_state = "required"
+        if local_identity is not None and "ship_trust_commissioning_not_validated" not in diagnostic_blocker_codes:
+            trust_state = "unknown"
+    elif endpoint_rows:
+        trust_state = "not_required"
+    commissioning_state = "not_started"
+    if any(task.status in {"running", "blocked", "open"} for task in task_rows):
+        commissioning_state = "blocked" if blocker_rows else "not_started"
+    if binding is not None and binding.connection_status in {"connected", "ready"}:
+        commissioning_state = "completed"
+    telemetry_state = "validated" if binding is not None and binding.telemetry_status == "validated" else "unknown"
+    control_state = "validated" if binding is not None and binding.control_status == "validated" else "unknown"
+    capabilities = (entity.properties or {}).get("capabilities") if isinstance((entity.properties or {}).get("capabilities"), dict) else {}
+    if telemetry_state == "unknown" and capabilities.get("monitorable") is False:
+        telemetry_state = "unvalidated"
+    if control_state == "unknown" and capabilities.get("controllable") is False:
+        control_state = "unvalidated"
+
+    overall = "discovered"
+    if binding is not None and binding.connection_status == "connected":
+        overall = "connected"
+    elif blocker_rows or diagnostic_blocker_codes:
+        overall = "blocked"
+    elif role_state == "user_accepted":
+        overall = "partially_ready"
+    elif endpoint_rows:
+        overall = "endpoint_visible"
+
+    return {
+        "overall_connection_state": overall,
+        "facets": {
+            "identity_state": "observed" if entity.entity_type == "device" else "unverified",
+            "endpoint_state": endpoint_state,
+            "role_state": role_state,
+            "trust_state": trust_state,
+            "commissioning_state": commissioning_state,
+            "telemetry_state": telemetry_state,
+            "control_state": control_state,
+            "local_eebus_identity_state": "ready" if local_identity is not None else ("missing" if has_eebus else "not_applicable"),
+        },
+        "blocker_refs": [blocker.id for blocker in blocker_rows],
+        "diagnostic_refs": [diagnostic.id for diagnostic in diagnostics],
+    }
+
+
+def _entity_text_score(text: str, entity: HomeGraphEntity) -> float:
+    if not text:
+        return 0.0
+    haystacks = [
+        entity.display_name.lower(),
+        entity.semantic_type.lower(),
+        entity.source_id.lower(),
+        str(entity.properties or {}).lower(),
+    ]
+    score = 0.0
+    for haystack in haystacks:
+        if text in haystack:
+            score += 2.0
+        for token in text.split():
+            if len(token) >= 3 and token in haystack:
+                score += 0.5
+    return score
+
+
+def _role_candidates_for_entity(session: Session, entity: HomeGraphEntity) -> list[HomeGraphEntity]:
+    rows = session.scalars(
+        select(HomeGraphEntity)
+        .where(
+            HomeGraphEntity.site_id == entity.site_id,
+            HomeGraphEntity.entity_type == "role_candidate",
+        )
+        .order_by(HomeGraphEntity.updated_at.desc())
+    ).all()
+    return [row for row in rows if (row.properties or {}).get("entity_ref") == entity.id]
+
+
+def _tasks_for_entity(session: Session, entity: HomeGraphEntity, role_candidates: list[HomeGraphEntity]) -> list[AgentTask]:
+    refs = {entity.id, *(row.id for row in role_candidates)}
+    tasks = session.scalars(
+        select(AgentTask)
+        .where(
+            AgentTask.site_id == entity.site_id,
+            AgentTask.status.in_(["open", "running", "blocked"]),
+        )
+        .order_by(AgentTask.updated_at.desc())
+        .limit(30)
+    ).all()
+    return [task for task in tasks if refs.intersection(set(task.target_refs or []))]
+
+
+def _blockers_for_entity(
+    session: Session,
+    entity: HomeGraphEntity,
+    role_candidates: list[HomeGraphEntity],
+    tasks: list[AgentTask],
+) -> list[Blocker]:
+    refs = {entity.id, *(row.id for row in role_candidates)}
+    task_ids = {task.id for task in tasks}
+    blockers = session.scalars(
+        select(Blocker)
+        .where(Blocker.status == "open")
+        .order_by(Blocker.created_at.desc())
+        .limit(50)
+    ).all()
+    return [
+        blocker
+        for blocker in blockers
+        if blocker.task_id in task_ids or blocker.subject_ref in refs
+    ]
+
+
+def _task_as_dict(task: AgentTask) -> dict:
+    return {
+        "task_ref": task.id,
+        "task_type": task.task_type,
+        "title": task.title,
+        "goal": task.goal,
+        "status": task.status,
+        "target_refs": task.target_refs or [],
+        "context": task.context or {},
+        "updated_at": task.updated_at,
+    }
+
+
+def _blocker_as_dict(blocker: Blocker) -> dict:
+    return {
+        "blocker_ref": blocker.id,
+        "task_ref": blocker.task_id,
+        "subject_ref": blocker.subject_ref,
+        "blocker_type": blocker.blocker_type,
+        "summary": blocker.summary,
+        "details": blocker.details or {},
+        "created_at": blocker.created_at,
+    }
 
 
 def _possible_roles_for_entity(entity: HomeGraphEntity) -> list[dict]:

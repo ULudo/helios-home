@@ -9,6 +9,7 @@ description = "Helios Home MVP local runtime for energy-device discovery and int
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+  "cryptography>=41,<46",
   "cvxpy>=1.6,<2.0",
   "eebus-sdk @ git+https://github.com/ULudo/eebus-sdk.git@48c854639ebd70b7250eb7c8273bcd9dad714351",
   "fastapi>=0.115,<1.0",

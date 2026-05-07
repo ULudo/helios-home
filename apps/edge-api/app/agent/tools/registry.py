@@ -6,10 +6,12 @@ from uuid import uuid4
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel
 
+from app.agent.tools.commissioning import CommissioningGetLogTool, CommissioningStartOrContinueTool
 from app.agent.tools.device import DeviceAssessTool
 from app.agent.tools.discovery import DiscoveryInspectHomeNetworkTool
 from app.agent.tools.evidence import EvidenceRecordUserAssertionTool
 from app.agent.tools.home_graph import HomeGraphGetEntityDetailsTool, HomeGraphQueryTool
+from app.agent.tools.protocol import ConnectionInspectReadinessTool, EebusIdentityGetOrCreateTool, ProtocolListEndpointsTool
 from app.agent.tools.reference import HomeGraphResolveEntityReferenceTool
 from app.agent.tools.roles import RolePrepareBindingProposalTool
 from app.agent.tools.schemas import AgentTool, AgentToolContext, ToolExecutionResult, ToolSpecRead
@@ -59,6 +61,11 @@ def create_default_tool_registry() -> ToolRegistry:
             HomeGraphGetEntityDetailsTool(),
             HomeGraphResolveEntityReferenceTool(),
             EvidenceRecordUserAssertionTool(),
+            ProtocolListEndpointsTool(),
+            ConnectionInspectReadinessTool(),
+            EebusIdentityGetOrCreateTool(),
+            CommissioningStartOrContinueTool(),
+            CommissioningGetLogTool(),
             DiscoveryInspectHomeNetworkTool(),
             DeviceAssessTool(),
             RolePrepareBindingProposalTool(),
@@ -115,22 +122,25 @@ def execute_registered_tool(
     try:
         result = tool.execute(context, payload)
     except Exception as exc:
-        invocation.status = "failed"
-        invocation.error = str(exc)
-        invocation.finished_at = utcnow()
-        context.session.add(invocation)
-        context.session.add(
-            AuditEvent(
-                actor="agent",
-                action="fail_tool_invocation",
-                target_type="tool_invocation",
-                target_id=invocation.id,
-                summary=f"{tool.name} failed.",
-                details={"error": str(exc)},
-                created_at=utcnow(),
+        context.session.rollback()
+        failed_invocation = context.session.get(ToolInvocation, invocation.id)
+        if failed_invocation is not None:
+            failed_invocation.status = "failed"
+            failed_invocation.error = str(exc)
+            failed_invocation.finished_at = utcnow()
+            context.session.add(failed_invocation)
+            context.session.add(
+                AuditEvent(
+                    actor="agent",
+                    action="fail_tool_invocation",
+                    target_type="tool_invocation",
+                    target_id=failed_invocation.id,
+                    summary=f"{tool.name} failed.",
+                    details={"error": str(exc), "error_type": exc.__class__.__name__},
+                    created_at=utcnow(),
+                )
             )
-        )
-        context.session.commit()
+            context.session.commit()
         raise
 
     invocation.status = "completed"

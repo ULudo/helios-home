@@ -24,6 +24,14 @@ INTEGRATION_PATH_PROTOCOLS = {
 }
 
 
+def allowed_integration_paths_for_protocol(protocol: str) -> list[str]:
+    return sorted(
+        integration_path
+        for integration_path, protocols in INTEGRATION_PATH_PROTOCOLS.items()
+        if protocol in protocols
+    )
+
+
 def _find_existing_role_proposal(
     session: Session,
     *,

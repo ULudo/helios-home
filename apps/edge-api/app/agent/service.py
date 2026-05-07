@@ -57,7 +57,7 @@ from app.db.models import (
 from app.db.session import get_session_factory
 from app.domain.schemas import DebugCaseRead
 from app.hems.bindings import list_system_bindings
-from app.home_graph.service import query_entities, sync_inventory_to_home_graph
+from app.home_graph.service import canonical_inventory_summary, sync_inventory_to_home_graph
 from app.services.dashboard import build_overview
 from app.services.knowledge import get_debug_case
 from app.services.network_scope import list_reachable_subnets
@@ -335,12 +335,7 @@ def _context_snapshot(
         for device_id in asset.device_ids or []:
             asset_id_by_device_id.setdefault(device_id, asset.id)
     bindings = list_system_bindings(session, confirmed_only=True)
-    home_graph = query_entities(
-        session,
-        entity_types=["device", "candidate", "role_candidate"],
-        include_evidence=False,
-        include_relationships=True,
-    )
+    inventory_summary = canonical_inventory_summary(session, site.id)
     role_candidates = accepted_role_candidates(session, site_id=site.id)
     active_tasks = session.scalars(
         select(AgentTask)
@@ -361,7 +356,6 @@ def _context_snapshot(
     return {
         "site_id": site.id,
         "input_context": input_context or {},
-        "available_tools": available_tools or [],
         "current_subnets": [entry.strip() for entry in site.local_subnet.split(",") if entry.strip()],
         "reachable_subnets": [
             {"cidr": option.cidr, "interface": option.interface, "label": option.label}
@@ -369,6 +363,7 @@ def _context_snapshot(
         ],
         "devices": [
             {
+                "ref": f"device:{device.id}",
                 "id": device.id,
                 "asset_id": asset_id_by_device_id.get(device.id),
                 "name": device.name,
@@ -379,10 +374,6 @@ def _context_snapshot(
                 "protocols": list(device.protocols),
                 "capabilities": device.capabilities.model_dump(),
                 "telemetry_keys": sorted(device.telemetry.keys()),
-                "telemetry_preview": {
-                    key: value
-                    for key, value in list(device.telemetry.items())[:6]
-                },
             }
             for device in overview.devices
         ],
@@ -409,8 +400,14 @@ def _context_snapshot(
             }
             for message in thread.messages[-6:]
         ],
-        "home_graph_entities": home_graph.get("entities", []),
-        "home_graph_relationships": home_graph.get("relationships", []),
+        "home_inventory": inventory_summary,
+        "home_graph_summary": {
+            "canonical_device_count": inventory_summary["canonical_device_count"],
+            "canonical_device_counts_by_type": inventory_summary["canonical_device_counts_by_type"],
+            "raw_artifact_counts": inventory_summary["raw_artifact_counts"],
+            "details_available_via": ["home_graph.query", "home_graph.get_entity_details"],
+            "normal_query_scope": "canonical_devices",
+        },
         "recent_candidate_sets": recent_candidate_sets,
         "accepted_role_candidates": role_candidates,
         "active_tasks": [

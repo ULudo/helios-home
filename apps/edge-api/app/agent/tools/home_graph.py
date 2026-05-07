@@ -26,13 +26,16 @@ class HomeGraphQueryTool:
         sync_inventory_to_home_graph(context.session, context.site.id)
         entity_types = payload.entity_types
         if payload.role_hypothesis and not entity_types:
-            entity_types = ["device", "candidate", "role_candidate"]
+            entity_types = ["device"] if payload.scope == "canonical_devices" else ["device", "candidate", "role_candidate"]
         result = query_entities(
             context.session,
             text=payload.text,
             entity_refs=payload.entity_refs,
             entity_types=entity_types,
+            scope=payload.scope,
             include_evidence=payload.include_evidence,
+            include_relationships=payload.include_relationships,
+            text_match_mode="rank" if payload.role_hypothesis else "filter",
         )
         if payload.role_hypothesis:
             role_types = _semantic_types_for_role(payload.role_hypothesis)
@@ -47,8 +50,6 @@ class HomeGraphQueryTool:
             ]
             result["role_hypothesis"] = payload.role_hypothesis
             result["matching_entities"] = result["entities"]
-        if not payload.include_relationships:
-            result["relationships"] = []
         return ToolExecutionResult(output=result)
 
 

@@ -575,6 +575,40 @@ class ProtocolEndpoint(Base):
     )
 
 
+class EebusLocalIdentity(Base):
+    __tablename__ = "eebus_local_identities"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"), unique=True)
+    common_name: Mapped[str] = mapped_column(String(180), default="Helios Home HEMS")
+    ski: Mapped[str] = mapped_column(String(80))
+    certificate_pem: Mapped[str] = mapped_column(Text, default="")
+    private_key_pem: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        onupdate=utcnow,
+    )
+
+
+class ProtocolDiagnosticRun(Base):
+    __tablename__ = "protocol_diagnostic_runs"
+
+    id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"))
+    thread_id: Mapped[str | None] = mapped_column(ForeignKey("conversation_threads.id"), nullable=True)
+    turn_id: Mapped[str | None] = mapped_column(ForeignKey("conversation_turns.id"), nullable=True)
+    entity_ref: Mapped[str] = mapped_column(String(96), default="")
+    endpoint_ref: Mapped[str] = mapped_column(String(96), default="")
+    protocol: Mapped[str] = mapped_column(String(80), default="")
+    integration_path: Mapped[str] = mapped_column(String(80), default="")
+    status: Mapped[str] = mapped_column(String(60), default="completed")
+    log_entries: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    result: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class HomeGraphEvidence(Base):
     __tablename__ = "home_graph_evidence"
 

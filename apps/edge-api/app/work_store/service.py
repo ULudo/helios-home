@@ -82,6 +82,38 @@ def add_task_step(
     return step
 
 
+def complete_task_step(
+    session: Session,
+    step: TaskStep,
+    *,
+    summary: str = "",
+    result: dict | None = None,
+) -> TaskStep:
+    step.status = "completed"
+    if summary:
+        step.summary = summary
+    if result is not None:
+        step.result = result
+    step.updated_at = utcnow()
+    session.add(step)
+    return step
+
+
+def fail_task_step(
+    session: Session,
+    step: TaskStep,
+    *,
+    summary: str,
+    result: dict | None = None,
+) -> TaskStep:
+    step.status = "failed"
+    step.summary = summary
+    step.result = result or {}
+    step.updated_at = utcnow()
+    session.add(step)
+    return step
+
+
 def complete_task(session: Session, task: AgentTask, *, summary: str = "") -> AgentTask:
     task.status = "completed"
     task.completed_at = utcnow()
@@ -89,6 +121,28 @@ def complete_task(session: Session, task: AgentTask, *, summary: str = "") -> Ag
     context = dict(task.context or {})
     if summary:
         context["completion_summary"] = summary
+    task.context = context
+    session.add(task)
+    return task
+
+
+def fail_task(
+    session: Session,
+    task: AgentTask,
+    *,
+    summary: str,
+    error_type: str = "",
+    error_message: str = "",
+) -> AgentTask:
+    task.status = "failed"
+    task.completed_at = utcnow()
+    task.updated_at = utcnow()
+    context = dict(task.context or {})
+    context["failure_summary"] = summary
+    if error_type:
+        context["error_type"] = error_type
+    if error_message:
+        context["error_message"] = error_message
     task.context = context
     session.add(task)
     return task

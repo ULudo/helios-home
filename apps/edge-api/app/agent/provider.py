@@ -149,6 +149,8 @@ class LLMModelProvider:
             "You are the configured Helios Home model operator.",
             "Helios-Home is the command center: it validates tools, executes deterministic workflows, persists state, and enforces safety.",
             "You own semantic interpretation, follow-up/reference resolution strategy, tool choice, evaluation of observations, planning, and the natural final answer.",
+            "Use Helios UI tools when they help your communication. If visual grounding would make a device, role, proposal, task, or blocker clearer to the user, focus the relevant UI entities before or alongside your answer.",
+            "Keep operational answers concise by default. Prefer the current status, concrete cause or blocker, and next executable step over broad inventories or menus. Expand when the user asks for detail.",
             "Never claim commissioning, telemetry validation, control, physical binding, or user approval unless it is explicitly present in tool observations or WorkStore/HomeGraph state.",
             "The backend will reject unsafe or unavailable tool calls. The model must not ask tools to approve user decisions or apply physical control.",
             final_constraint,

@@ -8,7 +8,15 @@ from app.agent.tools.schemas import (
     show_task_event,
     view_open_event,
 )
-from app.work_store.service import add_task_step, complete_task, create_task
+from app.work_store.service import (
+    add_blocker,
+    add_task_step,
+    complete_task,
+    complete_task_step,
+    create_task,
+    fail_task,
+    fail_task_step,
+)
 from app.workflows.discovery import inspect_home_network
 
 
@@ -35,7 +43,7 @@ class DiscoveryInspectHomeNetworkTool:
             title="Inspect home network",
             goal=payload.reason or "Discover devices and endpoints in the configured local home network.",
         )
-        add_task_step(
+        run_step = add_task_step(
             context.session,
             task_id=task.id,
             step_key="run_discovery",
@@ -43,8 +51,50 @@ class DiscoveryInspectHomeNetworkTool:
             status="running",
         )
         context.session.commit()
+        task_id = task.id
+        run_step_id = run_step.id
 
-        result = inspect_home_network(context.session)
+        try:
+            result = inspect_home_network(context.session)
+        except Exception as exc:
+            context.session.rollback()
+            failed_task = context.session.get(type(task), task_id)
+            failed_step = context.session.get(type(run_step), run_step_id)
+            error_result = {
+                "error_type": exc.__class__.__name__,
+                "message": str(exc),
+            }
+            if failed_step is not None:
+                fail_task_step(
+                    context.session,
+                    failed_step,
+                    summary="discovery_failed",
+                    result=error_result,
+                )
+            if failed_task is not None:
+                fail_task(
+                    context.session,
+                    failed_task,
+                    summary="discovery_failed",
+                    error_type=exc.__class__.__name__,
+                    error_message=str(exc),
+                )
+            add_blocker(
+                context.session,
+                task_id=task_id,
+                blocker_type="discovery_failed",
+                summary="Discovery failed before it could complete.",
+                details=error_result,
+            )
+            context.session.commit()
+            raise
+
+        complete_task_step(
+            context.session,
+            run_step,
+            summary="discovery_completed",
+            result={"run_ref": result["run"].get("id")},
+        )
         entity_refs = [
             ref
             for ref in result["entity_refs"]
