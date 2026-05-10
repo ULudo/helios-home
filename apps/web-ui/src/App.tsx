@@ -1,4 +1,14 @@
-import { Fragment, useEffect, useMemo, useReducer, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
+import {
+  Fragment,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+  type FormEvent,
+  type KeyboardEvent,
+} from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
@@ -38,6 +48,18 @@ type CanvasPoint = {
   y: number;
 };
 
+type CanvasSize = {
+  width: number;
+  height: number;
+};
+
+type CanvasRect = {
+  left: number;
+  right: number;
+  top: number;
+  bottom: number;
+};
+
 type ChatTaskView = {
   id: string;
   title: string;
@@ -57,6 +79,16 @@ const NAV_ITEMS: NavItem[] = [
   { view: "overview", label: "Overview", icon: "overview" },
   { view: "settings", label: "Settings", icon: "settings" },
 ];
+
+const DEVICE_CARD_WIDTH = 180;
+const DEVICE_CARD_HEIGHT = 112;
+const HOME_CARD_WIDTH = 220;
+const HOME_CARD_HEIGHT = 200;
+const CANVAS_PADDING = 36;
+const LAYOUT_GAP = 26;
+const MAX_CANVAS_RING_RADIUS = 540;
+const MIN_CANVAS_WORKSPACE_WIDTH = 1400;
+const MIN_CANVAS_WORKSPACE_HEIGHT = 1120;
 
 function humanize(value: string): string {
   return value.split("_").join(" ");
@@ -324,22 +356,230 @@ function taskFromRead(task: AgentTaskRead): ChatTaskView {
   };
 }
 
-function buildCanvasPoints(count: number): CanvasPoint[] {
+function rectFromCenter(point: CanvasPoint, width: number, height: number, gap = 0): CanvasRect {
+  return {
+    left: point.x - width / 2 - gap / 2,
+    right: point.x + width / 2 + gap / 2,
+    top: point.y - height / 2 - gap / 2,
+    bottom: point.y + height / 2 + gap / 2,
+  };
+}
+
+function rectsOverlap(a: CanvasRect, b: CanvasRect): boolean {
+  return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+}
+
+function rectWithinBounds(rect: CanvasRect, bounds: CanvasRect): boolean {
+  return rect.left >= bounds.left && rect.right <= bounds.right && rect.top >= bounds.top && rect.bottom <= bounds.bottom;
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function evenlySpacedRingPoints(count: number, radiusX: number, radiusY: number, phase = -Math.PI / 2): CanvasPoint[] {
+  return Array.from({ length: count }, (_, index) => {
+    const angle = phase + (index * Math.PI * 2) / count;
+    return {
+      x: Math.cos(angle) * radiusX,
+      y: Math.sin(angle) * radiusY,
+    };
+  });
+}
+
+function acceptedRectsForPoints(points: CanvasPoint[], bounds: CanvasRect, occupiedRects: CanvasRect[]): CanvasRect[] | null {
+  const nextRects: CanvasRect[] = [];
+  for (const point of points) {
+    const rect = rectFromCenter(point, DEVICE_CARD_WIDTH, DEVICE_CARD_HEIGHT, LAYOUT_GAP);
+    if (!rectWithinBounds(rect, bounds)) {
+      return null;
+    }
+    if ([...occupiedRects, ...nextRects].some((occupied) => rectsOverlap(rect, occupied))) {
+      return null;
+    }
+    nextRects.push(rect);
+  }
+  return nextRects;
+}
+
+function ringPhaseCandidates(count: number, phaseShift = 0): number[] {
+  if (count <= 1) {
+    return [-Math.PI / 2 + phaseShift];
+  }
+
+  const slotAngle = (Math.PI * 2) / count;
+  const cardinalPhase = -Math.PI / 2 + phaseShift;
+  const basePhase = cardinalPhase - slotAngle / 2;
+  const phaseSteps = Math.max(1, Math.min(16, count * 2));
+  const phases = [cardinalPhase, basePhase];
+  for (let index = 0; index < phaseSteps; index += 1) {
+    phases.push(basePhase + (slotAngle * index) / phaseSteps);
+  }
+  return phases;
+}
+
+function acceptedRingPoints(
+  count: number,
+  bounds: CanvasRect,
+  occupiedRects: CanvasRect[],
+  radiusX: number,
+  radiusY: number,
+  phaseShift = 0,
+): CanvasPoint[] | null {
+  for (const phase of ringPhaseCandidates(count, phaseShift)) {
+    const points = evenlySpacedRingPoints(count, radiusX, radiusY, phase);
+    if (acceptedRectsForPoints(points, bounds, occupiedRects)) {
+      return points;
+    }
+  }
+  return null;
+}
+
+function buildOuterFirstRingPoints(
+  count: number,
+  bounds: CanvasRect,
+  occupiedRects: CanvasRect[],
+  firstRadiusX: number,
+  firstRadiusY: number,
+  maxRadiusX: number,
+  maxRadiusY: number,
+): CanvasPoint[] | null {
+  const outerRadiusX = clampNumber(maxRadiusX * 0.94, firstRadiusX, maxRadiusX);
+  const outerRadiusY = clampNumber(maxRadiusY * 0.94, firstRadiusY, maxRadiusY);
+  const innerRadiusX = clampNumber(firstRadiusX + (outerRadiusX - firstRadiusX) * 0.38, firstRadiusX, outerRadiusX);
+  const innerRadiusY = clampNumber(firstRadiusY + (outerRadiusY - firstRadiusY) * 0.38, firstRadiusY, outerRadiusY);
+
+  const allOuterPoints = acceptedRingPoints(
+    count,
+    bounds,
+    occupiedRects,
+    outerRadiusX,
+    outerRadiusY,
+  );
+  if (allOuterPoints) {
+    return allOuterPoints;
+  }
+
+  for (let outerCount = count - 1; outerCount >= 1; outerCount -= 1) {
+    const outerPoints = acceptedRingPoints(
+      outerCount,
+      bounds,
+      occupiedRects,
+      outerRadiusX,
+      outerRadiusY,
+    );
+    if (!outerPoints) {
+      continue;
+    }
+
+    const outerRects = acceptedRectsForPoints(outerPoints, bounds, occupiedRects);
+    if (!outerRects) {
+      continue;
+    }
+
+    const innerCount = count - outerCount;
+    const innerPoints = acceptedRingPoints(
+      innerCount,
+      bounds,
+      [...occupiedRects, ...outerRects],
+      innerRadiusX,
+      innerRadiusY,
+      Math.PI / Math.max(1, innerCount),
+    );
+    if (!innerPoints) {
+      continue;
+    }
+
+    const innerRects = acceptedRectsForPoints(innerPoints, bounds, [...occupiedRects, ...outerRects]);
+    if (innerRects) {
+      return [...outerPoints, ...innerPoints];
+    }
+  }
+
+  const slots: CanvasPoint[] = [];
+  const workingOccupiedRects = [...occupiedRects];
+  const radii = [
+    { x: outerRadiusX, y: outerRadiusY },
+    { x: innerRadiusX, y: innerRadiusY },
+  ];
+
+  for (const [ringIndex, radius] of radii.entries()) {
+    const remaining = count - slots.length;
+    if (remaining <= 0) {
+      break;
+    }
+
+    const points = acceptedRingPoints(
+      remaining,
+      bounds,
+      workingOccupiedRects,
+      radius.x,
+      radius.y,
+      ringIndex === 0 ? 0 : Math.PI / Math.max(1, remaining),
+    );
+
+    if (!points) {
+      continue;
+    }
+
+    const rects = acceptedRectsForPoints(points, bounds, workingOccupiedRects);
+    if (rects) {
+      slots.push(...points);
+      workingOccupiedRects.push(...rects);
+    }
+  }
+
+  return slots.length === count ? slots : null;
+}
+
+function buildCanvasWorkspaceSize(canvasSize: CanvasSize): CanvasSize {
+  return {
+    width: Math.max(canvasSize.width || 1200, MIN_CANVAS_WORKSPACE_WIDTH),
+    height: Math.max(canvasSize.height || 760, MIN_CANVAS_WORKSPACE_HEIGHT),
+  };
+}
+
+function buildCanvasPoints(count: number, canvasSize: CanvasSize): CanvasPoint[] {
   if (count <= 0) {
     return [];
   }
 
-  const baseRadiusX = count <= 4 ? 260 : count <= 8 ? 300 : 340;
-  const baseRadiusY = count <= 4 ? 190 : count <= 8 ? 230 : 270;
+  const { width, height } = buildCanvasWorkspaceSize(canvasSize);
+  const bounds: CanvasRect = {
+    left: -width / 2 + CANVAS_PADDING,
+    right: width / 2 - CANVAS_PADDING,
+    top: -height / 2 + CANVAS_PADDING,
+    bottom: height / 2 - CANVAS_PADDING,
+  };
+  const homeRect = rectFromCenter({ x: 0, y: 0 }, HOME_CARD_WIDTH, HOME_CARD_HEIGHT, LAYOUT_GAP);
+  const maxRadiusX = Math.max(DEVICE_CARD_WIDTH / 2, width / 2 - CANVAS_PADDING - DEVICE_CARD_WIDTH / 2);
+  const maxRadiusY = Math.max(DEVICE_CARD_HEIGHT / 2, height / 2 - CANVAS_PADDING - DEVICE_CARD_HEIGHT / 2);
+  const firstRadiusX = HOME_CARD_WIDTH / 2 + DEVICE_CARD_WIDTH / 2 + LAYOUT_GAP + 18;
+  const firstRadiusY = HOME_CARD_HEIGHT / 2 + DEVICE_CARD_HEIGHT / 2 + LAYOUT_GAP + 18;
+  const plannedMaxRadiusX = Math.max(Math.min(maxRadiusX, MAX_CANVAS_RING_RADIUS), Math.min(firstRadiusX, maxRadiusX));
+  const plannedMaxRadiusY = Math.max(Math.min(maxRadiusY, MAX_CANVAS_RING_RADIUS), Math.min(firstRadiusY, maxRadiusY));
+  const occupiedRects: CanvasRect[] = [homeRect];
 
-  return Array.from({ length: count }, (_, index) => {
-    const angle = (-Math.PI / 2) + (index * (Math.PI * 2)) / count;
-    const ringOffset = count > 8 && index % 2 === 0 ? 26 : 0;
-    return {
-      x: Math.cos(angle) * (baseRadiusX + ringOffset),
-      y: Math.sin(angle) * (baseRadiusY + ringOffset),
-    };
-  });
+  const plannedRing = buildOuterFirstRingPoints(
+    count,
+    bounds,
+    occupiedRects,
+    Math.min(firstRadiusX, maxRadiusX),
+    Math.min(firstRadiusY, maxRadiusY),
+    plannedMaxRadiusX,
+    plannedMaxRadiusY,
+  );
+  if (plannedRing) {
+    return plannedRing;
+  }
+
+  return acceptedRingPoints(
+    count,
+    bounds,
+    occupiedRects,
+    Math.min(plannedMaxRadiusX, plannedMaxRadiusY),
+    Math.min(plannedMaxRadiusX, plannedMaxRadiusY),
+  ) ?? evenlySpacedRingPoints(count, plannedMaxRadiusX, plannedMaxRadiusY, 0);
 }
 
 function severityTone(severity: "info" | "caution" | "critical"): string {
@@ -537,10 +777,12 @@ export default function App() {
     baseUrl: "",
     apiKey: "",
   });
+  const [canvasSize, setCanvasSize] = useState<CanvasSize>({ width: 0, height: 0 });
   const [uiState, dispatchUiState] = useReducer(uiStateReducer, undefined, createInitialUIState);
 
   const streamRef = useRef<EventSource | null>(null);
   const timelineRef = useRef<HTMLDivElement | null>(null);
+  const canvasRef = useRef<HTMLElement | null>(null);
 
   const allDevices = overview?.devices ?? [];
   const inspectedDevice = useMemo(
@@ -575,7 +817,14 @@ export default function App() {
   }, [agentProviderConfig]);
 
   const currentScope = useMemo(() => parseConfiguredSubnets(overview?.site.local_subnet ?? ""), [overview?.site.local_subnet]);
-  const canvasPoints = useMemo(() => buildCanvasPoints(allDevices.length), [allDevices.length]);
+  const canvasWorkspaceSize = useMemo(
+    () => buildCanvasWorkspaceSize(canvasSize),
+    [canvasSize.height, canvasSize.width],
+  );
+  const canvasPoints = useMemo(
+    () => buildCanvasPoints(allDevices.length, canvasWorkspaceSize),
+    [allDevices.length, canvasWorkspaceSize],
+  );
   const currentView: NavView = uiState.currentView === "settings" ? "settings" : "overview";
   const unresolvedItems = thread?.setup_profile.unresolved_items ?? [];
   const confirmedSystems = thread?.setup_profile.confirmed_systems ?? [];
@@ -647,6 +896,49 @@ export default function App() {
     }
     timelineRef.current.scrollTop = timelineRef.current.scrollHeight;
   }, [activeTaskView, thread?.pending_proposals, timelineMessages]);
+
+  useLayoutEffect(() => {
+    const node = canvasRef.current;
+    if (!node) {
+      return;
+    }
+
+    const updateCanvasSize = () => {
+      const nextWidth = Math.round(node.clientWidth);
+      const nextHeight = Math.round(node.clientHeight);
+      setCanvasSize((current) =>
+        current.width === nextWidth && current.height === nextHeight
+          ? current
+          : { width: nextWidth, height: nextHeight },
+      );
+    };
+
+    updateCanvasSize();
+    const observer = new ResizeObserver(updateCanvasSize);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [currentView, loading]);
+
+  useLayoutEffect(() => {
+    const node = canvasRef.current;
+    if (!node || currentView !== "overview" || !canvasSize.width || !canvasSize.height) {
+      return;
+    }
+
+    const animationFrame = window.requestAnimationFrame(() => {
+      node.scrollLeft = Math.max(0, (canvasWorkspaceSize.width - node.clientWidth) / 2);
+      node.scrollTop = Math.max(0, (canvasWorkspaceSize.height - node.clientHeight) / 2);
+    });
+
+    return () => window.cancelAnimationFrame(animationFrame);
+  }, [
+    allDevices.length,
+    canvasSize.height,
+    canvasSize.width,
+    canvasWorkspaceSize.height,
+    canvasWorkspaceSize.width,
+    currentView,
+  ]);
 
   useEffect(() => {
     if (inspectedDeviceId && !allDevices.some((device) => device.id === inspectedDeviceId)) {
@@ -1405,93 +1697,104 @@ export default function App() {
     const discoveryRunning = busyAction === "run-discovery";
 
     return (
-      <section className="relative h-full min-h-0 overflow-hidden border border-[#d8dfea] bg-[linear-gradient(180deg,#ffffff_0%,#f8fbff_100%)] shadow-[0_24px_64px_rgba(15,23,42,0.08)]">
-        <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_46%,rgba(255,220,150,0.28),transparent_18%),radial-gradient(circle_at_18%_16%,rgba(210,223,242,0.34),transparent_24%),radial-gradient(circle_at_84%_18%,rgba(255,233,190,0.24),transparent_22%)]" />
+      <section
+        ref={canvasRef}
+        className="subtle-scrollbar relative h-full min-h-0 overflow-auto border border-[#d8dfea] bg-[linear-gradient(180deg,#ffffff_0%,#f8fbff_100%)] shadow-[0_24px_64px_rgba(15,23,42,0.08)]"
+      >
         {renderCanvasAlerts()}
 
-        <div className="absolute inset-0">
-          <button
-            type="button"
-            className="group absolute left-1/2 top-1/2 z-10 w-[220px] -translate-x-1/2 -translate-y-1/2 cursor-pointer rounded-[32px] border border-[#e5c88a] bg-[radial-gradient(circle_at_top,rgba(255,237,194,0.92),rgba(255,255,255,0.98)_62%)] px-6 py-7 text-center shadow-[0_28px_60px_rgba(212,163,74,0.18)] transition duration-200 hover:-translate-y-[calc(50%+2px)] hover:border-[#d08a11] hover:shadow-[0_32px_68px_rgba(212,163,74,0.24)] focus:outline-none focus:ring-4 focus:ring-[#f1d7a2]/50 disabled:cursor-wait"
-            onClick={() => void handleRunDiscovery()}
-            disabled={discoveryRunning}
-            aria-label={discoveryRunning ? "Discovery is running" : "Run discovery"}
-            title={discoveryRunning ? "Discovery is running" : "Run discovery"}
-          >
-            <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-[#d88b08] text-white shadow-[0_16px_30px_rgba(216,139,8,0.3)]">
-              {discoveryRunning ? (
-                <span className="h-7 w-7 animate-spin rounded-full border-2 border-white/35 border-t-white" />
-              ) : (
-                <span className="relative inline-block h-7 w-7">
-                  <AppIcon name="home" className="absolute inset-0 h-7 w-7 opacity-100 transition-opacity duration-150 group-hover:opacity-0" />
-                  <AppIcon name="discover" className="absolute inset-0 h-7 w-7 opacity-0 transition-opacity duration-150 group-hover:opacity-100" />
-                </span>
-              )}
-            </div>
-            <p className="m-0 mt-5 text-xl font-semibold text-slate-950">
-              {discoveryRunning ? (
-                "Discovering"
-              ) : (
-                <span className="relative inline-block min-w-[88px]">
-                  <span className="block opacity-100 transition-opacity duration-150 group-hover:opacity-0">Home</span>
-                  <span className="absolute inset-0 block opacity-0 transition-opacity duration-150 group-hover:opacity-100">
-                    Discover
+        <div
+          className="relative min-h-full min-w-full"
+          style={{ width: `${canvasWorkspaceSize.width}px`, height: `${canvasWorkspaceSize.height}px` }}
+        >
+          <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_46%,rgba(255,220,150,0.28),transparent_18%),radial-gradient(circle_at_18%_16%,rgba(210,223,242,0.34),transparent_24%),radial-gradient(circle_at_84%_18%,rgba(255,233,190,0.24),transparent_22%)]" />
+
+          <div className="absolute inset-0">
+            <button
+              type="button"
+              className="group absolute left-1/2 top-1/2 z-10 h-[200px] w-[220px] -translate-x-1/2 -translate-y-1/2 cursor-pointer rounded-[32px] border border-[#e5c88a] bg-[radial-gradient(circle_at_top,rgba(255,237,194,0.92),rgba(255,255,255,0.98)_62%)] px-6 py-7 text-center shadow-[0_28px_60px_rgba(212,163,74,0.18)] transition duration-200 hover:-translate-y-[calc(50%+2px)] hover:border-[#d08a11] hover:shadow-[0_32px_68px_rgba(212,163,74,0.24)] focus:outline-none focus:ring-4 focus:ring-[#f1d7a2]/50 disabled:cursor-wait"
+              onClick={() => void handleRunDiscovery()}
+              disabled={discoveryRunning}
+              aria-label={discoveryRunning ? "Discovery is running" : "Run discovery"}
+              title={discoveryRunning ? "Discovery is running" : "Run discovery"}
+            >
+              <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-[#d88b08] text-white shadow-[0_16px_30px_rgba(216,139,8,0.3)]">
+                {discoveryRunning ? (
+                  <span className="h-7 w-7 animate-spin rounded-full border-2 border-white/35 border-t-white" />
+                ) : (
+                  <span className="relative inline-block h-7 w-7">
+                    <AppIcon name="home" className="absolute inset-0 h-7 w-7 opacity-100 transition-opacity duration-150 group-hover:opacity-0" />
+                    <AppIcon name="discover" className="absolute inset-0 h-7 w-7 opacity-0 transition-opacity duration-150 group-hover:opacity-100" />
                   </span>
-                </span>
-              )}
-            </p>
-            <p className="m-0 mt-2 text-sm text-slate-600">
-              {discoveryRunning
-                ? "Scanning network"
-                : `${allDevices.length} detected device${allDevices.length === 1 ? "" : "s"}`}
-            </p>
-          </button>
+                )}
+              </div>
+              <p className="m-0 mt-5 text-xl font-semibold text-slate-950">
+                {discoveryRunning ? (
+                  "Discovering"
+                ) : (
+                  <span className="relative inline-block min-w-[88px]">
+                    <span className="block opacity-100 transition-opacity duration-150 group-hover:opacity-0">Home</span>
+                    <span className="absolute inset-0 block opacity-0 transition-opacity duration-150 group-hover:opacity-100">
+                      Discover
+                    </span>
+                  </span>
+                )}
+              </p>
+              <p className="m-0 mt-2 text-sm text-slate-600">
+                {discoveryRunning
+                  ? "Scanning network"
+                  : `${allDevices.length} detected device${allDevices.length === 1 ? "" : "s"}`}
+              </p>
+            </button>
 
-          {allDevices.map((device, index) => {
-            const point = canvasPoints[index] ?? { x: 0, y: 0 };
-            const selected = inspectedDeviceId === device.id;
-            const highlighted =
-              uiState.highlightedDeviceIds.includes(device.id) || uiState.selectedDeviceIds.includes(device.id);
-            const matchesFocus = deviceMatchesFocusedSystem(device, uiState.focusedSystem);
+            {allDevices.map((device, index) => {
+              const point = canvasPoints[index];
+              if (!point) {
+                return null;
+              }
+              const selected = inspectedDeviceId === device.id;
+              const highlighted =
+                uiState.highlightedDeviceIds.includes(device.id) || uiState.selectedDeviceIds.includes(device.id);
+              const matchesFocus = deviceMatchesFocusedSystem(device, uiState.focusedSystem);
 
-            return (
-              <button
-                key={device.id}
-                type="button"
-                title={deviceSpecTooltip(device)}
-                className={`absolute z-[5] w-[180px] -translate-x-1/2 -translate-y-1/2 rounded-[24px] border px-4 py-4 text-left transition duration-200 ${
-                  selected
-                    ? "border-[#d08a11] bg-[#fff9ee] shadow-[0_22px_40px_rgba(208,138,17,0.22)]"
-                    : highlighted
-                      ? "border-[#e7b14d] bg-[#fff9ef] shadow-[0_18px_34px_rgba(226,177,77,0.16)]"
-                      : "border-[#d8dfea] bg-white/96 shadow-[0_16px_30px_rgba(15,23,42,0.08)] hover:border-[#bcc9de] hover:shadow-[0_18px_34px_rgba(15,23,42,0.12)]"
-                } ${matchesFocus ? "opacity-100" : "opacity-50"}`}
-                style={{
-                  left: `calc(50% + ${point.x}px)`,
-                  top: `calc(50% + ${point.y}px)`,
-                }}
-                onClick={() => setInspectedDeviceId(device.id)}
-              >
-                <div className="flex items-start justify-between gap-3">
-                  <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-[14px] border border-[#f1d7a2] bg-[#fff7e8] text-[#c47d0f]">
-                    <AppIcon name={deviceIcon(device.device_type)} className="h-4 w-4" />
+              return (
+                <button
+                  key={device.id}
+                  type="button"
+                  title={deviceSpecTooltip(device)}
+                  className={`absolute z-[5] h-[112px] w-[180px] -translate-x-1/2 -translate-y-1/2 rounded-[24px] border px-4 py-4 text-left transition duration-200 ${
+                    selected
+                      ? "border-[#d08a11] bg-[#fff9ee] shadow-[0_22px_40px_rgba(208,138,17,0.22)]"
+                      : highlighted
+                        ? "border-[#e7b14d] bg-[#fff9ef] shadow-[0_18px_34px_rgba(226,177,77,0.16)]"
+                        : "border-[#d8dfea] bg-white/96 shadow-[0_16px_30px_rgba(15,23,42,0.08)] hover:border-[#bcc9de] hover:shadow-[0_18px_34px_rgba(15,23,42,0.12)]"
+                  } ${matchesFocus ? "opacity-100" : "opacity-50"}`}
+                  style={{
+                    left: `calc(50% + ${point.x}px)`,
+                    top: `calc(50% + ${point.y}px)`,
+                  }}
+                  onClick={() => setInspectedDeviceId(device.id)}
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-[14px] border border-[#f1d7a2] bg-[#fff7e8] text-[#c47d0f]">
+                      <AppIcon name={deviceIcon(device.device_type)} className="h-4 w-4" />
+                    </div>
+                    <div className="min-w-0">
+                      <p className="m-0 truncate text-sm font-semibold text-slate-950" title={device.name}>
+                        {device.name}
+                      </p>
+                      <p className="m-0 mt-1 truncate text-xs text-slate-500">
+                        {device.manufacturer}
+                      </p>
+                    </div>
                   </div>
-                  <div className="min-w-0">
-                    <p className="m-0 truncate text-sm font-semibold text-slate-950" title={device.name}>
-                      {device.name}
-                    </p>
-                    <p className="m-0 mt-1 truncate text-xs text-slate-500">
-                      {device.manufacturer}
-                    </p>
+                  <div className="mt-4 flex items-center justify-between gap-3">
+                    <span className="truncate text-xs text-slate-600">{deviceTelemetrySummary(device)}</span>
                   </div>
-                </div>
-                <div className="mt-4 flex items-center justify-between gap-3">
-                  <span className="truncate text-xs text-slate-600">{deviceTelemetrySummary(device)}</span>
-                </div>
-              </button>
-            );
-          })}
-
+                </button>
+              );
+            })}
+          </div>
         </div>
 
         {inspectedDevice ? renderDeviceOverlay(inspectedDevice) : null}
