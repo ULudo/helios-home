@@ -126,6 +126,35 @@ select {
     background: transparent;
   }
 
+  .hh-data-link {
+    stroke: rgba(216, 139, 8, 0.26);
+    stroke-linecap: round;
+    stroke-width: 2;
+    vector-effect: non-scaling-stroke;
+  }
+
+  .hh-data-bubble {
+    fill: url("#hemsDataBubbleGradient");
+    opacity: 0.94;
+    pointer-events: none;
+    transform-box: fill-box;
+    transform-origin: center;
+  }
+
+  .hh-data-link-label rect {
+    fill: rgba(255, 249, 238, 0.9);
+    stroke: rgba(216, 139, 8, 0.2);
+    stroke-width: 1;
+    vector-effect: non-scaling-stroke;
+  }
+
+  .hh-data-link-label text {
+    fill: #9a6208;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0;
+  }
+
   .message-markdown p,
   .message-markdown ul,
   .message-markdown ol {
@@ -161,6 +190,12 @@ select {
     text-underline-offset: 3px;
     color: color-mix(in srgb, var(--hh-accent) 76%, #8b5a16);
     text-decoration-color: rgba(199, 133, 35, 0.32);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hh-data-bubble {
+    display: none;
   }
 }
 

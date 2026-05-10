@@ -60,6 +60,14 @@ type CanvasRect = {
   bottom: number;
 };
 
+type CanvasConnectionLine = {
+  id: string;
+  from: CanvasPoint;
+  to: CanvasPoint;
+  label: string;
+  labelAt: CanvasPoint;
+};
+
 type ChatTaskView = {
   id: string;
   title: string;
@@ -582,6 +590,63 @@ function buildCanvasPoints(count: number, canvasSize: CanvasSize): CanvasPoint[]
   ) ?? evenlySpacedRingPoints(count, plannedMaxRadiusX, plannedMaxRadiusY, 0);
 }
 
+function connectionProtocolLabel(device: DeviceRead): string {
+  const protocol = device.protocols.find((entry) => entry !== "mdns") ?? device.protocols[0] ?? "linked";
+  const labels: Record<string, string> = {
+    eebus_ship: "EEBus",
+    http_local: "HTTP",
+    mdns: "mDNS",
+    modbus_tcp: "Modbus",
+    mqtt: "MQTT",
+  };
+  return labels[protocol] ?? humanize(protocol);
+}
+
+function canvasConnectionLine(device: DeviceRead, point: CanvasPoint): CanvasConnectionLine | null {
+  const length = Math.hypot(point.x, point.y);
+  if (length <= HOME_CARD_WIDTH / 2 + DEVICE_CARD_WIDTH / 2) {
+    return null;
+  }
+
+  return {
+    id: device.id,
+    from: { x: 0, y: 0 },
+    to: point,
+    label: connectionProtocolLabel(device),
+    labelAt: {
+      x: point.x * 0.62,
+      y: point.y * 0.62,
+    },
+  };
+}
+
+function deviceHasHemsConnection(device: DeviceRead): boolean {
+  const statusTags = new Set(device.status_tags ?? []);
+  return (
+    statusTags.has("connected") ||
+    ["connected", "monitorable", "controllable", "optimizable"].includes(device.primary_status) ||
+    device.capabilities.monitorable ||
+    device.capabilities.controllable ||
+    device.capabilities.optimizable
+  );
+}
+
+function seededUnitInterval(seed: string): number {
+  let hash = 2166136261;
+  for (let index = 0; index < seed.length; index += 1) {
+    hash ^= seed.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0) / 4294967295;
+}
+
+function dataBubbleBegin(lineId: string, direction: "inbound" | "outbound", index: number): string {
+  const cycleSeconds = 9.6;
+  const laneOffset = index * (cycleSeconds / 2);
+  const jitter = seededUnitInterval(`${lineId}:${direction}:${index}`) * cycleSeconds;
+  return `-${((laneOffset + jitter) % cycleSeconds).toFixed(2)}s`;
+}
+
 function severityTone(severity: "info" | "caution" | "critical"): string {
   if (severity === "critical") {
     return "border-rose-200 bg-rose-50 text-rose-800";
@@ -824,6 +889,16 @@ export default function App() {
   const canvasPoints = useMemo(
     () => buildCanvasPoints(allDevices.length, canvasWorkspaceSize),
     [allDevices.length, canvasWorkspaceSize],
+  );
+  const connectedDeviceLines = useMemo(
+    () =>
+      allDevices
+        .map((device, index) => {
+          const point = canvasPoints[index];
+          return point && deviceHasHemsConnection(device) ? canvasConnectionLine(device, point) : null;
+        })
+        .filter((line): line is CanvasConnectionLine => line !== null),
+    [allDevices, canvasPoints],
   );
   const currentView: NavView = uiState.currentView === "settings" ? "settings" : "overview";
   const unresolvedItems = thread?.setup_profile.unresolved_items ?? [];
@@ -1708,6 +1783,63 @@ export default function App() {
           style={{ width: `${canvasWorkspaceSize.width}px`, height: `${canvasWorkspaceSize.height}px` }}
         >
           <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_46%,rgba(255,220,150,0.28),transparent_18%),radial-gradient(circle_at_18%_16%,rgba(210,223,242,0.34),transparent_24%),radial-gradient(circle_at_84%_18%,rgba(255,233,190,0.24),transparent_22%)]" />
+
+          {connectedDeviceLines.length > 0 ? (
+            <svg
+              className="pointer-events-none absolute inset-0 z-[2]"
+              viewBox={`${-canvasWorkspaceSize.width / 2} ${-canvasWorkspaceSize.height / 2} ${canvasWorkspaceSize.width} ${canvasWorkspaceSize.height}`}
+              preserveAspectRatio="none"
+              aria-hidden="true"
+            >
+              <defs>
+                <radialGradient id="hemsDataBubbleGradient" cx="50%" cy="50%" r="50%">
+                  <stop offset="0%" stopColor="#d88b08" stopOpacity="0.92" />
+                  <stop offset="58%" stopColor="#e5a62d" stopOpacity="0.58" />
+                  <stop offset="100%" stopColor="#f8dca2" stopOpacity="0.08" />
+                </radialGradient>
+              </defs>
+              {connectedDeviceLines.map((line) => (
+                <g key={line.id}>
+                  <line
+                    className="hh-data-link"
+                    x1={line.from.x}
+                    y1={line.from.y}
+                    x2={line.to.x}
+                    y2={line.to.y}
+                  />
+                  <g className="hh-data-link-label" transform={`translate(${line.labelAt.x} ${line.labelAt.y})`}>
+                    <rect
+                      x={-(Math.max(46, line.label.length * 7 + 18) / 2)}
+                      y="-11"
+                      width={Math.max(46, line.label.length * 7 + 18)}
+                      height="22"
+                      rx="11"
+                    />
+                    <text textAnchor="middle" dominantBaseline="middle">
+                      {line.label}
+                    </text>
+                  </g>
+                  {(["outbound", "inbound"] as const).flatMap((direction) =>
+                    [0, 1].map((index) => (
+                    <ellipse key={`${direction}-${index}`} className="hh-data-bubble" rx="11" ry="3.2">
+                      <animateMotion
+                        dur="9.6s"
+                        begin={dataBubbleBegin(line.id, direction, index)}
+                        repeatCount="indefinite"
+                        rotate="auto"
+                        path={
+                          direction === "outbound"
+                            ? `M ${line.from.x} ${line.from.y} L ${line.to.x} ${line.to.y}`
+                            : `M ${line.to.x} ${line.to.y} L ${line.from.x} ${line.from.y}`
+                        }
+                      />
+                    </ellipse>
+                    )),
+                  )}
+                </g>
+              ))}
+            </svg>
+          ) : null}
 
           <div className="absolute inset-0">
             <button

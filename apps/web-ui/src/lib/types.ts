@@ -29,6 +29,7 @@ export interface DeviceRead {
   firmware: string;
   device_type: string;
   primary_status: string;
+  status_tags: string[];
   protocols: string[];
   capabilities: CapabilityRead;
   telemetry: Record<string, string | number | boolean>;
