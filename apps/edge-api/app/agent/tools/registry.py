@@ -12,6 +12,7 @@ from app.agent.tools.device import DeviceAssessTool
 from app.agent.tools.discovery import DiscoveryInspectHomeNetworkTool
 from app.agent.tools.evidence import EvidenceRecordUserAssertionTool
 from app.agent.tools.home_graph import HomeGraphGetEntityDetailsTool, HomeGraphQueryTool
+from app.agent.tools.inventory import InventoryRemoveDeviceTool
 from app.agent.tools.protocol import ConnectionInspectReadinessTool, EebusIdentityGetOrCreateTool, ProtocolListEndpointsTool
 from app.agent.tools.reference import HomeGraphResolveEntityReferenceTool
 from app.agent.tools.roles import RolePrepareBindingProposalTool
@@ -65,6 +66,7 @@ def create_default_tool_registry() -> ToolRegistry:
             ProtocolListEndpointsTool(),
             ConnectionInspectReadinessTool(),
             ConnectionEstablishTool(),
+            InventoryRemoveDeviceTool(),
             EebusIdentityGetOrCreateTool(),
             CommissioningGetLogTool(),
             DiscoveryInspectHomeNetworkTool(),

@@ -23,6 +23,7 @@ export type AppIconName =
   | "chevron-left"
   | "chevron-right"
   | "link"
+  | "trash"
   | "x";
 
 type AppIconProps = SVGProps<SVGSVGElement> & {
@@ -194,6 +195,15 @@ export function AppIcon({ name, className, ...props }: AppIconProps) {
         <>
           <path d="M10 13a5 5 0 0 0 7.1 0l2-2a5 5 0 0 0-7.1-7.1l-1.1 1.1" />
           <path d="M14 11a5 5 0 0 0-7.1 0l-2 2a5 5 0 1 0 7.1 7.1l1.1-1.1" />
+        </>
+      ) : null}
+      {name === "trash" ? (
+        <>
+          <path d="M4 7h16" />
+          <path d="M10 11v6" />
+          <path d="M14 11v6" />
+          <path d="M6 7l1 14h10l1-14" />
+          <path d="M9 7V4h6v3" />
         </>
       ) : null}
       {name === "x" ? (

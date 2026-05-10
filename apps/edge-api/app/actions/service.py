@@ -16,6 +16,7 @@ from app.actions.schemas import (
 )
 from app.db.models import AgentTask, AuditEvent, Device, ProtocolDiagnosticRun, ProtocolEndpoint, Site, utcnow
 from app.home_graph.service import connection_facets_for_entity, resolve_entity, sync_inventory_to_home_graph
+from app.services.dashboard import remove_device_from_inventory
 from app.services.eebus_identity import read_eebus_local_identity
 from app.services.eebus_runtime import runtime_snapshot_for_endpoint
 from app.workflows.eebus_connection import EebusConnectionContext, establish_eebus_connection
@@ -123,6 +124,22 @@ def _execute_action(context: ActionContext, action_name: str, payload: dict[str,
     if action_name == "connection.get_options":
         options = get_connection_options(context.session, context.site, str(payload.get("device_id") or ""))
         return options.model_dump(mode="json"), []
+    if action_name == "inventory.remove_device":
+        device_id = str(payload.get("device_id") or "")
+        if not device_id:
+            raise ValueError("device_id is required.")
+        removed = remove_device_from_inventory(context.session, device_id, actor=context.actor)
+        if removed is None:
+            raise ValueError(f"Unknown device: {device_id}")
+        return (
+            {
+                "status": "removed",
+                "device_id": removed.id,
+                "device_name": removed.name,
+                "rediscovery_required": True,
+            },
+            [],
+        )
     if action_name == "ui.open_device_details":
         entity_ref = str(payload.get("entity_ref") or "")
         if not entity_ref:

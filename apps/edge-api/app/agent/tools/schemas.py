@@ -154,6 +154,11 @@ class ConnectionEstablishInput(BaseModel):
     reason: str = ""
 
 
+class InventoryRemoveDeviceInput(BaseModel):
+    device_id: str
+    reason: str = ""
+
+
 class CommissioningGetLogInput(BaseModel):
     entity_ref: str = ""
     diagnostic_run_refs: list[str] = Field(default_factory=list)

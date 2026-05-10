@@ -2,11 +2,26 @@ import pytest
 from sqlalchemy import select
 
 from app.core.config import get_settings
-from app.db.models import ProtocolEndpoint, Site
+from app.db.models import (
+    AgentTask,
+    Asset,
+    AuditEvent,
+    DeviceAssessment,
+    DeviceCandidate,
+    HemsSystemBinding,
+    HomeGraphEntity,
+    HomeGraphEvidence,
+    Proposal,
+    ProtocolDiagnosticRun,
+    ProtocolEndpoint,
+    Site,
+    UserDecisionRequest,
+    utcnow,
+)
 from app.db.seed import seed_default_site
 from app.db.session import get_engine, get_session_factory, init_database
 from app.home_graph.service import query_entities, sync_inventory_to_home_graph
-from app.services.dashboard import build_overview
+from app.services.dashboard import build_overview, remove_device_from_inventory
 from app.services.discovery import list_device_candidates, list_discovery_runs, run_discovery
 from app.services.discovery_blueprints import RawCandidate
 from app.services.eebus import EebusDiscoveryBatch
@@ -334,6 +349,112 @@ def test_discovery_rerun_preserves_materialized_devices_and_assets(tmp_path, mon
         assert len(overview.devices) == 3
         assert {device.id for device in overview.devices} == {device.id for device in first_overview.devices}
         assert len(list_device_candidates(session)) == 3
+    finally:
+        session.close()
+
+
+def test_remove_device_from_inventory_hides_device_until_rediscovery(tmp_path, monkeypatch):
+    session = _build_session(tmp_path, monkeypatch)
+    try:
+        _install_local_test_discovery(session, monkeypatch, candidates=[_local_http_candidate()])
+        run_discovery(session)
+        sync_inventory_to_home_graph(session)
+
+        device_id = "dev-local-http-shelly-3em-aa-bb"
+        device_ref = f"device:{device_id}"
+        endpoint = session.scalar(select(ProtocolEndpoint).where(ProtocolEndpoint.owner_ref == device_ref))
+        assert endpoint is not None
+
+        now = utcnow()
+        session.add_all(
+            [
+                HemsSystemBinding(
+                    id="binding-grid-meter",
+                    site_id=1,
+                    system_type="grid_meter",
+                    label="Grid Meter",
+                    device_id=device_id,
+                    status="confirmed",
+                ),
+                DeviceAssessment(
+                    id="assessment-grid-meter",
+                    site_id=1,
+                    subject_ref=device_ref,
+                    summary="Tentative grid meter.",
+                    possible_roles=[],
+                    evidence_refs=[],
+                ),
+                HomeGraphEvidence(
+                    id="evidence-grid-meter",
+                    site_id=1,
+                    subject_ref=device_ref,
+                    evidence_type="test",
+                    summary="Test evidence.",
+                ),
+                ProtocolDiagnosticRun(
+                    id="diagnostic-grid-meter",
+                    site_id=1,
+                    entity_ref=device_ref,
+                    endpoint_ref=endpoint.id,
+                    protocol=endpoint.protocol,
+                    integration_path="http_local",
+                    status="completed",
+                    created_at=now,
+                ),
+                AgentTask(
+                    id="task-grid-meter",
+                    site_id=1,
+                    task_type="commission_role_candidate",
+                    title="Commission grid meter",
+                    status="running",
+                    target_refs=[device_ref, endpoint.id],
+                ),
+                Proposal(
+                    id="proposal-grid-meter",
+                    site_id=1,
+                    task_id="task-grid-meter",
+                    proposal_type="role_binding",
+                    title="Bind grid meter",
+                    target_refs=[device_ref],
+                    status="awaiting_user_decision",
+                ),
+                UserDecisionRequest(
+                    id="decision-grid-meter",
+                    site_id=1,
+                    proposal_id="proposal-grid-meter",
+                    question="Bind grid meter?",
+                    status="pending",
+                ),
+            ]
+        )
+        session.commit()
+
+        removed = remove_device_from_inventory(session, device_id)
+
+        assert removed is not None
+        assert removed.id == device_id
+        assert device_id not in {device.id for device in build_overview(session).devices}
+        assert session.scalar(select(DeviceCandidate).where(DeviceCandidate.matched_device_id == device_id)) is None
+        assert session.scalar(select(Asset).where(Asset.device_ids.contains([device_id]))) is None
+        assert session.scalar(select(HemsSystemBinding).where(HemsSystemBinding.device_id == device_id)) is None
+        assert session.get(HomeGraphEntity, device_ref) is None
+        assert session.scalar(select(ProtocolEndpoint).where(ProtocolEndpoint.owner_ref == device_ref)) is None
+        assert session.scalar(select(HomeGraphEvidence).where(HomeGraphEvidence.subject_ref == device_ref)) is None
+        assert session.scalar(select(DeviceAssessment).where(DeviceAssessment.subject_ref == device_ref)) is None
+        assert session.get(ProtocolDiagnosticRun, "diagnostic-grid-meter") is None
+        assert session.get(AgentTask, "task-grid-meter").status == "cancelled"
+        assert session.get(Proposal, "proposal-grid-meter").status == "cancelled"
+        assert session.get(UserDecisionRequest, "decision-grid-meter").status == "cancelled"
+        assert session.scalar(
+            select(AuditEvent).where(
+                AuditEvent.action == "remove_device_from_inventory",
+                AuditEvent.target_id == device_id,
+            )
+        )
+
+        run_discovery(session)
+
+        assert device_id in {device.id for device in build_overview(session).devices}
     finally:
         session.close()
 

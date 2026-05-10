@@ -10,6 +10,7 @@ import type {
   AgentTurnEventRead,
   ConnectionOptionsRead,
   ConnectionStateRead,
+  DeviceRead,
   DiscoveryRunRead,
   HemsAssetRead,
   HemsPlanRead,
@@ -117,6 +118,7 @@ export const api = {
     });
     return request<ConnectionStateRead>(`/connections/state?${query.toString()}`);
   },
+  removeDevice: (deviceId: string) => request<DeviceRead>(`/devices/${deviceId}`, { method: "DELETE" }),
   getOverview: () => request<OverviewResponse>("/overview"),
   listReachableSubnets: () => request<ReachableSubnetRead[]>("/network/reachable-subnets"),
   runDiscovery: () => request<DiscoveryRunRead>("/discovery/runs", { method: "POST" }),

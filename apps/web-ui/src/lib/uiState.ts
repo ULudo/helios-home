@@ -59,6 +59,7 @@ export type UIStateAction =
   | { type: "set_view"; view: ViewKey }
   | { type: "toggle_view_lock" }
   | { type: "toggle_device_selection"; deviceId: string }
+  | { type: "remove_device_reference"; deviceId: string }
   | { type: "set_monitoring_metric"; metricKey: string }
   | { type: "set_time_range"; timeRange: TimeRange }
   | { type: "clear_explanation" };
@@ -212,6 +213,19 @@ export function uiStateReducer(state: UIState, action: UIStateAction): UIState {
       monitoring: {
         ...state.monitoring,
         deviceIds: selected,
+      },
+    };
+  }
+
+  if (action.type === "remove_device_reference") {
+    const removeRef = (entries: string[]) => entries.filter((entry) => entry !== action.deviceId);
+    return {
+      ...state,
+      selectedDeviceIds: removeRef(state.selectedDeviceIds),
+      highlightedDeviceIds: removeRef(state.highlightedDeviceIds),
+      monitoring: {
+        ...state.monitoring,
+        deviceIds: removeRef(state.monitoring.deviceIds),
       },
     };
   }

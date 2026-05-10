@@ -1443,6 +1443,42 @@ export default function App() {
     }
   }
 
+  async function handleRemoveDevice(device: DeviceRead) {
+    const confirmed = window.confirm(
+      `Remove ${device.name} from the current HEMS inventory? It can be added again by running discovery.`,
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    setBusyAction(`remove-device-${device.id}`);
+    setError(null);
+
+    try {
+      await api.removeDevice(device.id);
+      setInspectedDeviceId(null);
+      dispatchUiState({ type: "remove_device_reference", deviceId: device.id });
+      setSelectedEndpointRefs((current) => {
+        const nextRefs = { ...current };
+        delete nextRefs[device.id];
+        return nextRefs;
+      });
+      if (connectionOptions?.device_id === device.id) {
+        setConnectionOptions(null);
+      }
+      if (connectionOverlayTarget?.deviceId === device.id) {
+        setConnectionOverlayTarget(null);
+        setConnectionOverlayState(null);
+        setConnectionOverlayError(null);
+      }
+      await refreshAll();
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Unable to remove the device.");
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
   async function handleUseReachableNetworks() {
     if (reachableSubnets.length === 0) {
       return;
@@ -1526,6 +1562,16 @@ export default function App() {
               </div>
               <div className="flex shrink-0 items-center gap-3">
                 <StatusBadge status={device.primary_status} />
+                <button
+                  type="button"
+                  className="inline-flex h-10 items-center justify-center rounded-[10px] border border-rose-200 bg-rose-50 px-3 text-sm font-semibold text-rose-700 transition hover:bg-rose-100 disabled:cursor-not-allowed disabled:opacity-60"
+                  onClick={() => void handleRemoveDevice(device)}
+                  disabled={busyAction !== null}
+                  title="Remove device from HEMS inventory"
+                >
+                  <AppIcon name="trash" className="mr-2 h-4 w-4" />
+                  Remove
+                </button>
                 <button
                   type="button"
                   className="secondary-button h-10 w-10 px-0"

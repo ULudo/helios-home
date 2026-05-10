@@ -27,7 +27,7 @@ from app.agent.service import (
 from app.core.config import get_settings
 from app.db.models import Site
 from app.db.session import get_session
-from app.domain.schemas import DiscoveryRunRead, OverviewResponse, ReachableSubnetRead, SiteRead, SiteUpdate
+from app.domain.schemas import DeviceRead, DiscoveryRunRead, OverviewResponse, ReachableSubnetRead, SiteRead, SiteUpdate
 from app.hems.schemas import (
     EebusLoadPowerLimitCreate,
     EebusLoadPowerLimitDistributionRead,
@@ -47,7 +47,7 @@ from app.hems.service import (
     patch_hems_policy,
     run_hems_replan,
 )
-from app.services.dashboard import build_overview, update_site
+from app.services.dashboard import build_overview, remove_device_from_inventory, update_site
 from app.services.discovery import run_discovery
 from app.services.eebus import distribute_load_power_limit, list_eebus_ship_services
 from app.services.network_scope import list_reachable_subnets
@@ -86,6 +86,14 @@ def read_device_connection_options(device_id: str, session: Session = Depends(ge
         return get_connection_options(session, _get_site(session), device_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.delete("/devices/{device_id}", response_model=DeviceRead)
+def remove_device(device_id: str, session: Session = Depends(get_session)) -> DeviceRead:
+    removed = remove_device_from_inventory(session, device_id, actor="user")
+    if removed is None:
+        raise HTTPException(status_code=404, detail="Device not found.")
+    return removed
 
 
 @router.get("/connections/state", response_model=ConnectionStateRead)
