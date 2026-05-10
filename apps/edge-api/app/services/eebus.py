@@ -37,24 +37,6 @@ class EebusSdk:
     build_limit_payload: Any
 
 
-def _fallback_build_limit_payload(
-    *,
-    watts: int,
-    duration_seconds: int | None,
-    limit_id: int,
-    is_active: bool,
-) -> dict[str, Any]:
-    value = abs(watts) if limit_id == 0 else -abs(watts) if limit_id == 1 else watts
-    limit_data: dict[str, Any] = {
-        "limitId": limit_id,
-        "isLimitActive": is_active,
-        "value": {"number": value, "scale": 0},
-    }
-    if duration_seconds is not None:
-        limit_data["timePeriod"] = {"endTime": f"PT{duration_seconds}S"}
-    return {"loadControlLimitListData": {"loadControlLimitData": [limit_data]}}
-
-
 def _load_sdk() -> EebusSdk:
     try:
         package = import_module("eebus_sdk")
@@ -67,8 +49,8 @@ def _load_sdk() -> EebusSdk:
     try:
         load_power = import_module("eebus_sdk._load_power")
         build_limit_payload = load_power.build_limit_payload
-    except (AttributeError, ModuleNotFoundError):
-        build_limit_payload = _fallback_build_limit_payload
+    except (AttributeError, ModuleNotFoundError) as exc:
+        raise RuntimeError("The installed eebus-sdk is missing required LoadControl helpers.") from exc
 
     return EebusSdk(
         discover_ship_services=package.discover_ship_services,
@@ -288,11 +270,7 @@ def build_load_power_limit_payload(command: EebusLoadPowerLimitCreate) -> dict[s
     limit_watts = command.limit_watts
     if limit_watts is None:
         raise ValueError("EEBus load-power limit requires limit_watts.")
-    try:
-        builder = _load_sdk().build_limit_payload
-    except RuntimeError:
-        builder = _fallback_build_limit_payload
-    return builder(
+    return _load_sdk().build_limit_payload(
         watts=int(limit_watts),
         duration_seconds=command.duration_seconds,
         limit_id=limit_id,

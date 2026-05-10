@@ -14,6 +14,11 @@ import type {
   AgentProviderOptionRead,
   AgentTaskRead,
   AgentThreadRead,
+  AgentUiEvent,
+  ConnectionActionRef,
+  ConnectionEndpointOptionRead,
+  ConnectionOptionsRead,
+  ConnectionStateRead,
   DeviceRead,
   OverviewResponse,
   ReachableSubnetRead,
@@ -39,6 +44,13 @@ type ChatTaskView = {
   status: string;
   summary: string;
   blockers: Array<Pick<AgentBlockerRead, "id" | "summary" | "blocker_type">>;
+};
+
+type ConnectionOverlayTarget = {
+  entityRef: string;
+  endpointRef: string;
+  integrationPath: string;
+  deviceId?: string;
 };
 
 const NAV_ITEMS: NavItem[] = [
@@ -143,6 +155,64 @@ function deviceSpecTooltip(device: DeviceRead): string {
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+function deviceIdFromEntityRef(entityRef: string | null | undefined): string | null {
+  if (!entityRef?.startsWith("device:")) {
+    return null;
+  }
+  return entityRef.slice("device:".length) || null;
+}
+
+function endpointAddress(endpoint: ConnectionEndpointOptionRead | ConnectionStateRead): string {
+  return endpoint.host ? `${endpoint.host}${endpoint.port ? `:${endpoint.port}` : ""}` : "Unknown endpoint";
+}
+
+function connectionPhaseLabel(state: Pick<ConnectionStateRead, "phase" | "status"> | null | undefined): string {
+  if (!state) {
+    return "Not inspected";
+  }
+  return humanize(state.phase || state.status || "unknown");
+}
+
+function connectionActionLabel(state: ConnectionStateRead | null | undefined): string {
+  if (!state) {
+    return "Connect";
+  }
+  if (state.phase === "ship_ready") {
+    return "Refresh";
+  }
+  if (state.phase === "waiting_for_user_trust" || state.phase === "ship_failed" || state.phase === "waiting_for_ship_session") {
+    return "Continue";
+  }
+  return "Connect";
+}
+
+function stepStatusClass(status: unknown): string {
+  if (status === "completed" || status === "ready") {
+    return "border-emerald-200 bg-emerald-50 text-emerald-700";
+  }
+  if (status === "failed" || status === "error") {
+    return "border-red-200 bg-red-50 text-red-700";
+  }
+  if (status === "action_required" || status === "blocked") {
+    return "border-[#f1d7a2] bg-[#fff7e8] text-[#9c6410]";
+  }
+  return "border-[#d8dfea] bg-white text-slate-600";
+}
+
+function fieldFromRecord(record: Record<string, unknown> | null | undefined, key: string): string {
+  const value = record?.[key];
+  if (value === null || value === undefined) {
+    return "";
+  }
+  if (typeof value === "string") {
+    return value;
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  return "";
 }
 
 function deviceMatchesFocusedSystem(device: DeviceRead, systemType: string | null): boolean {
@@ -452,6 +522,13 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [navExpanded, setNavExpanded] = useState(false);
   const [inspectedDeviceId, setInspectedDeviceId] = useState<string | null>(null);
+  const [selectedEndpointRefs, setSelectedEndpointRefs] = useState<Record<string, string>>({});
+  const [connectionOptions, setConnectionOptions] = useState<ConnectionOptionsRead | null>(null);
+  const [connectionOptionsBusy, setConnectionOptionsBusy] = useState(false);
+  const [connectionOverlayTarget, setConnectionOverlayTarget] = useState<ConnectionOverlayTarget | null>(null);
+  const [connectionOverlayState, setConnectionOverlayState] = useState<ConnectionStateRead | null>(null);
+  const [connectionOverlayBusy, setConnectionOverlayBusy] = useState(false);
+  const [connectionOverlayError, setConnectionOverlayError] = useState<string | null>(null);
   const [activeTurnId, setActiveTurnId] = useState<string | null>(null);
   const [streamingAssistant, setStreamingAssistant] = useState<AgentMessageRead | null>(null);
   const [providerForm, setProviderForm] = useState({
@@ -577,6 +654,164 @@ export default function App() {
     }
   }, [allDevices, inspectedDeviceId]);
 
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadConnectionOptions() {
+      if (!inspectedDeviceId) {
+        setConnectionOptions(null);
+        setConnectionOptionsBusy(false);
+        return;
+      }
+
+      setConnectionOptionsBusy(true);
+      try {
+        const options = await api.getDeviceConnectionOptions(inspectedDeviceId);
+        if (!cancelled) {
+          setConnectionOptions(options);
+        }
+      } catch (requestError) {
+        if (!cancelled) {
+          setConnectionOptions(null);
+          setError(requestError instanceof Error ? requestError.message : "Unable to load connection options.");
+        }
+      } finally {
+        if (!cancelled) {
+          setConnectionOptionsBusy(false);
+        }
+      }
+    }
+
+    void loadConnectionOptions();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [inspectedDeviceId]);
+
+  async function refreshConnectionOptions(deviceId = inspectedDeviceId) {
+    if (!deviceId) {
+      setConnectionOptions(null);
+      return;
+    }
+
+    setConnectionOptionsBusy(true);
+    try {
+      const options = await api.getDeviceConnectionOptions(deviceId);
+      setConnectionOptions(options);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Unable to refresh connection options.");
+    } finally {
+      setConnectionOptionsBusy(false);
+    }
+  }
+
+  async function refreshConnectionOverlayState(target = connectionOverlayTarget) {
+    if (!target) {
+      return null;
+    }
+
+    setConnectionOverlayBusy(true);
+    setConnectionOverlayError(null);
+    try {
+      const state = await api.getConnectionState({
+        entity_ref: target.entityRef,
+        endpoint_ref: target.endpointRef,
+        integration_path: target.integrationPath,
+      });
+      setConnectionOverlayState(state);
+      return state;
+    } catch (requestError) {
+      const message = requestError instanceof Error ? requestError.message : "Unable to load connection state.";
+      setConnectionOverlayError(message);
+      return null;
+    } finally {
+      setConnectionOverlayBusy(false);
+    }
+  }
+
+  async function openConnectionOverlay(target: ConnectionOverlayTarget) {
+    const deviceId = target.deviceId ?? deviceIdFromEntityRef(target.entityRef) ?? undefined;
+    const nextTarget = { ...target, deviceId };
+    setConnectionOverlayTarget(nextTarget);
+    setConnectionOverlayState(null);
+    setConnectionOverlayError(null);
+    if (deviceId) {
+      setInspectedDeviceId(deviceId);
+    }
+    dispatchUiState({ type: "set_view", view: "overview" });
+    await refreshConnectionOverlayState(nextTarget);
+  }
+
+  async function executeConnectionAction(action: ConnectionActionRef, fallbackTarget: ConnectionOverlayTarget) {
+    setBusyAction("connection-action");
+    setConnectionOverlayBusy(true);
+    setConnectionOverlayError(null);
+    setConnectionOverlayTarget(fallbackTarget);
+    try {
+      const execution = await api.executeAction(action.name, { input: action.input });
+      applyWorkspaceUiEvents(execution.ui_events);
+
+      const endpoint = execution.output.endpoint;
+      const endpointRef =
+        endpoint && typeof endpoint === "object"
+          ? fieldFromRecord(endpoint as Record<string, unknown>, "endpoint_ref")
+          : fieldFromRecord(execution.output, "endpoint_ref");
+      const nextTarget: ConnectionOverlayTarget = {
+        entityRef: fieldFromRecord(execution.output, "entity_ref") || fallbackTarget.entityRef,
+        endpointRef: endpointRef || fallbackTarget.endpointRef,
+        integrationPath: fieldFromRecord(execution.output, "integration_path") || fallbackTarget.integrationPath,
+        deviceId: fallbackTarget.deviceId,
+      };
+      setConnectionOverlayTarget(nextTarget);
+      await refreshConnectionOverlayState(nextTarget);
+      await refreshConnectionOptions(nextTarget.deviceId);
+      await refreshAll();
+    } catch (requestError) {
+      setConnectionOverlayError(requestError instanceof Error ? requestError.message : "Unable to run connection action.");
+    } finally {
+      setBusyAction(null);
+      setConnectionOverlayBusy(false);
+    }
+  }
+
+  function applyWorkspaceUiEvents(input: unknown) {
+    if (!Array.isArray(input)) {
+      return;
+    }
+
+    for (const rawEvent of input) {
+      if (typeof rawEvent !== "object" || rawEvent === null) {
+        continue;
+      }
+      const event = rawEvent as AgentUiEvent;
+      if (event.event_type === "device.details.open") {
+        const deviceId = deviceIdFromEntityRef(event.payload.entity_ref);
+        if (deviceId) {
+          dispatchUiState({ type: "set_view", view: "overview" });
+          setInspectedDeviceId(deviceId);
+        }
+      }
+      if (event.event_type === "connection.overlay.open") {
+        void openConnectionOverlay({
+          entityRef: event.payload.entity_ref,
+          endpointRef: event.payload.endpoint_ref,
+          integrationPath: event.payload.integration_path,
+          deviceId: deviceIdFromEntityRef(event.payload.entity_ref) ?? undefined,
+        });
+      }
+    }
+  }
+
+  async function runConnectionAction() {
+    const action = connectionOverlayState?.connect_action;
+    if (!action || !connectionOverlayTarget) {
+      setConnectionOverlayError("No connection action is available for this endpoint.");
+      return;
+    }
+    await executeConnectionAction(action, connectionOverlayTarget);
+  }
+
   function shouldShowExplanationPopup(): boolean {
     return Boolean(uiState.explanation && uiState.explanation.severity !== "info");
   }
@@ -590,6 +825,7 @@ export default function App() {
           if (actions.length > 0) {
             dispatchUiState({ type: "apply_actions", actions, occurredAt: event.created_at });
           }
+          applyWorkspaceUiEvents(event.payload.events);
         }
 
         if (event.event_type === "assistant_delta") {
@@ -832,6 +1068,19 @@ export default function App() {
   }
 
   function renderDeviceOverlay(device: DeviceRead) {
+    const deviceConnectionOptions = connectionOptions?.device_id === device.id ? connectionOptions : null;
+    const endpoints = deviceConnectionOptions?.endpoints ?? [];
+    const selectedEndpoint = endpoints.find((endpoint) => endpoint.endpoint_ref === selectedEndpointRefs[device.id]) ?? endpoints[0] ?? null;
+    const selectedPath = selectedEndpoint?.allowed_integration_paths[0] ?? selectedEndpoint?.state.integration_path ?? "";
+    const selectedTarget: ConnectionOverlayTarget | null = selectedEndpoint
+      ? {
+          entityRef: selectedEndpoint.owner_ref,
+          endpointRef: selectedEndpoint.endpoint_ref,
+          integrationPath: selectedPath,
+          deviceId: device.id,
+        }
+      : null;
+    const telemetryEntries = Object.entries(device.telemetry).filter(([, value]) => value !== null && value !== undefined && value !== "");
     return (
       <div className="absolute inset-0 z-30 bg-[rgba(247,249,252,0.78)] backdrop-blur-[6px]">
         <div className="h-full w-full p-6">
@@ -865,83 +1114,266 @@ export default function App() {
             </header>
 
             <div className="subtle-scrollbar min-h-0 flex-1 overflow-y-auto px-8 py-7">
-              <div className="grid gap-6 xl:grid-cols-[minmax(0,1.2fr)_360px]">
-                <div className="grid gap-6">
-                  <section className="surface-subtle p-5">
-                    <p className="section-heading">State</p>
-                    <div className="mt-4 grid gap-3 md:grid-cols-2">
-                      <div className="rounded-[16px] border border-[#d8dfea] bg-white px-4 py-4">
-                        <p className="section-heading">Status</p>
-                        <p className="m-0 mt-2 text-sm font-medium text-slate-900">{humanize(device.primary_status)}</p>
-                      </div>
-                      <div className="rounded-[16px] border border-[#d8dfea] bg-white px-4 py-4">
-                        <p className="section-heading">Protocols</p>
-                        <p className="m-0 mt-2 text-sm font-medium text-slate-900">
-                          {device.protocols.length > 0 ? device.protocols.join(", ") : "None"}
-                        </p>
-                      </div>
+              <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_420px]">
+                <section className="surface-subtle p-5">
+                  <p className="section-heading">State</p>
+                  <div className="mt-4 grid gap-3 md:grid-cols-3">
+                    <div className="rounded-[16px] border border-[#d8dfea] bg-white px-4 py-4">
+                      <p className="section-heading">Status</p>
+                      <p className="m-0 mt-2 text-sm font-medium text-slate-900">{humanize(device.primary_status)}</p>
                     </div>
-                  </section>
+                    <div className="rounded-[16px] border border-[#d8dfea] bg-white px-4 py-4">
+                      <p className="section-heading">Type</p>
+                      <p className="m-0 mt-2 text-sm font-medium text-slate-900">{humanize(device.device_type)}</p>
+                    </div>
+                    <div className="rounded-[16px] border border-[#d8dfea] bg-white px-4 py-4">
+                      <p className="section-heading">Last seen</p>
+                      <p className="m-0 mt-2 text-sm font-medium text-slate-900">{formatDateTime(device.last_seen_at)}</p>
+                    </div>
+                  </div>
 
-                  <section className="surface-subtle p-5">
+                  <div className="mt-5 border-t border-[#d8dfea] pt-5">
+                    <p className="section-heading">Connection</p>
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      <CapabilityPill label="Visible" enabled={device.capabilities.visible} />
+                      <CapabilityPill label="Telemetry" enabled={device.capabilities.monitorable} />
+                      <CapabilityPill label="Control" enabled={device.capabilities.controllable} />
+                      <CapabilityPill label="Optimizable" enabled={device.capabilities.optimizable} />
+                    </div>
+                  </div>
+
+                  <div className="mt-5 border-t border-[#d8dfea] pt-5">
                     <p className="section-heading">Telemetry</p>
-                    {Object.entries(device.telemetry).length > 0 ? (
+                    {telemetryEntries.length > 0 ? (
                       <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-                        {Object.entries(device.telemetry).map(([key, value]) => (
+                        {telemetryEntries.slice(0, 6).map(([key, value]) => (
                           <div key={key} className="rounded-[16px] border border-[#d8dfea] bg-white px-4 py-4">
-                            <p className="m-0 text-[11px] font-semibold uppercase tracking-[0.08em] text-slate-500">{humanize(key)}</p>
+                            <p className="m-0 truncate text-[11px] font-semibold uppercase tracking-[0.08em] text-slate-500">
+                              {humanize(key)}
+                            </p>
                             <p className="m-0 mt-2 text-base font-semibold text-slate-950">{formatTelemetryValue(key, value)}</p>
                           </div>
                         ))}
                       </div>
                     ) : (
                       <div className="mt-4 rounded-[16px] border border-dashed border-[#d8dfea] bg-[#fafcff] px-4 py-4 text-sm text-slate-500">
-                        No telemetry fields are available for this device yet.
+                        No live telemetry yet.
                       </div>
                     )}
-                  </section>
-                </div>
+                  </div>
+                </section>
 
-                <div className="grid gap-6 self-start">
-                  <section className="surface-subtle p-5">
-                    <p className="section-heading">Identity</p>
-                    <div className="mt-4 grid gap-3">
-                      <div className="rounded-[16px] border border-[#d8dfea] bg-white px-4 py-4">
-                        <p className="section-heading">Type</p>
-                        <p className="m-0 mt-2 text-sm font-medium text-slate-900">{humanize(device.device_type)}</p>
-                      </div>
-                      <div className="rounded-[16px] border border-[#d8dfea] bg-white px-4 py-4">
-                        <p className="section-heading">Last seen</p>
-                        <p className="m-0 mt-2 text-sm font-medium text-slate-900">{formatDateTime(device.last_seen_at)}</p>
-                      </div>
-                      <div className="rounded-[16px] border border-[#d8dfea] bg-white px-4 py-4">
-                        <p className="section-heading">Protocols</p>
-                        <p className="m-0 mt-2 text-sm font-medium text-slate-900">
-                          {device.protocols.length > 0 ? device.protocols.join(", ") : "None"}
-                        </p>
-                      </div>
-                    </div>
-                  </section>
+                <section className="surface-subtle p-5 self-start">
+                  <p className="section-heading">Connections</p>
 
-                  <section className="surface-subtle p-5">
-                    <p className="section-heading">Capabilities</p>
-                    <div className="mt-4 flex flex-wrap gap-2">
-                      <CapabilityPill label="Visible" enabled={device.capabilities.visible} />
-                      <CapabilityPill label="Telemetry" enabled={device.capabilities.monitorable} />
-                      <CapabilityPill label="Control" enabled={device.capabilities.controllable} />
-                      <CapabilityPill label="Optimizable" enabled={device.capabilities.optimizable} />
-                    </div>
-                    {uiState.highlightedDeviceIds.includes(device.id) ? (
-                      <div className="mt-4 rounded-[16px] border border-[#f1d7a2] bg-[#fff7e8] px-4 py-3 text-sm text-[#9c6410]">
-                        This device is currently highlighted by the agent conversation.
+                  <div className="mt-4">
+                    <p className="section-heading">Protocols</p>
+                    {connectionOptionsBusy ? (
+                      <p className="m-0 mt-2 text-sm font-medium text-slate-500">Loading…</p>
+                    ) : endpoints.length > 0 ? (
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        {endpoints.map((endpoint) => {
+                          const selected = selectedEndpoint?.endpoint_ref === endpoint.endpoint_ref;
+                          return (
+                            <button
+                              key={endpoint.endpoint_ref}
+                              type="button"
+                              className={`rounded-full border px-3 py-1.5 text-xs font-semibold transition ${
+                                selected
+                                  ? "border-[#d08a11] bg-[#fff7e8] text-[#9c6410]"
+                                  : "border-[#d8dfea] bg-white text-slate-600 hover:border-[#bcc9de] hover:bg-[#fafcff]"
+                              }`}
+                              onClick={() =>
+                                setSelectedEndpointRefs((current) => ({
+                                  ...current,
+                                  [device.id]: endpoint.endpoint_ref,
+                                }))
+                              }
+                              title={endpointAddress(endpoint)}
+                            >
+                              {humanize(endpoint.protocol)}
+                            </button>
+                          );
+                        })}
                       </div>
-                    ) : null}
-                  </section>
-                </div>
+                    ) : (
+                      <p className="m-0 mt-2 text-sm font-medium text-slate-900">
+                        {device.protocols.length > 0 ? device.protocols.join(", ") : "None"}
+                      </p>
+                    )}
+                  </div>
+
+                  <div className="mt-5 border-t border-[#d8dfea] pt-5">
+                    {connectionOptionsBusy ? (
+                      <div className="rounded-[16px] border border-dashed border-[#d8dfea] bg-[#fafcff] px-4 py-4 text-sm text-slate-500">
+                        Loading connection options…
+                      </div>
+                    ) : selectedEndpoint && selectedTarget ? (
+                      <article className="rounded-[18px] border border-[#d8dfea] bg-white px-4 py-4">
+                        <div className="flex flex-wrap items-start justify-between gap-3">
+                          <div className="min-w-0">
+                            <p className="m-0 text-sm font-semibold text-slate-950">{humanize(selectedEndpoint.protocol)}</p>
+                            <p className="m-0 mt-1 truncate text-xs text-slate-500">{endpointAddress(selectedEndpoint)}</p>
+                          </div>
+                          <StatusBadge status={selectedEndpoint.state.status || selectedEndpoint.status} />
+                        </div>
+                        <div className="mt-3 grid gap-2 text-xs text-slate-600">
+                          <span className="truncate">Path: {selectedPath ? humanize(selectedPath) : "Not selected"}</span>
+                          <span className="truncate">State: {connectionPhaseLabel(selectedEndpoint.state)}</span>
+                        </div>
+                        <button
+                          type="button"
+                          className="primary-button mt-4 w-full"
+                          onClick={() =>
+                            selectedEndpoint.connect_action
+                              ? void executeConnectionAction(selectedEndpoint.connect_action, selectedTarget)
+                              : void openConnectionOverlay(selectedTarget)
+                          }
+                          disabled={!selectedEndpoint.connectable || busyAction === "connection-action"}
+                        >
+                          <AppIcon name="link" className="mr-2 h-4 w-4" />
+                          {connectionActionLabel(selectedEndpoint.state)}
+                        </button>
+                      </article>
+                    ) : (
+                      <div className="rounded-[16px] border border-dashed border-[#d8dfea] bg-[#fafcff] px-4 py-4 text-sm text-slate-500">
+                        No connectable endpoint is known yet.
+                      </div>
+                    )}
+                  </div>
+
+                  {uiState.highlightedDeviceIds.includes(device.id) ? (
+                    <div className="mt-4 rounded-[16px] border border-[#f1d7a2] bg-[#fff7e8] px-4 py-3 text-sm text-[#9c6410]">
+                      This device is currently highlighted by the agent conversation.
+                    </div>
+                  ) : null}
+                </section>
               </div>
             </div>
           </section>
         </div>
+      </div>
+    );
+  }
+
+  function renderConnectionOverlay() {
+    if (!connectionOverlayTarget) {
+      return null;
+    }
+
+    const state = connectionOverlayState;
+    const requiredAction = fieldFromRecord(state?.required_user_action, "action");
+    const localSki = fieldFromRecord(state?.required_user_action, "local_ski") || state?.local_ski || "";
+    const actionAvailable = Boolean(state?.connect_action && state.can_connect);
+
+    return (
+      <div className="absolute inset-0 z-40 flex items-center justify-center bg-[rgba(15,23,42,0.18)] px-6 py-6 backdrop-blur-[4px]">
+        <section className="flex max-h-full w-[min(720px,100%)] flex-col overflow-hidden rounded-[28px] border border-[#d8dfea] bg-white shadow-[0_32px_88px_rgba(15,23,42,0.22)]">
+          <header className="flex items-start justify-between gap-5 border-b border-[#d8dfea] px-6 py-5">
+            <div className="min-w-0">
+              <p className="section-heading">Connection setup</p>
+              <p className="m-0 mt-2 truncate text-xl font-semibold text-slate-950">
+                {state ? humanize(state.protocol) : humanize(connectionOverlayTarget.integrationPath)}
+              </p>
+              <p className="m-0 mt-1 truncate text-sm text-slate-500">
+                {state ? endpointAddress(state) : connectionOverlayTarget.endpointRef}
+              </p>
+            </div>
+            <button
+              type="button"
+              className="secondary-button h-10 w-10 shrink-0 px-0"
+              onClick={() => {
+                setConnectionOverlayTarget(null);
+                setConnectionOverlayState(null);
+                setConnectionOverlayError(null);
+              }}
+              aria-label="Close connection setup"
+            >
+              <AppIcon name="x" className="h-4 w-4" />
+            </button>
+          </header>
+
+          <div className="subtle-scrollbar min-h-0 flex-1 overflow-y-auto px-6 py-5">
+            {connectionOverlayError ? (
+              <DismissibleAlert tone="error" body={connectionOverlayError} onClose={() => setConnectionOverlayError(null)} />
+            ) : null}
+
+            {state ? (
+              <div className="grid gap-5">
+                <div className="rounded-[16px] border border-[#d8dfea] bg-[#fafcff] px-4 py-4">
+                  <p className="section-heading">Phase</p>
+                  <p className="m-0 mt-2 text-sm font-semibold text-slate-950">{connectionPhaseLabel(state)}</p>
+                </div>
+
+                {requiredAction ? (
+                  <div className="rounded-[18px] border border-[#f1d7a2] bg-[#fff8ec] px-4 py-4">
+                    <p className="section-heading">User action</p>
+                    <p className="m-0 mt-2 text-sm font-medium text-slate-900">{humanize(requiredAction)}</p>
+                    {localSki ? (
+                      <div className="mt-3 rounded-[14px] border border-[#e6d2a9] bg-white px-3 py-3">
+                        <p className="section-heading">Local SKI</p>
+                        <p className="m-0 mt-2 break-all font-mono text-sm text-slate-950">{localSki}</p>
+                      </div>
+                    ) : null}
+                  </div>
+                ) : null}
+
+                {state.last_error ? (
+                  <div className="rounded-[18px] border border-red-200 bg-red-50 px-4 py-4 text-sm text-red-700">
+                    {state.last_error}
+                  </div>
+                ) : null}
+
+                <div className="grid gap-3">
+                  {state.steps.map((step, index) => {
+                    const key = fieldFromRecord(step, "key") || `step-${index}`;
+                    const label = fieldFromRecord(step, "label") || humanize(key);
+                    const status = fieldFromRecord(step, "status") || "pending";
+                    const detail = fieldFromRecord(step, "detail");
+                    return (
+                      <article key={key} className={`rounded-[16px] border px-4 py-4 ${stepStatusClass(status)}`}>
+                        <div className="flex items-start justify-between gap-3">
+                          <p className="m-0 text-sm font-semibold">{label}</p>
+                          <span className="shrink-0 rounded-full bg-white/70 px-2 py-1 text-[11px] font-semibold uppercase">
+                            {humanize(status)}
+                          </span>
+                        </div>
+                        {detail ? <p className="m-0 mt-2 text-sm opacity-85">{detail}</p> : null}
+                      </article>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : (
+              <div className="rounded-[16px] border border-dashed border-[#d8dfea] bg-[#fafcff] px-4 py-4 text-sm text-slate-500">
+                Loading connection state…
+              </div>
+            )}
+          </div>
+
+          <footer className="flex flex-wrap items-center justify-end gap-2 border-t border-[#d8dfea] px-6 py-5">
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={() => {
+                setConnectionOverlayTarget(null);
+                setConnectionOverlayState(null);
+                setConnectionOverlayError(null);
+              }}
+            >
+              Close
+            </button>
+            <button
+              type="button"
+              className="primary-button"
+              onClick={() => void runConnectionAction()}
+              disabled={!actionAvailable || connectionOverlayBusy || busyAction === "connection-action"}
+            >
+              <AppIcon name="link" className="mr-2 h-4 w-4" />
+              {connectionActionLabel(state)}
+            </button>
+          </footer>
+        </section>
       </div>
     );
   }
@@ -970,21 +1402,50 @@ export default function App() {
   }
 
   function renderOverviewCanvas() {
+    const discoveryRunning = busyAction === "run-discovery";
+
     return (
       <section className="relative h-full min-h-0 overflow-hidden border border-[#d8dfea] bg-[linear-gradient(180deg,#ffffff_0%,#f8fbff_100%)] shadow-[0_24px_64px_rgba(15,23,42,0.08)]">
         <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_46%,rgba(255,220,150,0.28),transparent_18%),radial-gradient(circle_at_18%_16%,rgba(210,223,242,0.34),transparent_24%),radial-gradient(circle_at_84%_18%,rgba(255,233,190,0.24),transparent_22%)]" />
         {renderCanvasAlerts()}
 
         <div className="absolute inset-0">
-          <div className="absolute left-1/2 top-1/2 z-10 w-[220px] -translate-x-1/2 -translate-y-1/2 rounded-[32px] border border-[#e5c88a] bg-[radial-gradient(circle_at_top,rgba(255,237,194,0.92),rgba(255,255,255,0.98)_62%)] px-6 py-7 text-center shadow-[0_28px_60px_rgba(212,163,74,0.18)]">
+          <button
+            type="button"
+            className="group absolute left-1/2 top-1/2 z-10 w-[220px] -translate-x-1/2 -translate-y-1/2 cursor-pointer rounded-[32px] border border-[#e5c88a] bg-[radial-gradient(circle_at_top,rgba(255,237,194,0.92),rgba(255,255,255,0.98)_62%)] px-6 py-7 text-center shadow-[0_28px_60px_rgba(212,163,74,0.18)] transition duration-200 hover:-translate-y-[calc(50%+2px)] hover:border-[#d08a11] hover:shadow-[0_32px_68px_rgba(212,163,74,0.24)] focus:outline-none focus:ring-4 focus:ring-[#f1d7a2]/50 disabled:cursor-wait"
+            onClick={() => void handleRunDiscovery()}
+            disabled={discoveryRunning}
+            aria-label={discoveryRunning ? "Discovery is running" : "Run discovery"}
+            title={discoveryRunning ? "Discovery is running" : "Run discovery"}
+          >
             <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-[#d88b08] text-white shadow-[0_16px_30px_rgba(216,139,8,0.3)]">
-              <AppIcon name="home" className="h-7 w-7" />
+              {discoveryRunning ? (
+                <span className="h-7 w-7 animate-spin rounded-full border-2 border-white/35 border-t-white" />
+              ) : (
+                <span className="relative inline-block h-7 w-7">
+                  <AppIcon name="home" className="absolute inset-0 h-7 w-7 opacity-100 transition-opacity duration-150 group-hover:opacity-0" />
+                  <AppIcon name="discover" className="absolute inset-0 h-7 w-7 opacity-0 transition-opacity duration-150 group-hover:opacity-100" />
+                </span>
+              )}
             </div>
-            <p className="m-0 mt-5 text-xl font-semibold text-slate-950">Home</p>
-            <p className="m-0 mt-2 text-sm text-slate-600">
-              {allDevices.length > 0 ? `${allDevices.length} detected device${allDevices.length === 1 ? "" : "s"}` : "Waiting for discovery"}
+            <p className="m-0 mt-5 text-xl font-semibold text-slate-950">
+              {discoveryRunning ? (
+                "Discovering"
+              ) : (
+                <span className="relative inline-block min-w-[88px]">
+                  <span className="block opacity-100 transition-opacity duration-150 group-hover:opacity-0">Home</span>
+                  <span className="absolute inset-0 block opacity-0 transition-opacity duration-150 group-hover:opacity-100">
+                    Discover
+                  </span>
+                </span>
+              )}
             </p>
-          </div>
+            <p className="m-0 mt-2 text-sm text-slate-600">
+              {discoveryRunning
+                ? "Scanning network"
+                : `${allDevices.length} detected device${allDevices.length === 1 ? "" : "s"}`}
+            </p>
+          </button>
 
           {allDevices.map((device, index) => {
             const point = canvasPoints[index] ?? { x: 0, y: 0 };
@@ -1031,14 +1492,10 @@ export default function App() {
             );
           })}
 
-          {allDevices.length === 0 ? (
-            <div className="absolute left-1/2 top-[calc(50%+170px)] z-10 w-[320px] -translate-x-1/2 rounded-[24px] border border-dashed border-[#d8dfea] bg-white/90 px-5 py-4 text-center text-sm leading-6 text-slate-500 shadow-[0_16px_34px_rgba(15,23,42,0.06)]">
-              No devices have been detected yet. Discovery can be requested in chat or run from Settings.
-            </div>
-          ) : null}
         </div>
 
         {inspectedDevice ? renderDeviceOverlay(inspectedDevice) : null}
+        {renderConnectionOverlay()}
       </section>
     );
   }

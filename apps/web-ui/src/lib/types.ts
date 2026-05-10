@@ -382,6 +382,71 @@ export interface UserDecisionCreate {
   comment?: string;
 }
 
+export interface ActionExecuteRequest {
+  input?: Record<string, unknown>;
+  context?: Record<string, unknown>;
+}
+
+export interface ActionExecutionRead {
+  action_name: string;
+  actor: "user" | "agent" | "system";
+  status: string;
+  output: Record<string, unknown>;
+  ui_events: AgentUiEvent[];
+}
+
+export interface ConnectionActionRef {
+  name: string;
+  input: Record<string, unknown>;
+}
+
+export interface ConnectionEndpointOptionRead {
+  endpoint_ref: string;
+  owner_ref: string;
+  protocol: string;
+  host: string;
+  port: number | null;
+  service_name: string;
+  status: string;
+  source: string;
+  last_seen_at: string;
+  confidence: number;
+  allowed_integration_paths: string[];
+  connectable: boolean;
+  state: ConnectionStateRead;
+  connect_action: ConnectionActionRef | null;
+}
+
+export interface ConnectionOptionsRead {
+  entity_ref: string;
+  device_id: string;
+  display_name: string;
+  endpoints: ConnectionEndpointOptionRead[];
+}
+
+export interface ConnectionStateRead {
+  entity_ref: string;
+  endpoint_ref: string;
+  protocol: string;
+  host: string;
+  port: number | null;
+  service_name: string;
+  integration_path: string;
+  phase: string;
+  status: string;
+  can_connect: boolean;
+  steps: Array<Record<string, unknown>>;
+  required_user_action: Record<string, unknown>;
+  connection_facets: Record<string, unknown>;
+  diagnostic_run_ref: string;
+  task_ref: string;
+  local_ski: string;
+  peer_ski: string;
+  last_error: string;
+  updated_at: string | null;
+  connect_action: ConnectionActionRef | null;
+}
+
 export type ViewKey = "overview" | "devices" | "monitoring" | "tasks" | "settings";
 export type NavigationMode = "peek" | "focus" | "switch";
 export type TimeRange = "last_1h" | "last_6h" | "last_24h" | "last_7d";
@@ -389,6 +454,11 @@ export type TimeRange = "last_1h" | "last_6h" | "last_24h" | "last_7d";
 export type AgentUiEvent =
   | { event_type: "view.open"; payload: { view: ViewKey; mode?: NavigationMode } }
   | { event_type: "entity.focus"; payload: { entity_refs: string[]; reason?: string; mode?: "focus" | "highlight" } }
+  | { event_type: "device.details.open"; payload: { entity_ref: string } }
+  | {
+      event_type: "connection.overlay.open";
+      payload: { entity_ref: string; endpoint_ref: string; integration_path: string; mode?: string };
+    }
   | {
       event_type: "entity.relationship.show";
       payload: { from_ref: string; to_ref: string; relationship: string };

@@ -8,6 +8,7 @@ from app.core.config import get_settings
 from app.db.seed import seed_default_site
 from app.db.session import get_session_factory, init_database
 from app.services.discovery import prune_legacy_fixture_inventory
+from app.services.eebus_runtime import get_eebus_runtime_manager
 
 
 def create_app() -> FastAPI:
@@ -21,6 +22,7 @@ def create_app() -> FastAPI:
             seed_default_site(session)
             prune_legacy_fixture_inventory(session)
         yield
+        get_eebus_runtime_manager().stop()
 
     application = FastAPI(
         title=settings.app_name,

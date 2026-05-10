@@ -4,13 +4,18 @@ from dataclasses import dataclass, field
 import json
 from typing import Any
 
+from cryptography import x509
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import ExtensionOID
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 from app.core.config import get_settings
 from app.db.models import (
     AgentTask,
+    AuditEvent,
     Blocker,
     Device,
     DeviceCandidate,
@@ -23,11 +28,14 @@ from app.db.models import (
     ToolInvocation,
     UserDecisionRequest,
     Site,
+    SiteSetupProfile,
 )
 from app.db.session import get_engine, get_session_factory
+from app.agent.configuration import PROVIDER_SPECS, ProviderRuntimeStatus, ProviderState
 from app.home_graph.service import sync_inventory_to_home_graph
 from app.main import create_app
 from app.agent.provider import (
+    LLMModelProvider,
     ModelFinalAnswer,
     ModelRequest,
     ModelResponse,
@@ -35,6 +43,8 @@ from app.agent.provider import (
     _model_action_from_openai_responses_payload,
     _provider_tool_name_map,
 )
+from app.agent.tools.registry import create_default_tool_registry
+from app.services.eebus_runtime import EebusPeerTrustMaterial, EebusRuntimeSnapshot
 
 
 def _bootstrap_app(tmp_path, monkeypatch, name: str = "agent.db"):
@@ -200,6 +210,70 @@ def _add_ppc_eebus_candidate(device_id: str = "dev-ppc", *, register: bool = Fal
         session.commit()
 
 
+def _fake_eebus_peer_trust() -> EebusPeerTrustMaterial:
+    return EebusPeerTrustMaterial(
+        host="192.168.188.142",
+        port=23292,
+        server_name="EPPCC001161952.local",
+        advertised_ski="f819e215a4f292d803325276767d9e27f67fe108",
+        certificate_pem="-----BEGIN CERTIFICATE-----\nFAKE-TEST-CERT\n-----END CERTIFICATE-----\n",
+        certificate_ski="f819e215a4f292d803325276767d9e27f67fe108",
+        txt_ski_matches_certificate_ski=True,
+        client_cert_requested=True,
+        openssl_exit_code=1,
+    )
+
+
+class FakeEebusRuntimeManager:
+    def __init__(self, status: str | list[str] = "listening", error: str = "") -> None:
+        self.statuses = [status] if isinstance(status, str) else list(status)
+        self.error = error
+        self.calls: list[dict[str, Any]] = []
+
+    def start_or_update(self, **kwargs) -> EebusRuntimeSnapshot:
+        self.calls.append(kwargs)
+        status = self.statuses[min(len(self.calls) - 1, len(self.statuses) - 1)]
+        peer = kwargs["peer"]
+        local_identity = kwargs["local_identity"]
+        ready_peer_skis = [peer.certificate_ski] if status == "ship_ready" else []
+        outbound_status = "ready" if status == "ship_ready" else "failed" if status == "failed" else "connecting"
+        state_error = self.error if status == "failed" else ""
+        return EebusRuntimeSnapshot(
+            status=status,
+            local_ski=local_identity.ski,
+            local_ship_id=f"i:32266_u:HELIOS-HOME-HEMS_r:HEMS",
+            bind_host="0.0.0.0",
+            port=4712,
+            path="/ship/",
+            interface_ip="192.168.188.10",
+            trusted_peer_skis=[peer.certificate_ski],
+            ready_peer_skis=ready_peer_skis,
+            endpoint_refs=[kwargs["endpoint_ref"]],
+            diagnostic_run_refs=[kwargs["diagnostic_run_ref"]],
+            active_connection_directions=["outbound_to_peer", "inbound_from_peer"],
+            connection_states={
+                kwargs["endpoint_ref"]: {
+                    "outbound_to_peer": {
+                        "status": outbound_status,
+                        "host": peer.host,
+                        "port": peer.port,
+                        "path": peer.path,
+                        "server_name": peer.server_name,
+                        "peer_ski": peer.certificate_ski,
+                        "error": state_error,
+                    },
+                    "inbound_from_peer": {
+                        "status": "listening",
+                        "bind_host": "0.0.0.0",
+                        "port": 4712,
+                        "path": "/ship/",
+                    },
+                }
+            },
+            error=state_error,
+        )
+
+
 def _endpoint_ref_for_device(device_id: str, protocol: str) -> str:
     session_factory = get_session_factory()
     with session_factory() as session:
@@ -232,6 +306,48 @@ def test_empty_thread_does_not_create_backend_authored_assistant_welcome(tmp_pat
 
         assert response.status_code == 200
         assert response.json()["messages"] == []
+
+
+def test_setup_profile_get_or_create_recovers_from_concurrent_insert(tmp_path, monkeypatch):
+    app = _bootstrap_app(tmp_path, monkeypatch, "setup-profile-race.db")
+
+    with TestClient(app):
+        from app.agent.service import _get_or_create_setup_profile
+
+        session_factory = get_session_factory()
+        with session_factory() as session:
+            site = session.scalar(select(Site).limit(1))
+            assert site is not None
+            assert session.scalar(select(SiteSetupProfile).where(SiteSetupProfile.site_id == site.id)) is None
+            original_commit = session.commit
+            state = {"raised": False}
+
+            def commit_after_competing_insert() -> None:
+                if state["raised"]:
+                    original_commit()
+                    return
+                state["raised"] = True
+                with session_factory() as competing_session:
+                    competing_session.add(
+                        SiteSetupProfile(
+                            site_id=site.id,
+                            summary="setup_profile_initialized",
+                            confirmed_systems=[],
+                            unresolved_items=[],
+                            user_notes=[],
+                        )
+                    )
+                    competing_session.commit()
+                raise IntegrityError("insert into site_setup_profiles", {}, Exception("unique site setup profile"))
+
+            monkeypatch.setattr(session, "commit", commit_after_competing_insert)
+
+            profile = _get_or_create_setup_profile(session)
+
+            assert profile.site_id == site.id
+            assert state["raised"] is True
+            profiles = session.scalars(select(SiteSetupProfile).where(SiteSetupProfile.site_id == site.id)).all()
+            assert len(profiles) == 1
 
 
 def test_openai_responses_native_final_text_maps_to_model_final_answer():
@@ -270,6 +386,70 @@ def test_openai_responses_native_function_call_maps_to_internal_tool_name():
     assert action.arguments == {"role_hypothesis": "ev_charger"}
 
 
+def test_system_prompt_frames_ui_as_shared_workspace_without_hard_focus_rule():
+    runtime = ProviderRuntimeStatus(
+        selected_provider="openai",
+        effective_provider="openai",
+        ready=True,
+        message="ready",
+        state=ProviderState(
+            provider_id="openai",
+            model="gpt-5-mini",
+            base_url=PROVIDER_SPECS["openai"].base_url_default,
+            api_key="test",
+        ),
+        spec=PROVIDER_SPECS["openai"],
+    )
+    provider = LLMModelProvider(runtime)
+    prompt = provider._system_prompt(
+        ModelRequest(
+            turn_id="turn-test",
+            user_message="Which devices are meters?",
+            recent_messages=[],
+            context={},
+            available_tools=[],
+        )
+    )
+
+    assert "shared visual workspace" in prompt
+    assert "do not treat UI actions as decoration" in prompt
+    assert "always" not in prompt.lower()
+    assert "ui.focus_entities" not in prompt
+
+
+def test_ui_focus_entities_tool_purpose_is_neutral():
+    registry = create_default_tool_registry()
+    tool = registry.get("ui.focus_entities")
+    assert tool is not None
+    assert tool.purpose == (
+        "Focuses or highlights entities in the shared workspace, so the user can see which devices, "
+        "roles, tasks, or blockers you are referring to."
+    )
+    assert "should" not in tool.purpose.lower()
+    assert "when" not in tool.purpose.lower()
+
+
+def test_dashboard_ui_actions_are_registered_as_agent_tools():
+    registry = create_default_tool_registry()
+
+    assert registry.get("ui.open_device_details") is not None
+    assert registry.get("ui.open_connection_overlay") is not None
+
+
+def test_connection_establish_hides_protocol_direction_from_agent_schema():
+    registry = create_default_tool_registry()
+    establish = registry.get("connection.establish")
+    inspect = registry.get("connection.inspect_readiness")
+
+    assert establish is not None
+    assert inspect is not None
+    establish_schema = establish.input_model.model_json_schema()
+    inspect_schema = inspect.input_model.model_json_schema()
+    assert "connection_direction" not in establish_schema.get("properties", {})
+    assert "connection_direction" not in inspect_schema.get("properties", {})
+    assert registry.get("commissioning.start_or_continue") is None
+
+
 def test_runtime_uses_model_actions_tool_observations_and_model_final_answer(tmp_path, monkeypatch):
     app = _bootstrap_app(tmp_path, monkeypatch, "runtime-loop.db")
     provider = _use_scripted_provider(
@@ -306,11 +486,14 @@ def test_runtime_uses_model_actions_tool_observations_and_model_final_answer(tmp
         assert "home_graph.get_entity_details" in runtime_started["payload"]["available_tools"]
         assert "protocol.list_endpoints" in runtime_started["payload"]["available_tools"]
         assert "connection.inspect_readiness" in runtime_started["payload"]["available_tools"]
+        assert "connection.establish" in runtime_started["payload"]["available_tools"]
         assert "eebus.identity.get_or_create" in runtime_started["payload"]["available_tools"]
-        assert "commissioning.start_or_continue" in runtime_started["payload"]["available_tools"]
+        assert "commissioning.start_or_continue" not in runtime_started["payload"]["available_tools"]
         assert "commissioning.get_log" in runtime_started["payload"]["available_tools"]
         assert "discovery.inspect_home_network" in runtime_started["payload"]["available_tools"]
         assert "ui.focus_entities" in runtime_started["payload"]["available_tools"]
+        assert "ui.open_device_details" in runtime_started["payload"]["available_tools"]
+        assert "ui.open_connection_overlay" in runtime_started["payload"]["available_tools"]
         assert "home_graph.find_system_role" not in runtime_started["payload"]["available_tools"]
         assert "confirmation.respond_to_pending_decision" not in runtime_started["payload"]["available_tools"]
         assert "ui.highlight_entities" not in runtime_started["payload"]["available_tools"]
@@ -366,7 +549,12 @@ def test_default_model_context_is_compact_and_tool_pull_based(tmp_path, monkeypa
         assert "available_tools" not in context
         assert context["home_graph_summary"]["canonical_device_count"] == 25
         assert context["home_graph_summary"]["canonical_device_counts_by_type"] == {"smart_appliance": 25}
+        assert context["home_graph_summary"]["observed_class_counts"] == {"local_http_endpoint": 25}
+        assert context["home_graph_summary"]["role_hypothesis_counts"] == {}
         assert context["home_inventory"]["canonical_device_count"] == 25
+        assert "canonical_devices" not in context["home_inventory"]
+        assert context["home_inventory"]["primary_observations"][0]["classification_status"] == "unclassified"
+        assert len(context["home_inventory"]["primary_observations"]) == 8
         assert context["home_graph_summary"]["details_available_via"] == [
             "home_graph.query",
             "home_graph.get_entity_details",
@@ -392,6 +580,7 @@ def test_home_graph_context_separates_canonical_devices_from_raw_candidates(tmp_
         context = provider.requests[0].context
         assert context["home_graph_summary"]["canonical_device_count"] == 2
         assert context["home_graph_summary"]["canonical_device_counts_by_type"] == {"grid_meter": 2}
+        assert context["home_graph_summary"]["role_hypothesis_counts"] == {"grid_meter": 2}
         assert context["home_graph_summary"]["raw_artifact_counts"]["candidate_count"] == 1
         assert context["home_graph_summary"]["raw_artifact_counts"]["candidate_counts_by_type"] == {"grid_meter": 1}
 
@@ -497,6 +686,12 @@ def test_entity_details_tool_returns_protocol_endpoints_without_backend_advice(t
         assert tool_finished["payload"]["tool_name"] == "home_graph.get_entity_details"
         assert result["entity"]["ref"] == "device:dev-ppc"
         assert result["canonical"] is True
+        assert result["observed_identity"]["display_name"] == "PPC SMGW"
+        assert result["classification"]["status"] == "tentative"
+        assert result["classification"]["observed_class"] == "eebus_ship_peer"
+        assert result["classification"]["role_hypotheses"][0]["role"] == "grid_meter"
+        assert result["classification"]["role_hypotheses"][0]["needs_confirmation"] is True
+        assert "eebus_ship" in result["technical_observations"]
         assert result["connection_facets"]["overall_connection_state"] == "endpoint_visible"
         assert result["connection_facets"]["facets"]["endpoint_state"] == "visible"
         assert "next_step" not in result["entity"]["properties"]
@@ -504,6 +699,37 @@ def test_entity_details_tool_returns_protocol_endpoints_without_backend_advice(t
         assert result["protocol_endpoints"][0]["protocol"] == "eebus_ship"
         assert result["protocol_endpoints"][0]["port"] == 4711
         assert "recommended_option" not in result
+
+
+def test_entity_details_keep_generic_smart_appliance_role_unclassified(tmp_path, monkeypatch):
+    app = _bootstrap_app(tmp_path, monkeypatch, "entity-details-generic-appliance.db")
+    _use_scripted_provider(
+        monkeypatch,
+        ScriptedModelProvider(
+            [
+                ModelToolCall("home_graph.get_entity_details", {"entity_ref": "device:dev-shelly"}),
+                ModelFinalAnswer("I inspected the visible local endpoint."),
+            ]
+        ),
+    )
+
+    with TestClient(app) as client:
+        client.get("/api/v1/agent/thread")
+        _add_device(
+            device_id="dev-shelly",
+            name="Shelly1PM",
+            device_type="smart_appliance",
+            manufacturer="Shelly",
+            protocols=["http_local"],
+        )
+        events = _send_and_stream(client, "Was ist das Shelly?")
+
+        tool_finished = next(event for event in events if event["event_type"] == "tool_finished")
+        result = tool_finished["payload"]["result"]
+        assert result["classification"]["status"] == "unclassified"
+        assert result["classification"]["observed_class"] == "local_http_endpoint"
+        assert result["classification"]["role_hypotheses"] == []
+        assert "http_local" in result["technical_observations"]
 
 
 def test_home_graph_role_query_does_not_hard_filter_free_text_when_role_is_structured(tmp_path, monkeypatch):
@@ -580,6 +806,12 @@ def test_binding_proposal_records_model_selected_endpoint_and_integration_path(t
             assert proposal.payload["endpoint_ref"] == endpoint_ref
             assert proposal.payload["endpoint_protocol"] == "eebus_ship"
             assert proposal.payload["integration_path"] == "eebus_spine"
+            assert proposal.payload["binding_scope"] == {
+                "establishes_role_candidate_only": True,
+                "establishes_protocol_connection": False,
+                "validates_spine_or_telemetry": False,
+            }
+            assert proposal.payload["connection_facets_at_creation"]["overall_connection_state"] != "connected"
             assert endpoint_ref in proposal.target_refs
             assert session.scalar(select(HemsSystemBinding)) is None
 
@@ -649,18 +881,77 @@ def test_connection_readiness_reports_eebus_trust_blockers_without_connecting(tm
         assert any(entry["event"] == "eebus_ship_metadata" for entry in result["log_entries"])
         blocker_codes = {blocker["code"] for blocker in result["blockers"]}
         assert "local_eebus_identity_missing" in blocker_codes
-        assert "remote_auto_registration_closed" in blocker_codes
+        assert "peer_certificate_not_materialized" in blocker_codes
         assert "ship_trust_commissioning_not_validated" in blocker_codes
         facts = result["inspections"][0]["facts"]
         assert facts["remote_register"] is False
+        assert facts["remote_certificate_materialized"] is False
         assert facts["local_identity_exists"] is False
         assert any(transition["tool"] == "eebus.identity.get_or_create" for transition in result["available_transitions"])
+        assert any(transition["tool"] == "connection.establish" for transition in result["available_transitions"])
         session_factory = get_session_factory()
         with session_factory() as session:
             diagnostic = session.get(ProtocolDiagnosticRun, result["diagnostic_run_ref"])
             assert diagnostic is not None
             assert diagnostic.status == "blocked"
             assert diagnostic.result["blocker_codes"]
+
+
+def test_connection_readiness_distinguishes_peer_rejection_from_ship_ready(tmp_path, monkeypatch):
+    app = _bootstrap_app(tmp_path, monkeypatch, "connection-readiness-peer-rejected.db")
+
+    with TestClient(app) as client:
+        client.get("/api/v1/agent/thread")
+        _add_device(device_id="dev-ppc", name="PPC SMGW", device_type="grid_meter", manufacturer="PPC")
+        _add_ppc_eebus_candidate("dev-ppc", register=False)
+        endpoint_ref = _endpoint_ref_for_device("dev-ppc", "eebus_ship")
+
+        def runtime_snapshot(endpoint_id: str) -> dict[str, Any]:
+            return {
+                "status": "failed",
+                "local_ski": "0123456789abcdef0123456789abcdef01234567",
+                "endpoint_in_runtime": endpoint_id == endpoint_ref,
+                "ready_peer_skis": [],
+                "received_load_power_limit_count": 0,
+                "last_load_power_limit": {},
+                "recent_events": [{"reason": "Node rejected by application."}],
+                "endpoint_connection_states": {
+                    "outbound_to_peer": {
+                        "status": "failed",
+                        "error": "Node rejected by application.",
+                    }
+                },
+                "error": "Node rejected by application.",
+            }
+
+        monkeypatch.setattr("app.agent.tools.protocol.runtime_snapshot_for_endpoint", runtime_snapshot)
+        _use_scripted_provider(
+            monkeypatch,
+            ScriptedModelProvider(
+                [
+                    ModelToolCall(
+                        "connection.inspect_readiness",
+                        {
+                            "entity_ref": "device:dev-ppc",
+                            "endpoint_ref": endpoint_ref,
+                            "integration_path": "eebus_spine",
+                            "role": "grid_meter",
+                        },
+                    ),
+                    ModelFinalAnswer("The peer rejected the previous SHIP attempt; it is not connected yet."),
+                ]
+            ),
+        )
+
+        events = _send_and_stream(client, "Prüfe die PPC Verbindung.")
+
+        result = next(event for event in events if event["event_type"] == "tool_finished")["payload"]["result"]
+        blocker_codes = {blocker["code"] for blocker in result["blockers"]}
+        facts = result["inspections"][0]["facts"]
+        assert "eebus_peer_trust_required" in blocker_codes
+        assert facts["ship_session_state"] == "not_ready"
+        assert facts["spine_feature_exchange_state"] == "not_validated"
+        assert facts["lpc_lpp_receive_state"] == "not_validated"
 
 
 def test_eebus_identity_tool_creates_public_ski_without_exposing_private_key(tmp_path, monkeypatch):
@@ -683,24 +974,60 @@ def test_eebus_identity_tool_creates_public_ski_without_exposing_private_key(tmp
         identity = tool_finished["payload"]["result"]["identity"]
         assert len(identity["ski"]) == 40
         assert identity["certificate_pem"].startswith("-----BEGIN CERTIFICATE-----")
+        certificate = x509.load_pem_x509_certificate(identity["certificate_pem"].encode("ascii"))
+        subject_key_identifier = certificate.extensions.get_extension_for_oid(
+            ExtensionOID.SUBJECT_KEY_IDENTIFIER
+        ).value.digest.hex()
+        assert identity["ski"] == subject_key_identifier
+        assert isinstance(certificate.public_key(), ec.EllipticCurvePublicKey)
+        assert identity["ski_source"] == "x509_subject_key_identifier"
+        assert identity["qr_payload"].startswith("ID:")
         assert "private_key_pem" not in identity
         assert tool_finished["payload"]["result"]["private_key_exported"] is False
 
 
-def test_commissioning_start_or_continue_prepares_eebus_identity_and_records_trust_blocker(tmp_path, monkeypatch):
+def test_connection_establish_prepares_eebus_identity_and_records_trust_blocker(tmp_path, monkeypatch):
     app = _bootstrap_app(tmp_path, monkeypatch, "commissioning-start.db")
+    fake_runtime = FakeEebusRuntimeManager(status="listening")
+    monkeypatch.setattr("app.workflows.eebus_connection.probe_eebus_peer_certificate", lambda **_: _fake_eebus_peer_trust())
+    monkeypatch.setattr("app.workflows.eebus_connection.get_eebus_runtime_manager", lambda: fake_runtime)
 
     with TestClient(app) as client:
         client.get("/api/v1/agent/thread")
         _add_device(device_id="dev-ppc", name="PPC SMGW", device_type="grid_meter", manufacturer="PPC")
         _add_ppc_eebus_candidate("dev-ppc", register=False)
         endpoint_ref = _endpoint_ref_for_device("dev-ppc", "eebus_ship")
+        session_factory = get_session_factory()
+        with session_factory() as session:
+            site = session.get(Site, _site_id())
+            assert site is not None
+            stale_task = AgentTask(
+                id="task-stale-commissioning",
+                site_id=site.id,
+                task_type="commission_role_candidate",
+                title="Commission PPC SMGW",
+                goal="Continue PPC SMGW commissioning.",
+                status="open",
+                target_refs=["device:dev-ppc", endpoint_ref],
+                context={"current_phase": "awaiting_commissioning_workflow"},
+            )
+            stale_blocker = Blocker(
+                id="blocker-stale-commissioning",
+                task_id=stale_task.id,
+                subject_ref="device:dev-ppc",
+                blocker_type="commissioning_workflow_not_started",
+                summary="commissioning_workflow_not_started",
+                status="open",
+                details={"missing_capabilities": ["eebus_trust_commissioning_readiness_validation"]},
+            )
+            session.add_all([stale_task, stale_blocker])
+            session.commit()
         _use_scripted_provider(
             monkeypatch,
             ScriptedModelProvider(
                 [
                     ModelToolCall(
-                        "commissioning.start_or_continue",
+                        "connection.establish",
                         {
                             "entity_ref": "device:dev-ppc",
                             "endpoint_ref": endpoint_ref,
@@ -718,26 +1045,286 @@ def test_commissioning_start_or_continue_prepares_eebus_identity_and_records_tru
 
         tool_finished = next(event for event in events if event["event_type"] == "tool_finished")
         result = tool_finished["payload"]["result"]
-        assert tool_finished["payload"]["tool_name"] == "commissioning.start_or_continue"
-        assert result["status"] == "blocked_waiting_for_user_action"
-        assert result["phase"] == "waiting_for_peer_trust"
+        assert tool_finished["payload"]["tool_name"] == "connection.establish"
+        assert result["status"] == "connecting_ship_session"
+        assert result["phase"] == "waiting_for_ship_session"
         assert len(result["local_identity"]["ski"]) == 40
-        assert result["required_external_action"]["action"] == "authorize_local_ski_on_peer"
+        assert result["peer_certificate"]["status"] == "materialized"
+        assert result["ship_runtime"]["status"] == "listening"
+        assert result["required_user_action"]["local_ski"] == result["local_identity"]["ski"]
+        assert result["required_user_action"]["retry_tool"] == "connection.establish"
         assert result["connection_facets"]["overall_connection_state"] == "blocked"
         assert "no_spine_feature_validation" in result["effects_not_included"]
+        assert fake_runtime.calls
+        assert fake_runtime.calls[0]["connection_direction"] == "auto"
+        assert fake_runtime.calls[0]["peer"].host == "192.168.188.142"
+        assert fake_runtime.calls[0]["peer"].port == 23292
+        assert fake_runtime.calls[0]["peer"].server_name == "EPPCC001161952.local"
 
         session_factory = get_session_factory()
         with session_factory() as session:
             diagnostic = session.get(ProtocolDiagnosticRun, result["diagnostic_run_ref"])
             assert diagnostic is not None
-            assert diagnostic.result["blocker_codes"] == ["eebus_peer_trust_required"]
-            blocker = session.scalar(select(Blocker).where(Blocker.blocker_type == "eebus_peer_trust_required"))
+            assert diagnostic.result["blocker_codes"] == ["eebus_peer_connection_pending"]
+            blocker = session.scalar(select(Blocker).where(Blocker.blocker_type == "eebus_peer_connection_pending"))
             assert blocker is not None
             assert blocker.status == "open"
+            stale_blocker = session.get(Blocker, "blocker-stale-commissioning")
+            assert stale_blocker is not None
+            assert stale_blocker.status == "resolved"
+            assert stale_blocker.resolved_at is not None
+            assert stale_blocker.details["resolved_by"] == "connection.establish"
 
 
-def test_commissioning_get_log_reads_compact_diagnostic_entries(tmp_path, monkeypatch):
-    app = _bootstrap_app(tmp_path, monkeypatch, "commissioning-log.db")
+def test_dashboard_connection_action_uses_same_connection_workflow_as_agent_tool(tmp_path, monkeypatch):
+    app = _bootstrap_app(tmp_path, monkeypatch, "dashboard-connection-action.db")
+    fake_runtime = FakeEebusRuntimeManager(status="failed", error="Node rejected by application.")
+    monkeypatch.setattr("app.workflows.eebus_connection.probe_eebus_peer_certificate", lambda **_: _fake_eebus_peer_trust())
+    monkeypatch.setattr("app.workflows.eebus_connection.get_eebus_runtime_manager", lambda: fake_runtime)
+
+    with TestClient(app) as client:
+        client.get("/api/v1/agent/thread")
+        _add_device(device_id="dev-ppc", name="PPC SMGW", device_type="grid_meter", manufacturer="PPC")
+        _add_ppc_eebus_candidate("dev-ppc", register=False)
+        endpoint_ref = _endpoint_ref_for_device("dev-ppc", "eebus_ship")
+
+        options_response = client.get("/api/v1/devices/dev-ppc/connection-options")
+        assert options_response.status_code == 200
+        options = options_response.json()
+        assert options["entity_ref"] == "device:dev-ppc"
+        assert options["endpoints"][0]["endpoint_ref"] == endpoint_ref
+        assert options["endpoints"][0]["connect_action"]["name"] == "connection.establish"
+        assert options["endpoints"][0]["connect_action"]["input"] == {
+            "entity_ref": "device:dev-ppc",
+            "endpoint_ref": endpoint_ref,
+            "integration_path": "eebus_spine",
+        }
+
+        action_response = client.post(
+            "/api/v1/actions/connection.establish",
+            json={
+                "input": {
+                    "entity_ref": "device:dev-ppc",
+                    "endpoint_ref": endpoint_ref,
+                    "integration_path": "eebus_spine",
+                }
+            },
+        )
+
+        assert action_response.status_code == 200
+        action_result = action_response.json()
+        assert action_result["actor"] == "user"
+        assert action_result["action_name"] == "connection.establish"
+        assert action_result["output"]["phase"] == "waiting_for_user_trust"
+        assert action_result["output"]["required_user_action"]["local_ski"]
+        assert action_result["ui_events"] == [
+            {
+                "event_type": "connection.overlay.open",
+                "payload": {
+                    "entity_ref": "device:dev-ppc",
+                    "endpoint_ref": endpoint_ref,
+                    "integration_path": "eebus_spine",
+                    "mode": "waiting_for_user_trust",
+                },
+            }
+        ]
+
+        state_response = client.get(
+            "/api/v1/connections/state",
+            params={
+                "entity_ref": "device:dev-ppc",
+                "endpoint_ref": endpoint_ref,
+                "integration_path": "eebus_spine",
+            },
+        )
+        assert state_response.status_code == 200
+        state = state_response.json()
+        assert state["phase"] == "waiting_for_user_trust"
+        assert state["protocol"] == "eebus_ship"
+        assert state["host"] == "192.168.188.142"
+        assert state["port"] == 23292
+        assert state["last_error"] == ""
+        assert state["connect_action"]["name"] == "connection.establish"
+        assert any(step["key"] == "local_identity" and step["status"] == "completed" for step in state["steps"])
+        assert any(step["key"] == "peer_trust" and step["status"] == "action_required" for step in state["steps"])
+        assert any(step["key"] == "ship_session" and step["status"] == "pending" for step in state["steps"])
+
+        session_factory = get_session_factory()
+        with session_factory() as session:
+            audit_actions = [
+                row.action
+                for row in session.scalars(
+                    select(AuditEvent).where(AuditEvent.target_id == "connection.establish").order_by(AuditEvent.id)
+                ).all()
+            ]
+            assert audit_actions == ["start_action", "complete_action"]
+
+
+def test_connection_establish_continues_after_user_trust_registration(tmp_path, monkeypatch):
+    app = _bootstrap_app(tmp_path, monkeypatch, "commissioning-trust-retry.db")
+    fake_runtime = FakeEebusRuntimeManager(
+        status=["failed", "ship_ready"],
+        error="Node rejected by application.",
+    )
+    monkeypatch.setattr("app.workflows.eebus_connection.probe_eebus_peer_certificate", lambda **_: _fake_eebus_peer_trust())
+    monkeypatch.setattr("app.workflows.eebus_connection.get_eebus_runtime_manager", lambda: fake_runtime)
+
+    with TestClient(app) as client:
+        client.get("/api/v1/agent/thread")
+        _add_device(device_id="dev-ppc", name="PPC SMGW", device_type="grid_meter", manufacturer="PPC")
+        _add_ppc_eebus_candidate("dev-ppc", register=False)
+        endpoint_ref = _endpoint_ref_for_device("dev-ppc", "eebus_ship")
+
+        _use_scripted_provider(
+            monkeypatch,
+            ScriptedModelProvider(
+                [
+                    ModelToolCall(
+                        "connection.establish",
+                        {
+                            "entity_ref": "device:dev-ppc",
+                            "endpoint_ref": endpoint_ref,
+                            "integration_path": "eebus_spine",
+                            "role": "grid_meter",
+                        },
+                    ),
+                    ModelFinalAnswer("Please add the local SKI and tell me when it is accepted."),
+                ]
+            ),
+        )
+        first_events = _send_and_stream(client, "Verbinde das PPC SMGW.")
+        first_result = next(event for event in first_events if event["event_type"] == "tool_finished")["payload"]["result"]
+
+        assert first_result["phase"] == "waiting_for_user_trust"
+        assert first_result["status"] == "waiting_for_user_trust"
+        assert first_result["ship_runtime"]["status"] == "failed"
+        assert first_result["required_user_action"]["retry_tool"] == "connection.establish"
+        assert first_result["required_user_action"]["ship_ready"] is False
+        assert first_result["connection_lifecycle"]["verified_states"]["ship_session"] == "not_ready"
+
+        _use_scripted_provider(
+            monkeypatch,
+            ScriptedModelProvider(
+                [
+                    ModelToolCall(
+                        "connection.establish",
+                        {
+                            "entity_ref": "device:dev-ppc",
+                            "endpoint_ref": endpoint_ref,
+                            "integration_path": "eebus_spine",
+                            "role": "grid_meter",
+                        },
+                    ),
+                    ModelFinalAnswer("SHIP is now verified by the connection workflow."),
+                ]
+            ),
+        )
+        second_events = _send_and_stream(client, "Die SKI wurde akzeptiert, ACK 0.")
+        second_result = next(event for event in second_events if event["event_type"] == "tool_finished")["payload"]["result"]
+
+        assert second_result["phase"] == "ship_ready"
+        assert second_result["status"] == "connected_ship_ready"
+        assert second_result["connection_lifecycle"]["previous_phase"] == "waiting_for_user_trust"
+        assert second_result["connection_lifecycle"]["connection_attempt_count"] == 2
+        assert second_result["connection_lifecycle"]["verified_states"]["ship_session"] == "ready"
+        assert len(fake_runtime.calls) == 2
+
+        session_factory = get_session_factory()
+        with session_factory() as session:
+            task = session.scalar(select(AgentTask).where(AgentTask.task_type == "commission_role_candidate"))
+            assert task is not None
+            assert task.context["connection_attempt_count"] == 2
+            trust_blocker = session.scalar(select(Blocker).where(Blocker.blocker_type == "eebus_peer_trust_required"))
+            assert trust_blocker is not None
+            assert trust_blocker.status == "resolved"
+
+
+def test_readiness_preserves_materialized_eebus_peer_after_inventory_sync(tmp_path, monkeypatch):
+    app = _bootstrap_app(tmp_path, monkeypatch, "commissioning-readiness-preserves-peer.db")
+    fake_runtime = FakeEebusRuntimeManager(status="listening")
+    monkeypatch.setattr("app.workflows.eebus_connection.probe_eebus_peer_certificate", lambda **_: _fake_eebus_peer_trust())
+    monkeypatch.setattr("app.workflows.eebus_connection.get_eebus_runtime_manager", lambda: fake_runtime)
+
+    with TestClient(app) as client:
+        client.get("/api/v1/agent/thread")
+        _add_device(device_id="dev-ppc", name="PPC SMGW", device_type="grid_meter", manufacturer="PPC")
+        _add_ppc_eebus_candidate("dev-ppc", register=False)
+        endpoint_ref = _endpoint_ref_for_device("dev-ppc", "eebus_ship")
+
+        def runtime_snapshot(endpoint_id: str) -> dict[str, Any]:
+            return {
+                "status": "listening",
+                "local_ski": "0123456789abcdef0123456789abcdef01234567",
+                "local_ship_id": "i:32266_u:HELIOS-HOME-HEMS_r:HEMS",
+                "bind_host": "0.0.0.0",
+                "port": 4712,
+                "path": "/ship/",
+                "interface_ip": "192.168.188.10",
+                "trusted_peer_skis": ["f819e215a4f292d803325276767d9e27f67fe108"],
+                "ready_peer_skis": [],
+                "endpoint_refs": [endpoint_ref],
+                "diagnostic_run_refs": [],
+                "recent_events": [],
+                "received_load_power_limit_count": 0,
+                "last_load_power_limit": {},
+                "error": "",
+                "endpoint_in_runtime": endpoint_id == endpoint_ref,
+            }
+
+        monkeypatch.setattr("app.agent.tools.protocol.runtime_snapshot_for_endpoint", runtime_snapshot)
+        _use_scripted_provider(
+            monkeypatch,
+            ScriptedModelProvider(
+                [
+                    ModelToolCall(
+                        "connection.establish",
+                        {
+                            "entity_ref": "device:dev-ppc",
+                            "endpoint_ref": endpoint_ref,
+                            "integration_path": "eebus_spine",
+                            "role": "grid_meter",
+                        },
+                    ),
+                    ModelToolCall(
+                        "connection.inspect_readiness",
+                        {
+                            "entity_ref": "device:dev-ppc",
+                            "endpoint_ref": endpoint_ref,
+                            "integration_path": "eebus_spine",
+                            "role": "grid_meter",
+                        },
+                    ),
+                    ModelFinalAnswer("The peer certificate is still known; SHIP is waiting for a session."),
+                ]
+            ),
+        )
+
+        events = _send_and_stream(client, "Starte PPC Commissioning und prüfe danach die Readiness.")
+
+        tool_results = [event["payload"]["result"] for event in events if event["event_type"] == "tool_finished"]
+        assert tool_results[0]["peer_certificate"]["status"] == "materialized"
+        readiness = tool_results[1]
+        blocker_codes = {blocker["code"] for blocker in readiness["blockers"]}
+        facts = readiness["inspections"][0]["facts"]
+        assert facts["remote_certificate_materialized"] is True
+        assert facts["remote_certificate_ski"] == "f819e215a4f292d803325276767d9e27f67fe108"
+        assert "peer_certificate_not_materialized" not in blocker_codes
+        assert "ship_trust_commissioning_not_validated" in blocker_codes
+
+        session_factory = get_session_factory()
+        with session_factory() as session:
+            sync_inventory_to_home_graph(session, _site_id())
+            endpoint = session.get(ProtocolEndpoint, endpoint_ref)
+            assert endpoint is not None
+            assert endpoint.properties["peer_certificate_ski"] == "f819e215a4f292d803325276767d9e27f67fe108"
+            assert endpoint.properties["tls_probe"]["cert_ski"] == "f819e215a4f292d803325276767d9e27f67fe108"
+
+
+def test_connection_establish_reports_ship_ready_without_legacy_trust_blocker(tmp_path, monkeypatch):
+    app = _bootstrap_app(tmp_path, monkeypatch, "commissioning-ready.db")
+    fake_runtime = FakeEebusRuntimeManager(status="ship_ready")
+    monkeypatch.setattr("app.workflows.eebus_connection.probe_eebus_peer_certificate", lambda **_: _fake_eebus_peer_trust())
+    monkeypatch.setattr("app.workflows.eebus_connection.get_eebus_runtime_manager", lambda: fake_runtime)
 
     with TestClient(app) as client:
         client.get("/api/v1/agent/thread")
@@ -749,7 +1336,53 @@ def test_commissioning_get_log_reads_compact_diagnostic_entries(tmp_path, monkey
             ScriptedModelProvider(
                 [
                     ModelToolCall(
-                        "commissioning.start_or_continue",
+                        "connection.establish",
+                        {
+                            "entity_ref": "device:dev-ppc",
+                            "endpoint_ref": endpoint_ref,
+                            "integration_path": "eebus_spine",
+                            "role": "grid_meter",
+                        },
+                    ),
+                    ModelFinalAnswer("SHIP is ready."),
+                ]
+            ),
+        )
+
+        events = _send_and_stream(client, "Verbinde das PPC SMGW weiter.")
+
+        tool_finished = next(event for event in events if event["event_type"] == "tool_finished")
+        result = tool_finished["payload"]["result"]
+        assert result["status"] == "connected_ship_ready"
+        assert result["phase"] == "ship_ready"
+        assert result["ship_runtime"]["ready_peer_skis"] == ["f819e215a4f292d803325276767d9e27f67fe108"]
+        assert "no_spine_feature_validation" not in result["effects_not_included"]
+        session_factory = get_session_factory()
+        with session_factory() as session:
+            diagnostic = session.get(ProtocolDiagnosticRun, result["diagnostic_run_ref"])
+            assert diagnostic is not None
+            assert diagnostic.result["blocker_codes"] == []
+
+
+def test_commissioning_get_log_reads_compact_diagnostic_entries(tmp_path, monkeypatch):
+    app = _bootstrap_app(tmp_path, monkeypatch, "commissioning-log.db")
+    monkeypatch.setattr("app.workflows.eebus_connection.probe_eebus_peer_certificate", lambda **_: _fake_eebus_peer_trust())
+    monkeypatch.setattr(
+        "app.workflows.eebus_connection.get_eebus_runtime_manager",
+        lambda: FakeEebusRuntimeManager(status="listening"),
+    )
+
+    with TestClient(app) as client:
+        client.get("/api/v1/agent/thread")
+        _add_device(device_id="dev-ppc", name="PPC SMGW", device_type="grid_meter", manufacturer="PPC")
+        _add_ppc_eebus_candidate("dev-ppc", register=False)
+        endpoint_ref = _endpoint_ref_for_device("dev-ppc", "eebus_ship")
+        _use_scripted_provider(
+            monkeypatch,
+            ScriptedModelProvider(
+                [
+                    ModelToolCall(
+                        "connection.establish",
                         {
                             "entity_ref": "device:dev-ppc",
                             "endpoint_ref": endpoint_ref,
@@ -768,7 +1401,9 @@ def test_commissioning_get_log_reads_compact_diagnostic_entries(tmp_path, monkey
         log_result = tool_finished[-1]["payload"]["result"]
         assert tool_finished[-1]["payload"]["tool_name"] == "commissioning.get_log"
         assert len(log_result["diagnostic_runs"]) == 1
-        assert any(entry["event"] == "manual_peer_trust_required" for entry in log_result["diagnostic_runs"][0]["log_entries"])
+        events = {entry["event"] for entry in log_result["diagnostic_runs"][0]["log_entries"]}
+        assert "peer_certificate_materialized" in events
+        assert "eebus_connection_workflow_result" in events
 
 
 def test_binding_proposal_rejects_incompatible_selected_endpoint_path(tmp_path, monkeypatch):
@@ -888,6 +1523,14 @@ def test_discovery_tool_is_available_for_model_operated_network_scan(tmp_path, m
     )
 
     with TestClient(app) as client:
+        client.get("/api/v1/agent/thread")
+        _add_device(
+            device_id="dev-found",
+            name="Found HTTP Endpoint",
+            device_type="smart_appliance",
+            manufacturer="Test",
+            protocols=["http_local"],
+        )
         events = _send_and_stream(client, "Please scan the network.")
 
         runtime_started = next(event for event in events if event["event_type"] == "agent_runtime_started")
@@ -895,6 +1538,12 @@ def test_discovery_tool_is_available_for_model_operated_network_scan(tmp_path, m
         tool_finished = next(event for event in events if event["event_type"] == "tool_finished")
         assert tool_finished["payload"]["tool_name"] == "discovery.inspect_home_network"
         assert tool_finished["payload"]["result"]["candidate_count"] == 1
+        assert tool_finished["payload"]["result"]["canonical_device_count"] == 1
+        assert tool_finished["payload"]["result"]["observed_class_counts"] == {"local_http_endpoint": 1}
+        assert tool_finished["payload"]["result"]["role_hypothesis_counts"] == {}
+        assert tool_finished["payload"]["result"]["primary_observations"][0]["classification_status"] == "unclassified"
+        assert tool_finished["payload"]["result"]["refs"]["entity_refs"] == ["device:dev-found"]
+        assert "new_device_ids" not in tool_finished["payload"]["result"]
 
 
 def test_discovery_tool_failure_marks_invocation_task_and_step_failed(tmp_path, monkeypatch):

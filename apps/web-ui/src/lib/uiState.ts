@@ -298,6 +298,8 @@ export function parseUiEvents(input: unknown): UIStateEffect[] {
       return (
         eventType === "view.open" ||
         eventType === "entity.focus" ||
+        eventType === "device.details.open" ||
+        eventType === "connection.overlay.open" ||
         eventType === "entity.relationship.show" ||
         eventType === "task.show" ||
         eventType === "proposal.present" ||

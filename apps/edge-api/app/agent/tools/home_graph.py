@@ -84,6 +84,6 @@ def _semantic_types_for_role(role: str) -> set[str]:
         "pv_inverter": {"pv_inverter"},
         "battery": {"battery"},
         "heat_pump": {"heat_pump"},
-        "controllable_load": {"controllable_load", "smart_appliance"},
+        "controllable_load": {"controllable_load"},
     }
     return role_map.get(role, {role})

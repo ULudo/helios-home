@@ -17,6 +17,8 @@ IntegrationPath = Literal["eebus_spine", "modbus_tcp", "sunspec_modbus", "http_l
 UiEventType = Literal[
     "view.open",
     "entity.focus",
+    "device.details.open",
+    "connection.overlay.open",
     "entity.relationship.show",
     "task.show",
     "proposal.present",
@@ -144,10 +146,10 @@ class EebusIdentityGetOrCreateInput(BaseModel):
     common_name: str = "Helios Home HEMS"
 
 
-class CommissioningStartOrContinueInput(BaseModel):
+class ConnectionEstablishInput(BaseModel):
     entity_ref: str
     endpoint_ref: str = ""
-    integration_path: IntegrationPath | Literal[""] = ""
+    integration_path: Literal["eebus_spine"]
     role: HemsRole | None = None
     reason: str = ""
 
@@ -170,12 +172,38 @@ class UiFocusEntitiesInput(BaseModel):
     reason: str = ""
 
 
+class UiOpenDeviceDetailsInput(BaseModel):
+    entity_ref: str
+
+
+class UiOpenConnectionOverlayInput(BaseModel):
+    entity_ref: str
+    endpoint_ref: str
+    integration_path: IntegrationPath
+
+
 def view_open_event(view: Literal["overview", "settings"], mode: Literal["peek", "focus", "switch"] = "focus") -> AgentUiEvent:
     return AgentUiEvent(event_type="view.open", payload={"view": view, "mode": mode})
 
 
 def focus_entities_event(entity_refs: list[str], reason: str = "", mode: Literal["focus", "highlight"] = "focus") -> AgentUiEvent:
     return AgentUiEvent(event_type="entity.focus", payload={"entity_refs": entity_refs, "reason": reason, "mode": mode})
+
+
+def open_device_details_event(entity_ref: str) -> AgentUiEvent:
+    return AgentUiEvent(event_type="device.details.open", payload={"entity_ref": entity_ref})
+
+
+def open_connection_overlay_event(entity_ref: str, endpoint_ref: str, integration_path: str, mode: str = "focus") -> AgentUiEvent:
+    return AgentUiEvent(
+        event_type="connection.overlay.open",
+        payload={
+            "entity_ref": entity_ref,
+            "endpoint_ref": endpoint_ref,
+            "integration_path": integration_path,
+            "mode": mode,
+        },
+    )
 
 
 def show_relationship_event(from_ref: str, to_ref: str, relationship: str) -> AgentUiEvent:

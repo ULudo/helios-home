@@ -1,7 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.actions.schemas import ActionExecuteRequest, ActionExecutionRead, ConnectionOptionsRead, ConnectionStateRead
+from app.actions.service import ActionContext, execute_action, get_connection_options, get_connection_state
 from app.agent.schemas import (
     ActionProposalDecisionRead,
     AgentMessageCreate,
@@ -22,6 +25,7 @@ from app.agent.service import (
     update_agent_provider_config,
 )
 from app.core.config import get_settings
+from app.db.models import Site
 from app.db.session import get_session
 from app.domain.schemas import DiscoveryRunRead, OverviewResponse, ReachableSubnetRead, SiteRead, SiteUpdate
 from app.hems.schemas import (
@@ -51,6 +55,13 @@ from app.services.network_scope import list_reachable_subnets
 router = APIRouter()
 
 
+def _get_site(session: Session) -> Site:
+    site = session.scalar(select(Site).limit(1))
+    if site is None:
+        raise RuntimeError("Site has not been seeded.")
+    return site
+
+
 @router.get("/overview", response_model=OverviewResponse)
 def read_overview(session: Session = Depends(get_session)) -> OverviewResponse:
     return build_overview(session)
@@ -67,6 +78,49 @@ def read_reachable_subnets() -> list[ReachableSubnetRead]:
 @router.post("/discovery/runs", response_model=DiscoveryRunRead)
 def create_discovery_run(session: Session = Depends(get_session)) -> DiscoveryRunRead:
     return run_discovery(session)
+
+
+@router.get("/devices/{device_id}/connection-options", response_model=ConnectionOptionsRead)
+def read_device_connection_options(device_id: str, session: Session = Depends(get_session)) -> ConnectionOptionsRead:
+    try:
+        return get_connection_options(session, _get_site(session), device_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/connections/state", response_model=ConnectionStateRead)
+def read_connection_state(
+    entity_ref: str,
+    endpoint_ref: str = "",
+    integration_path: str = "",
+    session: Session = Depends(get_session),
+) -> ConnectionStateRead:
+    try:
+        return get_connection_state(
+            session,
+            _get_site(session),
+            entity_ref=entity_ref,
+            endpoint_ref=endpoint_ref,
+            integration_path=integration_path,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/actions/{action_name}", response_model=ActionExecutionRead)
+def execute_dashboard_action(
+    action_name: str,
+    payload: ActionExecuteRequest,
+    session: Session = Depends(get_session),
+) -> ActionExecutionRead:
+    try:
+        return execute_action(
+            ActionContext(session=session, site=_get_site(session), actor="user"),
+            action_name,
+            payload.input,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.patch("/site", response_model=SiteRead)

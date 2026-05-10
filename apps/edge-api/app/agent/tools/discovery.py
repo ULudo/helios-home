@@ -8,6 +8,7 @@ from app.agent.tools.schemas import (
     show_task_event,
     view_open_event,
 )
+from app.home_graph.service import canonical_inventory_summary
 from app.work_store.service import (
     add_blocker,
     add_task_step,
@@ -114,18 +115,27 @@ class DiscoveryInspectHomeNetworkTool:
             summary="discovery_completed",
         )
         context.session.commit()
+        inventory_summary = canonical_inventory_summary(context.session, context.site.id)
 
         return ToolExecutionResult(
             output={
                 "task_ref": task.id,
                 "run_ref": result["run"].get("id"),
-                "result": result["result"],
+                "result": "devices_found" if result["candidate_count"] else result["result"],
+                "canonical_device_count": inventory_summary["canonical_device_count"],
+                "observed_class_counts": inventory_summary["observed_class_counts"],
+                "role_hypothesis_counts": inventory_summary["role_hypothesis_counts"],
+                "primary_observations": inventory_summary["primary_observations"],
+                "raw_artifact_counts": inventory_summary["raw_artifact_counts"],
+                "details_available_via": ["home_graph.query", "home_graph.get_entity_details"],
                 "scope": result["scope"],
                 "source_results": result["source_results"],
                 "candidate_count": result["candidate_count"],
                 "integrated_devices": result["integrated_devices"],
-                "new_device_ids": result["new_device_ids"],
-                "entity_refs": entity_refs,
+                "refs": {
+                    "new_device_ids": result["new_device_ids"],
+                    "entity_refs": entity_refs,
+                },
                 "status": "completed",
             },
             ui_events=[

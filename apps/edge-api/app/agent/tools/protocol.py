@@ -18,6 +18,7 @@ from app.services.eebus_identity import (
     get_or_create_eebus_local_identity,
     read_eebus_local_identity,
 )
+from app.services.eebus_runtime import runtime_snapshot_for_endpoint
 from app.workflows.role_binding import allowed_integration_paths_for_protocol
 
 
@@ -252,15 +253,35 @@ def _inspect_single_path(
     if integration_path == "eebus_spine":
         identity = read_eebus_local_identity(context.session, site_id=context.site.id)
         register_value = properties.get("register")
+        runtime = runtime_snapshot_for_endpoint(endpoint.id)
+        runtime_ready = (
+            runtime.get("endpoint_in_runtime") is True
+            and runtime.get("status") == "ship_ready"
+            and bool(runtime.get("ready_peer_skis"))
+        )
+        runtime_error = _runtime_error(runtime)
+        peer_rejected = _runtime_error_indicates_peer_rejection(runtime_error)
         facts.update(
             {
                 "ship_path": properties.get("path", ""),
                 "remote_ship_id": properties.get("ship_id", ""),
                 "remote_ski": properties.get("ski", ""),
+                "remote_certificate_ski": properties.get("peer_certificate_ski", ""),
+                "remote_certificate_materialized": bool(properties.get("peer_certificate_pem")),
+                "txt_ski_matches_certificate_ski": properties.get("txt_ski_matches_certificate_ski"),
                 "remote_register": register_value,
                 "supported_use_cases_observed": properties.get("supported_use_cases", []),
                 "local_identity_exists": identity is not None,
                 "local_ski": identity.ski if identity is not None else "",
+                "runtime": runtime,
+                "runtime_connection_states": runtime.get("endpoint_connection_states", {}),
+                "active_connection_directions": runtime.get("active_connection_directions", []),
+                "last_runtime_error": runtime_error,
+                "ship_session_state": "ready" if runtime_ready else "not_ready",
+                "spine_feature_exchange_state": "not_validated",
+                "lpc_lpp_receive_state": (
+                    "observed" if runtime.get("received_load_power_limit_count", 0) else "not_validated"
+                ),
             }
         )
         if identity is None:
@@ -271,26 +292,43 @@ def _inspect_single_path(
                     "detail": "No local Helios EEBus identity/SKI exists yet.",
                 }
             )
-        if register_value is False:
+        if not properties.get("peer_certificate_pem"):
             blockers.append(
                 {
-                    "code": "remote_auto_registration_closed",
+                    "code": "peer_certificate_not_materialized",
                     "severity": "blocking",
-                    "detail": "The peer advertises register=false; manual trust configuration is likely required.",
+                    "detail": "The peer certificate has not been materialized yet, so Helios cannot validate SHIP trust anchors.",
                 }
             )
-        blockers.append(
-            {
-                "code": "ship_trust_commissioning_not_validated",
-                "severity": "blocking",
-                "detail": "No successful SHIP trust commissioning has been recorded.",
-            }
-        )
+        if not runtime_ready:
+            blocker_code = "eebus_peer_trust_required" if peer_rejected else "ship_trust_commissioning_not_validated"
+            blockers.append(
+                {
+                    "code": blocker_code,
+                    "severity": "blocking",
+                    "detail": runtime_error or "No successful SHIP session is currently recorded for this endpoint.",
+                }
+            )
         validation_results.extend(
             [
                 {"check": "ship_endpoint_observed", "status": "passed"},
-                {"check": "spine_feature_discovery", "status": "not_run"},
-                {"check": "lpc_lpp_capability_validation", "status": "not_run"},
+                {"check": "local_identity", "status": "passed" if identity is not None else "not_run"},
+                {"check": "peer_certificate", "status": "passed" if properties.get("peer_certificate_pem") else "not_run"},
+                {"check": "ship_session", "status": "passed" if runtime_ready else "not_run"},
+                {
+                    "check": "outbound_ship_session",
+                    "status": (
+                        "passed"
+                        if (runtime.get("endpoint_connection_states", {}).get("outbound_to_peer", {}).get("status") == "ready")
+                        else "failed"
+                        if (runtime.get("endpoint_connection_states", {}).get("outbound_to_peer", {}).get("status") == "failed")
+                        else "not_run"
+                    ),
+                },
+                {
+                    "check": "lpc_lpp_runtime_receive",
+                    "status": "passed" if runtime.get("received_load_power_limit_count", 0) else "not_run",
+                },
             ]
         )
     else:
@@ -305,6 +343,26 @@ def _inspect_single_path(
         "validation_results": validation_results,
         "blockers": blockers,
     }
+
+
+def _runtime_error(runtime: dict) -> str:
+    errors: list[str] = []
+    if runtime.get("error"):
+        errors.append(str(runtime.get("error")))
+    for state in (runtime.get("endpoint_connection_states") or {}).values():
+        if isinstance(state, dict) and state.get("error"):
+            errors.append(str(state.get("error")))
+    for event in runtime.get("recent_events") or []:
+        if isinstance(event, dict) and event.get("error"):
+            errors.append(str(event.get("error")))
+        if isinstance(event, dict) and event.get("reason"):
+            errors.append(str(event.get("reason")))
+    return " | ".join(dict.fromkeys(errors))
+
+
+def _runtime_error_indicates_peer_rejection(error: str) -> bool:
+    normalized = error.lower()
+    return "rejected by application" in normalized or "node rejected" in normalized
 
 
 def _available_transitions(inspections: list[dict]) -> list[dict]:
@@ -327,6 +385,16 @@ def _available_transitions(inspections: list[dict]) -> list[dict]:
             }
         )
     if flattened:
+        if any(path.get("integration_path") == "eebus_spine" for path in flattened):
+            transitions.append(
+                {
+                    "transition": "establish_connection",
+                    "tool": "connection.establish",
+                    "allowed": True,
+                    "risk": "medium",
+                    "requires_user_decision": False,
+                }
+            )
         transitions.append(
             {
                 "transition": "prepare_binding_proposal",

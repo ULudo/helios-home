@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
@@ -15,6 +16,7 @@ from app.services.eebus import (
     build_load_power_limit_payload,
     discover_eebus_site,
 )
+from app.services.eebus_runtime import EebusPeerTrustMaterial, EebusRuntimeManager, _extract_load_power_limit_commands
 
 
 def _fake_ship_service(**overrides):
@@ -167,3 +169,262 @@ def test_eebus_lpc_distribution_tightens_policy_and_replans(tmp_path, monkeypatc
     assert payload["applied_grid_export_limit_kw"] == 12.0
     assert payload["changed_policy_fields"] == {"grid_import_limit_kw": 4.2}
     assert payload["plan"]["triggered_by"] == "eebus_lpc"
+
+
+def test_eebus_runtime_extracts_incoming_lpc_write_from_ship_trace_payload():
+    payload = {
+        "data": {
+            "header": {"protocolId": "ee1.0"},
+            "payload": {
+                "datagram": {
+                    "header": {
+                        "specificationVersion": "1.3.0",
+                        "cmdClassifier": "write",
+                        "ackRequest": True,
+                    },
+                    "payload": {
+                        "cmd": [
+                            {
+                                "function": "loadControlLimitListData",
+                                "loadControlLimitListData": {
+                                    "loadControlLimitData": [
+                                        {
+                                            "limitId": 0,
+                                            "isLimitActive": True,
+                                            "timePeriod": {"endTime": "PT10M"},
+                                            "value": {"number": 6000, "scale": 0},
+                                        }
+                                    ]
+                                },
+                            }
+                        ]
+                    },
+                }
+            },
+        }
+    }
+
+    commands = _extract_load_power_limit_commands(payload)
+
+    assert commands == [
+        {
+            "use_case": "limitationOfPowerConsumption",
+            "limit_id": 0,
+            "limit_watts": 6000,
+            "duration_seconds": 600,
+            "is_active": True,
+            "raw": {
+                "state": {
+                    "raw": {
+                        "limitId": 0,
+                        "isLimitActive": True,
+                        "timePeriod": {"endTime": "PT10M"},
+                        "value": {"number": 6000, "scale": 0},
+                    },
+                    "limit_id": 0,
+                    "direction": "consume",
+                    "is_active": True,
+                    "protocol_watts": 6000,
+                    "watts": 6000,
+                    "scale": 0,
+                    "duration": "PT10M",
+                },
+                "header": {
+                    "specificationVersion": "1.3.0",
+                    "cmdClassifier": "write",
+                    "ackRequest": True,
+                },
+                "command": {
+                    "function": "loadControlLimitListData",
+                    "loadControlLimitListData": {
+                        "loadControlLimitData": [
+                            {
+                                "limitId": 0,
+                                "isLimitActive": True,
+                                "timePeriod": {"endTime": "PT10M"},
+                                "value": {"number": 6000, "scale": 0},
+                            }
+                        ]
+                    },
+                },
+            },
+        }
+    ]
+
+
+def test_eebus_runtime_connects_outbound_to_discovered_ship_endpoint(monkeypatch, tmp_path):
+    calls: list[dict] = []
+
+    class FakeHemsClient:
+        def __init__(self):
+            self.session = SimpleNamespace(remote_ship_id="i:321_u:REMOTE_r:SMGW")
+
+        @classmethod
+        async def connect(cls, service, identity, trust, **kwargs):
+            calls.append(
+                {
+                    "host": service.preferred_host(),
+                    "port": service.port,
+                    "path": service.path,
+                    "server_name": service.server_name(),
+                    "ski": service.ski,
+                    "identity_ski": identity.ski,
+                    "profile": kwargs.get("profile"),
+                }
+            )
+            return cls()
+
+        async def session_events(self):
+            while True:
+                await asyncio.sleep(3600)
+                yield SimpleNamespace(kind="idle", payload={})
+
+        async def handle_incoming_datagram(self, datagram):
+            return []
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(
+        "app.services.eebus_runtime.materialize_eebus_identity",
+        lambda identity, directory: SimpleNamespace(
+            ski=identity.ski,
+            ship_id="i:32266_u:HELIOS-HOME-HEMS_r:HEMS",
+            device_id="HELIOS-HOME-HEMS",
+        ),
+    )
+    monkeypatch.setattr("eebus_sdk.HemsClient", FakeHemsClient)
+
+    manager = EebusRuntimeManager()
+    try:
+        snapshot = manager.start_or_update(
+            session_factory=lambda: None,
+            settings=SimpleNamespace(
+                eebus_interface_ip="192.0.2.10",
+                eebus_ship_bind_host="0.0.0.0",
+                eebus_ship_port=4714,
+                eebus_ship_path="/ship/",
+                eebus_ship_device_id="",
+                eebus_timeout_seconds=1.0,
+            ),
+            local_identity=SimpleNamespace(ski="618a6ecdef40aaf6d5c36f01f971c610a13c0aed"),
+            peer=EebusPeerTrustMaterial(
+                host="192.0.2.40",
+                port=23292,
+                server_name="peer.local",
+                advertised_ski="f819e215a4f292d803325276767d9e27f67fe108",
+                certificate_pem="-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n",
+                certificate_ski="f819e215a4f292d803325276767d9e27f67fe108",
+                txt_ski_matches_certificate_ski=True,
+                client_cert_requested=True,
+                openssl_exit_code=0,
+                path="/ship/",
+            ),
+            entity_ref="device:peer",
+            endpoint_ref="endpoint:peer-eebus",
+            diagnostic_run_ref="",
+            connection_direction="outbound_to_peer",
+        )
+
+        assert snapshot.status == "ship_ready"
+        assert calls == [
+            {
+                "host": "192.0.2.40",
+                "port": 23292,
+                "path": "/ship/",
+                "server_name": "peer.local",
+                "ski": "f819e215a4f292d803325276767d9e27f67fe108",
+                "identity_ski": "618a6ecdef40aaf6d5c36f01f971c610a13c0aed",
+                "profile": "cls-adapter",
+            }
+        ]
+        state = snapshot.connection_states["endpoint:peer-eebus"]["outbound_to_peer"]
+        assert state["status"] == "ready"
+        assert state["host"] == "192.0.2.40"
+        assert state["port"] == 23292
+    finally:
+        manager.stop()
+
+
+def test_eebus_runtime_reuses_same_outbound_endpoint_session(monkeypatch):
+    calls: list[str] = []
+
+    class FakeHemsClient:
+        def __init__(self):
+            self.session = SimpleNamespace(remote_ship_id="i:321_u:REMOTE_r:SMGW")
+
+        @classmethod
+        async def connect(cls, service, identity, trust, **kwargs):
+            calls.append(service.preferred_host())
+            return cls()
+
+        async def session_events(self):
+            while True:
+                await asyncio.sleep(3600)
+                yield SimpleNamespace(kind="idle", payload={})
+
+        async def handle_incoming_datagram(self, datagram):
+            return []
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(
+        "app.services.eebus_runtime.materialize_eebus_identity",
+        lambda identity, directory: SimpleNamespace(
+            ski=identity.ski,
+            ship_id="i:32266_u:HELIOS-HOME-HEMS_r:HEMS",
+            device_id="HELIOS-HOME-HEMS",
+        ),
+    )
+    monkeypatch.setattr("eebus_sdk.HemsClient", FakeHemsClient)
+    settings = SimpleNamespace(
+        eebus_interface_ip="192.0.2.10",
+        eebus_ship_bind_host="0.0.0.0",
+        eebus_ship_port=4714,
+        eebus_ship_path="/ship/",
+        eebus_ship_device_id="",
+        eebus_timeout_seconds=1.0,
+    )
+    identity = SimpleNamespace(ski="618a6ecdef40aaf6d5c36f01f971c610a13c0aed")
+    peer = EebusPeerTrustMaterial(
+        host="192.0.2.40",
+        port=23292,
+        server_name="peer.local",
+        advertised_ski="f819e215a4f292d803325276767d9e27f67fe108",
+        certificate_pem="-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n",
+        certificate_ski="f819e215a4f292d803325276767d9e27f67fe108",
+        txt_ski_matches_certificate_ski=True,
+        client_cert_requested=True,
+        openssl_exit_code=0,
+        path="/ship/",
+    )
+
+    manager = EebusRuntimeManager()
+    try:
+        first = manager.start_or_update(
+            session_factory=lambda: None,
+            settings=settings,
+            local_identity=identity,
+            peer=peer,
+            entity_ref="device:peer",
+            endpoint_ref="endpoint:peer-eebus",
+            diagnostic_run_ref="",
+            connection_direction="outbound_to_peer",
+        )
+        second = manager.start_or_update(
+            session_factory=lambda: None,
+            settings=settings,
+            local_identity=identity,
+            peer=peer,
+            entity_ref="device:peer",
+            endpoint_ref="endpoint:peer-eebus",
+            diagnostic_run_ref="",
+            connection_direction="outbound_to_peer",
+        )
+
+        assert first.status == "ship_ready"
+        assert second.status == "ship_ready"
+        assert calls == ["192.0.2.40"]
+    finally:
+        manager.stop()

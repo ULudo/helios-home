@@ -208,7 +208,7 @@ def _semantic_type_matches_role(semantic_type: str, role: str) -> bool:
         "pv_inverter": {"pv_inverter"},
         "battery": {"battery"},
         "heat_pump": {"heat_pump"},
-        "controllable_load": {"controllable_load", "smart_appliance"},
+        "controllable_load": {"controllable_load"},
     }
     return semantic_type in role_map.get(role, {role})
 

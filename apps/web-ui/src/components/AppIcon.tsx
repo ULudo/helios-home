@@ -10,6 +10,7 @@ export type AppIconName =
   | "sun"
   | "send"
   | "home"
+  | "discover"
   | "grid"
   | "pv"
   | "battery"
@@ -111,6 +112,15 @@ export function AppIcon({ name, className, ...props }: AppIconProps) {
           <path d="M4 11.5 12 5l8 6.5" />
           <path d="M7 10.5V19h10v-8.5" />
           <path d="M10 19v-5h4v5" />
+        </>
+      ) : null}
+      {name === "discover" ? (
+        <>
+          <circle cx="12" cy="12" r="1.8" />
+          <path d="M12 12 18 6" />
+          <path d="M5.6 18.4a9 9 0 1 1 12.8 0" />
+          <path d="M8.4 15.6a5 5 0 1 1 7.2 0" />
+          <path d="M3 21h18" />
         </>
       ) : null}
       {name === "grid" ? (

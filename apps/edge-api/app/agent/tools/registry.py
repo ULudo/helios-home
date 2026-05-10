@@ -6,7 +6,8 @@ from uuid import uuid4
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel
 
-from app.agent.tools.commissioning import CommissioningGetLogTool, CommissioningStartOrContinueTool
+from app.agent.tools.commissioning import CommissioningGetLogTool
+from app.agent.tools.connection import ConnectionEstablishTool
 from app.agent.tools.device import DeviceAssessTool
 from app.agent.tools.discovery import DiscoveryInspectHomeNetworkTool
 from app.agent.tools.evidence import EvidenceRecordUserAssertionTool
@@ -15,7 +16,7 @@ from app.agent.tools.protocol import ConnectionInspectReadinessTool, EebusIdenti
 from app.agent.tools.reference import HomeGraphResolveEntityReferenceTool
 from app.agent.tools.roles import RolePrepareBindingProposalTool
 from app.agent.tools.schemas import AgentTool, AgentToolContext, ToolExecutionResult, ToolSpecRead
-from app.agent.tools.ui import UiFocusEntitiesTool
+from app.agent.tools.ui import UiFocusEntitiesTool, UiOpenConnectionOverlayTool, UiOpenDeviceDetailsTool
 from app.agent.tools.work import WorkGetStatusTool
 from app.db.models import AgentUiEvent, AuditEvent, ToolInvocation, utcnow
 
@@ -63,14 +64,16 @@ def create_default_tool_registry() -> ToolRegistry:
             EvidenceRecordUserAssertionTool(),
             ProtocolListEndpointsTool(),
             ConnectionInspectReadinessTool(),
+            ConnectionEstablishTool(),
             EebusIdentityGetOrCreateTool(),
-            CommissioningStartOrContinueTool(),
             CommissioningGetLogTool(),
             DiscoveryInspectHomeNetworkTool(),
             DeviceAssessTool(),
             RolePrepareBindingProposalTool(),
             WorkGetStatusTool(),
             UiFocusEntitiesTool(),
+            UiOpenDeviceDetailsTool(),
+            UiOpenConnectionOverlayTool(),
         ]
     )
 

@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select
 
 from app.db.models import Proposal, ProtocolEndpoint, UserDecisionRequest
-from app.home_graph.service import resolve_entity
+from app.home_graph.service import connection_facets_for_entity, resolve_entity
 from app.work_store.service import (
     create_proposal_with_decision_request,
     latest_accepted_role_candidate_for_entity,
@@ -12,7 +12,14 @@ from app.work_store.service import (
 
 
 ROLE_BINDING_EFFECTS_IF_APPROVED = ["create_role_candidate", "mark_role_candidate_user_approved"]
-ROLE_BINDING_EFFECTS_NOT_INCLUDED = ["no_pairing", "no_commissioning", "no_control", "no_device_configuration"]
+ROLE_BINDING_EFFECTS_NOT_INCLUDED = [
+    "no_ship_trust",
+    "no_commissioning",
+    "no_spine_validation",
+    "no_telemetry_validation",
+    "no_control",
+    "no_device_configuration",
+]
 
 INTEGRATION_PATH_PROTOCOLS = {
     "eebus_spine": {"eebus_ship"},
@@ -120,6 +127,11 @@ def prepare_role_binding_proposal(
         endpoint_ref=requested_endpoint_ref,
         integration_path=requested_integration_path,
     )
+    connection_facets = connection_facets_for_entity(
+        session,
+        entity_ref=entity.id,
+        endpoints=[endpoint] if endpoint is not None else None,
+    )
     safe_label = label.strip() or entity.display_name
     accepted = latest_accepted_role_candidate_for_entity(
         session,
@@ -146,6 +158,12 @@ def prepare_role_binding_proposal(
             "target_refs": [entity.id, f"role:{role}", accepted["role_candidate_ref"]],
             "risk_level": "medium",
             "role_candidate": accepted,
+            "connection_facets": connection_facets,
+            "binding_scope": {
+                "establishes_role_candidate_only": True,
+                "establishes_protocol_connection": False,
+                "validates_spine_or_telemetry": False,
+            },
         }
 
     existing = _find_existing_role_proposal(
@@ -173,6 +191,12 @@ def prepare_role_binding_proposal(
             "risk_level": proposal.risk_level,
             "effects_if_approved": ROLE_BINDING_EFFECTS_IF_APPROVED,
             "effects_not_included": ROLE_BINDING_EFFECTS_NOT_INCLUDED,
+            "connection_facets": connection_facets,
+            "binding_scope": {
+                "establishes_role_candidate_only": True,
+                "establishes_protocol_connection": False,
+                "validates_spine_or_telemetry": False,
+            },
             "existing": True,
         }
 
@@ -195,6 +219,12 @@ def prepare_role_binding_proposal(
             "endpoint_protocol": endpoint.protocol if endpoint is not None else "",
             "integration_path": requested_integration_path,
             "rationale": rationale,
+            "connection_facets_at_creation": connection_facets,
+            "binding_scope": {
+                "establishes_role_candidate_only": True,
+                "establishes_protocol_connection": False,
+                "validates_spine_or_telemetry": False,
+            },
             "decision_required": True,
             "effects_if_approved": ROLE_BINDING_EFFECTS_IF_APPROVED,
             "effects_not_included": ROLE_BINDING_EFFECTS_NOT_INCLUDED,
@@ -220,4 +250,10 @@ def prepare_role_binding_proposal(
         "risk_level": proposal.risk_level,
         "effects_if_approved": ROLE_BINDING_EFFECTS_IF_APPROVED,
         "effects_not_included": ROLE_BINDING_EFFECTS_NOT_INCLUDED,
+        "connection_facets": connection_facets,
+        "binding_scope": {
+            "establishes_role_candidate_only": True,
+            "establishes_protocol_connection": False,
+            "validates_spine_or_telemetry": False,
+        },
     }

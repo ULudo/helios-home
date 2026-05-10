@@ -25,6 +25,22 @@ from app.db.models import (
     Site,
     utcnow,
 )
+from app.services.eebus_runtime import runtime_snapshot_for_endpoint
+
+
+_ENDPOINT_RUNTIME_PROPERTY_KEYS = {
+    "peer_certificate_pem",
+    "peer_certificate_ski",
+    "txt_ski_matches_certificate_ski",
+}
+
+_ENDPOINT_RUNTIME_TLS_PROBE_KEYS = {
+    "available",
+    "client_cert_requested",
+    "openssl_exit_code",
+    "cert_ski",
+    "txt_ski_matches_cert_ski",
+}
 
 
 def entity_ref(entity_type: str, source_id: str) -> str:
@@ -104,9 +120,38 @@ def _upsert_endpoint(
         clean_properties["confidence"] = confidence
     if host:
         clean_properties["host"] = host
+    if endpoint.properties:
+        clean_properties = _merge_runtime_endpoint_properties(clean_properties, endpoint.properties)
     endpoint.properties = clean_properties
     endpoint.updated_at = utcnow()
     return endpoint
+
+
+def _merge_runtime_endpoint_properties(incoming: dict, existing: dict) -> dict:
+    merged = dict(incoming)
+    for key in _ENDPOINT_RUNTIME_PROPERTY_KEYS:
+        if existing.get(key) and not merged.get(key):
+            merged[key] = existing[key]
+
+    existing_tls_probe = existing.get("tls_probe") if isinstance(existing.get("tls_probe"), dict) else {}
+    incoming_tls_probe = merged.get("tls_probe") if isinstance(merged.get("tls_probe"), dict) else {}
+    preserved_tls_probe = dict(incoming_tls_probe)
+    for key in _ENDPOINT_RUNTIME_TLS_PROBE_KEYS:
+        if existing_tls_probe.get(key) is not None and preserved_tls_probe.get(key) is None:
+            preserved_tls_probe[key] = existing_tls_probe[key]
+    if preserved_tls_probe:
+        merged["tls_probe"] = preserved_tls_probe
+    elif merged.get("tls_probe") is None:
+        merged.pop("tls_probe", None)
+    return merged
+
+
+def _has_runtime_endpoint_state(endpoint: ProtocolEndpoint) -> bool:
+    properties = endpoint.properties or {}
+    if any(properties.get(key) for key in _ENDPOINT_RUNTIME_PROPERTY_KEYS):
+        return True
+    tls_probe = properties.get("tls_probe") if isinstance(properties.get("tls_probe"), dict) else {}
+    return any(tls_probe.get(key) is not None for key in _ENDPOINT_RUNTIME_TLS_PROBE_KEYS)
 
 
 def _first_string(*values: Any) -> str:
@@ -267,6 +312,8 @@ def _endpoint_specs(
                         "path": _first_string(ship.get("path")),
                         "ship_id": _first_string(ship.get("ship_id")),
                         "ski": _first_string(ship.get("ski")),
+                        "target": _first_string(ship.get("target")),
+                        "addresses": ship.get("addresses") if isinstance(ship.get("addresses"), dict) else {},
                         "register": ship.get("register") if isinstance(ship.get("register"), bool) else None,
                         "supported_use_cases": evidence.get("supported_use_cases") if isinstance(evidence.get("supported_use_cases"), list) else [],
                         "tls_probe": ship.get("tls_probe"),
@@ -335,9 +382,9 @@ def sync_inventory_to_home_graph(session: Session, site_id: int | None = None) -
         raise RuntimeError("Site has not been seeded.")
 
     refs: list[str] = []
+    observed_endpoint_ids: set[str] = set()
     candidates = session.scalars(select(DeviceCandidate).where(DeviceCandidate.site_id == site.id)).all()
     candidate_by_device_id = {candidate.matched_device_id: candidate for candidate in candidates if candidate.matched_device_id}
-    session.query(ProtocolEndpoint).filter(ProtocolEndpoint.site_id == site.id).delete(synchronize_session=False)
     for candidate in candidates:
         ref = entity_ref("candidate", candidate.id)
         refs.append(ref)
@@ -371,7 +418,7 @@ def sync_inventory_to_home_graph(session: Session, site_id: int | None = None) -
             last_seen_at=candidate.last_seen_at,
             confidence=candidate.classification_confidence,
         ):
-            _upsert_endpoint(
+            endpoint = _upsert_endpoint(
                 session,
                 site_id=site.id,
                 owner_ref=ref,
@@ -384,6 +431,7 @@ def sync_inventory_to_home_graph(session: Session, site_id: int | None = None) -
                 confidence=float(spec.get("confidence") or 0.0),
                 properties=spec.get("properties") if isinstance(spec.get("properties"), dict) else {},
             )
+            observed_endpoint_ids.add(endpoint.id)
 
     devices = session.scalars(select(Device).where(Device.site_id == site.id)).all()
     for device in devices:
@@ -421,7 +469,7 @@ def sync_inventory_to_home_graph(session: Session, site_id: int | None = None) -
             last_seen_at=device.last_seen_at,
             confidence=float(confidence or 0.0),
         ):
-            _upsert_endpoint(
+            endpoint = _upsert_endpoint(
                 session,
                 site_id=site.id,
                 owner_ref=ref,
@@ -434,6 +482,17 @@ def sync_inventory_to_home_graph(session: Session, site_id: int | None = None) -
                 confidence=float(spec.get("confidence") or 0.0),
                 properties=spec.get("properties") if isinstance(spec.get("properties"), dict) else {},
             )
+            observed_endpoint_ids.add(endpoint.id)
+
+    for endpoint in session.scalars(select(ProtocolEndpoint).where(ProtocolEndpoint.site_id == site.id)).all():
+        if endpoint.id in observed_endpoint_ids:
+            continue
+        if _has_runtime_endpoint_state(endpoint):
+            endpoint.status = "stale"
+            endpoint.updated_at = utcnow()
+            session.add(endpoint)
+        else:
+            session.delete(endpoint)
 
     session.commit()
     return refs
@@ -448,8 +507,16 @@ def canonical_inventory_summary(session: Session, site_id: int) -> dict:
     candidates = session.scalars(select(DeviceCandidate).where(DeviceCandidate.site_id == site_id)).all()
     graph_entities = session.scalars(select(HomeGraphEntity).where(HomeGraphEntity.site_id == site_id)).all()
     by_type: dict[str, int] = {}
+    observed_class_counts: dict[str, int] = {}
+    role_hypothesis_counts: dict[str, int] = {}
     for device in devices:
         by_type[device.device_type or "unknown"] = by_type.get(device.device_type or "unknown", 0) + 1
+        properties = _device_summary_properties(device)
+        observed_class = _observed_class_for_properties(properties)
+        observed_class_counts[observed_class] = observed_class_counts.get(observed_class, 0) + 1
+        for hypothesis in _role_hypotheses_for_semantic_type(device.device_type):
+            role = hypothesis["role"]
+            role_hypothesis_counts[role] = role_hypothesis_counts.get(role, 0) + 1
     raw_candidates_by_type: dict[str, int] = {}
     for candidate in candidates:
         raw_candidates_by_type[candidate.device_type or "unknown"] = raw_candidates_by_type.get(candidate.device_type or "unknown", 0) + 1
@@ -459,18 +526,34 @@ def canonical_inventory_summary(session: Session, site_id: int) -> dict:
     return {
         "canonical_device_count": len(devices),
         "canonical_device_counts_by_type": by_type,
+        "observed_class_counts": observed_class_counts,
+        "role_hypothesis_counts": role_hypothesis_counts,
         "canonical_devices": [
             {
                 "ref": entity_ref("device", device.id),
                 "id": device.id,
                 "label": device.name,
                 "device_type": device.device_type,
+                "observed_class": _observed_class_for_properties(_device_summary_properties(device)),
+                "role_hypotheses": _role_hypotheses_for_semantic_type(device.device_type),
+                "classification_status": "tentative" if _role_hypotheses_for_semantic_type(device.device_type) else "unclassified",
+                "attached_load": "unknown" if _observed_class_for_properties(_device_summary_properties(device)) == "controllable_or_metering_endpoint" else "",
                 "manufacturer": device.manufacturer,
                 "model": device.model,
                 "status": device.primary_status,
                 "protocols": list(device.protocols or []),
             }
             for device in devices[:40]
+        ],
+        "primary_observations": [
+            {
+                "ref": entity_ref("device", device.id),
+                "label": device.name,
+                "observed_class": _observed_class_for_properties(_device_summary_properties(device)),
+                "role_hypotheses": _role_hypotheses_for_semantic_type(device.device_type),
+                "classification_status": "tentative" if _role_hypotheses_for_semantic_type(device.device_type) else "unclassified",
+            }
+            for device in devices[:12]
         ],
         "raw_artifact_counts": {
             "candidate_count": len(candidates),
@@ -479,10 +562,63 @@ def canonical_inventory_summary(session: Session, site_id: int) -> dict:
             "home_graph_counts_by_entity_type": raw_entities_by_type,
         },
         "notes": [
-            "canonical_devices are physical systems suitable for normal user-facing inventory",
+            "canonical_devices are deduplicated discovered device records, not necessarily confirmed HEMS systems",
+            "role_hypotheses are tentative unless confirmed by user evidence or validation workflows",
             "raw_artifacts are discovery candidates or graph implementation details available through tools when diagnostics require them",
         ],
     }
+
+
+def _device_summary_properties(device: Device) -> dict:
+    return {
+        "protocols": list(device.protocols or []),
+        "capabilities": device.capabilities or {},
+        "telemetry": device.telemetry or {},
+        "semantic_type": device.device_type,
+        "confidence": device.confidence,
+    }
+
+
+def _observed_class_for_properties(properties: dict) -> str:
+    protocols = {str(protocol) for protocol in properties.get("protocols", []) if protocol}
+    capabilities = properties.get("capabilities") if isinstance(properties.get("capabilities"), dict) else {}
+    if "eebus_ship" in protocols:
+        return "eebus_ship_peer"
+    if "modbus_tcp" in protocols:
+        return "modbus_tcp_endpoint"
+    if "mqtt" in protocols:
+        return "mqtt_endpoint"
+    if capabilities.get("controllable") or capabilities.get("monitorable"):
+        return "controllable_or_metering_endpoint"
+    if "http_local" in protocols:
+        return "local_http_endpoint"
+    if protocols.intersection({"mdns", "ssdp"}):
+        return "network_advertised_service"
+    return "unknown"
+
+
+def _role_hypotheses_for_semantic_type(semantic_type: str) -> list[dict]:
+    role_map = {
+        "grid_meter": "grid_meter",
+        "smart_meter_gateway": "grid_meter",
+        "wallbox": "ev_charger",
+        "ev_charger": "ev_charger",
+        "battery": "battery",
+        "pv_inverter": "pv_inverter",
+        "heat_pump": "heat_pump",
+        "controllable_load": "controllable_load",
+    }
+    role = role_map.get(semantic_type)
+    if not role:
+        return []
+    return [
+        {
+            "role": role,
+            "status": "tentative",
+            "source": "stored_discovery_hypothesis",
+            "needs_confirmation": True,
+        }
+    ]
 
 
 def query_entities(
@@ -559,6 +695,9 @@ def get_entity_details(
     return {
         "entity": _entity_as_dict(entity),
         "canonical": entity.entity_type == "device",
+        "observed_identity": _observed_identity_for_entity(entity, endpoint_rows),
+        "technical_observations": _technical_observations_for_endpoints(endpoint_rows),
+        "classification": _classification_payload_for_entity(entity),
         "protocol_endpoints": [_endpoint_as_dict(endpoint) for endpoint in endpoint_rows],
         "connection_facets": connection_facets_for_entity(
             session,
@@ -603,6 +742,85 @@ def resolve_entity(session: Session, ref: str) -> HomeGraphEntity | None:
             sync_inventory_to_home_graph(session, candidate.site_id)
             return session.get(HomeGraphEntity, ref)
     return None
+
+
+def _observed_identity_for_entity(entity: HomeGraphEntity, endpoints: list[ProtocolEndpoint]) -> dict:
+    properties = entity.properties or {}
+    service_names = sorted({endpoint.service_name for endpoint in endpoints if endpoint.service_name})
+    hosts = sorted({endpoint.host for endpoint in endpoints if endpoint.host})
+    ports = sorted({endpoint.port for endpoint in endpoints if endpoint.port is not None})
+    return {
+        "display_name": entity.display_name,
+        "manufacturer": properties.get("manufacturer", ""),
+        "model": properties.get("model", ""),
+        "source_type": entity.source_type,
+        "source_id": entity.source_id,
+        "protocols": list(properties.get("protocols") or []),
+        "service_names": service_names,
+        "hosts": hosts,
+        "ports": ports,
+    }
+
+
+def _technical_observations_for_endpoints(endpoints: list[ProtocolEndpoint]) -> dict:
+    observations: dict[str, list[dict]] = {}
+    for endpoint in endpoints:
+        properties = endpoint.properties or {}
+        entry: dict[str, Any] = {
+            "endpoint_ref": endpoint.id,
+            "host": endpoint.host,
+            "port": endpoint.port,
+            "service_name": endpoint.service_name,
+            "status": endpoint.status,
+            "source": properties.get("source", ""),
+            "confidence": properties.get("confidence", 0.0),
+        }
+        if endpoint.protocol == "eebus_ship":
+            entry.update(
+                {
+                    "ship_id": properties.get("ship_id", ""),
+                    "ski": properties.get("ski", ""),
+                    "register": properties.get("register"),
+                    "supported_use_cases": properties.get("supported_use_cases", []),
+                }
+            )
+        elif endpoint.protocol == "http_local":
+            entry.update(
+                {
+                    "base_url": properties.get("base_url", ""),
+                    "paths": properties.get("paths", []),
+                    "server": properties.get("server", ""),
+                }
+            )
+        elif endpoint.protocol == "mdns":
+            entry.update(
+                {
+                    "service_type": properties.get("service_type", ""),
+                    "txt": properties.get("txt", []),
+                }
+            )
+        observations.setdefault(endpoint.protocol, []).append(entry)
+    return observations
+
+
+def _classification_payload_for_entity(entity: HomeGraphEntity) -> dict:
+    properties = entity.properties or {}
+    observed_class = _observed_class_for_properties(properties)
+    role_hypotheses = _role_hypotheses_for_semantic_type(entity.semantic_type)
+    payload = {
+        "status": "tentative" if role_hypotheses else "unclassified",
+        "observed_class": observed_class,
+        "role_hypotheses": role_hypotheses,
+        "source": "stored_discovery_hypothesis" if role_hypotheses else "technical_observation",
+        "notes": [
+            "Role hypotheses are not confirmed bindings or physical-system truth.",
+            "The model may inspect details, ask the user, or use research tools when available before treating a role as known.",
+        ],
+    }
+    if observed_class == "controllable_or_metering_endpoint":
+        payload["attached_load"] = "unknown"
+        payload["notes"].append("A controllable or metering endpoint does not identify the attached physical load by itself.")
+    return payload
 
 
 @dataclass(slots=True)
@@ -722,6 +940,15 @@ def connection_facets_for_entity(
     )
     protocols = {endpoint.protocol for endpoint in endpoint_rows}
     has_eebus = "eebus_ship" in protocols
+    eebus_runtime_snapshots = [
+        runtime_snapshot_for_endpoint(endpoint.id)
+        for endpoint in endpoint_rows
+        if endpoint.protocol == "eebus_ship"
+    ]
+    eebus_ship_ready = any(
+        snapshot.get("endpoint_in_runtime") is True and snapshot.get("status") == "ship_ready"
+        for snapshot in eebus_runtime_snapshots
+    )
     local_identity = session.scalar(select(EebusLocalIdentity).where(EebusLocalIdentity.site_id == entity.site_id))
     diagnostic_blocker_codes = {
         str(code)
@@ -733,14 +960,14 @@ def connection_facets_for_entity(
     role_state = "bound" if binding is not None else ("user_accepted" if role_candidate_rows else "none")
     trust_state = "unknown"
     if has_eebus:
-        trust_state = "required"
-        if local_identity is not None and "ship_trust_commissioning_not_validated" not in diagnostic_blocker_codes:
-            trust_state = "unknown"
+        trust_state = "established" if eebus_ship_ready else "required"
     elif endpoint_rows:
         trust_state = "not_required"
     commissioning_state = "not_started"
+    if eebus_ship_ready:
+        commissioning_state = "ship_ready"
     if any(task.status in {"running", "blocked", "open"} for task in task_rows):
-        commissioning_state = "blocked" if blocker_rows else "not_started"
+        commissioning_state = "blocked" if blocker_rows else commissioning_state
     if binding is not None and binding.connection_status in {"connected", "ready"}:
         commissioning_state = "completed"
     telemetry_state = "validated" if binding is not None and binding.telemetry_status == "validated" else "unknown"
@@ -754,6 +981,8 @@ def connection_facets_for_entity(
     overall = "discovered"
     if binding is not None and binding.connection_status == "connected":
         overall = "connected"
+    elif eebus_ship_ready:
+        overall = "ship_ready"
     elif blocker_rows or diagnostic_blocker_codes:
         overall = "blocked"
     elif role_state == "user_accepted":
@@ -879,7 +1108,6 @@ def _possible_roles_for_entity(entity: HomeGraphEntity) -> list[dict]:
         "battery": "battery",
         "pv_inverter": "pv_inverter",
         "heat_pump": "heat_pump",
-        "smart_appliance": "controllable_load",
         "controllable_load": "controllable_load",
     }
     role = role_map.get(semantic_type)

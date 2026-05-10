@@ -1,11 +1,15 @@
 import type {
   ActionProposalDecisionRead,
+  ActionExecuteRequest,
+  ActionExecutionRead,
   AgentMessageCreate,
   AgentProviderConfigRead,
   AgentProviderConfigUpdate,
   AgentThreadRead,
   AgentTurnAcceptedRead,
   AgentTurnEventRead,
+  ConnectionOptionsRead,
+  ConnectionStateRead,
   DiscoveryRunRead,
   HemsAssetRead,
   HemsPlanRead,
@@ -99,6 +103,20 @@ export const api = {
       method: "POST",
       body: JSON.stringify(payload),
     }),
+  executeAction: (actionName: string, payload: ActionExecuteRequest) =>
+    request<ActionExecutionRead>(`/actions/${actionName}`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  getDeviceConnectionOptions: (deviceId: string) => request<ConnectionOptionsRead>(`/devices/${deviceId}/connection-options`),
+  getConnectionState: (params: { entity_ref: string; endpoint_ref: string; integration_path: string }) => {
+    const query = new URLSearchParams({
+      entity_ref: params.entity_ref,
+      endpoint_ref: params.endpoint_ref,
+      integration_path: params.integration_path,
+    });
+    return request<ConnectionStateRead>(`/connections/state?${query.toString()}`);
+  },
   getOverview: () => request<OverviewResponse>("/overview"),
   listReachableSubnets: () => request<ReachableSubnetRead[]>("/network/reachable-subnets"),
   runDiscovery: () => request<DiscoveryRunRead>("/discovery/runs", { method: "POST" }),

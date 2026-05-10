@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from fastapi.encoders import jsonable_encoder
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.agent.configuration import (
@@ -110,17 +111,25 @@ def _get_site(session: Session) -> Site:
 def _get_or_create_setup_profile(session: Session) -> SiteSetupProfile:
     site = _get_site(session)
     profile = session.scalar(select(SiteSetupProfile).where(SiteSetupProfile.site_id == site.id).limit(1))
-    if profile is None:
-        profile = SiteSetupProfile(
-            site_id=site.id,
-            summary="setup_profile_initialized",
-            confirmed_systems=[],
-            unresolved_items=[],
-            user_notes=[],
-        )
-        session.add(profile)
+    if profile is not None:
+        return profile
+    profile = SiteSetupProfile(
+        site_id=site.id,
+        summary="setup_profile_initialized",
+        confirmed_systems=[],
+        unresolved_items=[],
+        user_notes=[],
+    )
+    session.add(profile)
+    try:
         session.commit()
-        session.refresh(profile)
+    except IntegrityError:
+        session.rollback()
+        profile = session.scalar(select(SiteSetupProfile).where(SiteSetupProfile.site_id == site.id).limit(1))
+        if profile is None:
+            raise
+        return profile
+    session.refresh(profile)
     return profile
 
 
@@ -318,6 +327,23 @@ def get_agent_thread(session: Session) -> AgentThreadRead:
     return _serialize_thread(session, thread, profile)
 
 
+def _compact_inventory_context(inventory_summary: dict) -> dict:
+    return {
+        "canonical_device_count": inventory_summary["canonical_device_count"],
+        "canonical_device_counts_by_type": inventory_summary["canonical_device_counts_by_type"],
+        "observed_class_counts": inventory_summary["observed_class_counts"],
+        "role_hypothesis_counts": inventory_summary["role_hypothesis_counts"],
+        "primary_observations": inventory_summary["primary_observations"][:8],
+        "raw_artifact_counts": inventory_summary["raw_artifact_counts"],
+        "details_available_via": ["home_graph.query", "home_graph.get_entity_details"],
+        "normal_query_scope": "canonical_devices",
+        "notes": [
+            "Default context is compact. Use Home Graph tools for complete entity details.",
+            "Role hypotheses are tentative until confirmed by user evidence or validation workflows.",
+        ],
+    }
+
+
 def _context_snapshot(
     session: Session,
     thread: ConversationThread,
@@ -336,6 +362,7 @@ def _context_snapshot(
             asset_id_by_device_id.setdefault(device_id, asset.id)
     bindings = list_system_bindings(session, confirmed_only=True)
     inventory_summary = canonical_inventory_summary(session, site.id)
+    compact_inventory = _compact_inventory_context(inventory_summary)
     role_candidates = accepted_role_candidates(session, site_id=site.id)
     active_tasks = session.scalars(
         select(AgentTask)
@@ -400,10 +427,12 @@ def _context_snapshot(
             }
             for message in thread.messages[-6:]
         ],
-        "home_inventory": inventory_summary,
+        "home_inventory": compact_inventory,
         "home_graph_summary": {
             "canonical_device_count": inventory_summary["canonical_device_count"],
             "canonical_device_counts_by_type": inventory_summary["canonical_device_counts_by_type"],
+            "observed_class_counts": inventory_summary["observed_class_counts"],
+            "role_hypothesis_counts": inventory_summary["role_hypothesis_counts"],
             "raw_artifact_counts": inventory_summary["raw_artifact_counts"],
             "details_available_via": ["home_graph.query", "home_graph.get_entity_details"],
             "normal_query_scope": "canonical_devices",
