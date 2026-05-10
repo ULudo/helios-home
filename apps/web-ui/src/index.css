@@ -26,7 +26,6 @@ body,
 }
 
 body {
-  min-width: 1280px;
   margin: 0;
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.88) 0%, rgba(255, 255, 255, 0.4) 34%, rgba(255, 255, 255, 0) 58%),

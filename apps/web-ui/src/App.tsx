@@ -95,8 +95,7 @@ const HOME_CARD_HEIGHT = 200;
 const CANVAS_PADDING = 36;
 const LAYOUT_GAP = 26;
 const MAX_CANVAS_RING_RADIUS = 540;
-const MIN_CANVAS_WORKSPACE_WIDTH = 1400;
-const MIN_CANVAS_WORKSPACE_HEIGHT = 1120;
+const MIN_CANVAS_LAYOUT_SEARCH_STEP = 20;
 
 function humanize(value: string): string {
   return value.split("_").join(" ");
@@ -540,19 +539,12 @@ function buildOuterFirstRingPoints(
   return slots.length === count ? slots : null;
 }
 
-function buildCanvasWorkspaceSize(canvasSize: CanvasSize): CanvasSize {
-  return {
-    width: Math.max(canvasSize.width || 1200, MIN_CANVAS_WORKSPACE_WIDTH),
-    height: Math.max(canvasSize.height || 760, MIN_CANVAS_WORKSPACE_HEIGHT),
-  };
-}
-
-function buildCanvasPoints(count: number, canvasSize: CanvasSize): CanvasPoint[] {
+function buildCanvasPointsForSize(count: number, canvasSize: CanvasSize): CanvasPoint[] | null {
   if (count <= 0) {
     return [];
   }
 
-  const { width, height } = buildCanvasWorkspaceSize(canvasSize);
+  const { width, height } = canvasSize;
   const bounds: CanvasRect = {
     left: -width / 2 + CANVAS_PADDING,
     right: width / 2 - CANVAS_PADDING,
@@ -587,7 +579,72 @@ function buildCanvasPoints(count: number, canvasSize: CanvasSize): CanvasPoint[]
     occupiedRects,
     Math.min(plannedMaxRadiusX, plannedMaxRadiusY),
     Math.min(plannedMaxRadiusX, plannedMaxRadiusY),
-  ) ?? evenlySpacedRingPoints(count, plannedMaxRadiusX, plannedMaxRadiusY, 0);
+  );
+}
+
+function minimumTwoRingWorkspaceSize(count: number, visibleSize: CanvasSize): CanvasSize {
+  if (count <= 0) {
+    return visibleSize;
+  }
+
+  if (buildCanvasPointsForSize(count, visibleSize)) {
+    return visibleSize;
+  }
+
+  const firstRadiusX = HOME_CARD_WIDTH / 2 + DEVICE_CARD_WIDTH / 2 + LAYOUT_GAP + 18;
+  const firstRadiusY = HOME_CARD_HEIGHT / 2 + DEVICE_CARD_HEIGHT / 2 + LAYOUT_GAP + 18;
+  const minWidth = Math.ceil((firstRadiusX + DEVICE_CARD_WIDTH / 2 + CANVAS_PADDING) * 2);
+  const minHeight = Math.ceil((firstRadiusY + DEVICE_CARD_HEIGHT / 2 + CANVAS_PADDING) * 2);
+  const overflowScale = Math.max(0, count - 16);
+  const maxWidth = Math.ceil((MAX_CANVAS_RING_RADIUS + DEVICE_CARD_WIDTH / 2 + CANVAS_PADDING) * 2 + overflowScale * 60);
+  const maxHeight = Math.ceil((MAX_CANVAS_RING_RADIUS + DEVICE_CARD_HEIGHT / 2 + CANVAS_PADDING) * 2 + overflowScale * 40);
+
+  let best: CanvasSize | null = null;
+  let bestScore = Number.POSITIVE_INFINITY;
+
+  for (let width = minWidth; width <= maxWidth; width += MIN_CANVAS_LAYOUT_SEARCH_STEP) {
+    for (let height = minHeight; height <= maxHeight; height += MIN_CANVAS_LAYOUT_SEARCH_STEP) {
+      const candidate = {
+        width: Math.max(visibleSize.width, width),
+        height: Math.max(visibleSize.height, height),
+      };
+      if (!buildCanvasPointsForSize(count, candidate)) {
+        continue;
+      }
+
+      const overflowX = Math.max(0, candidate.width - visibleSize.width);
+      const overflowY = Math.max(0, candidate.height - visibleSize.height);
+      const maxOverflow = Math.max(overflowX, overflowY);
+      const area = candidate.width * candidate.height;
+      const aspect = candidate.width / candidate.height;
+      const visibleAspect = visibleSize.width / visibleSize.height;
+      const aspectPenalty = Math.abs(aspect - visibleAspect) * 1000;
+      const score = maxOverflow * 100000 + overflowX * overflowX + overflowY * overflowY + area * 0.001 + aspectPenalty;
+
+      if (score < bestScore) {
+        best = candidate;
+        bestScore = score;
+      }
+    }
+  }
+
+  return best ?? { width: Math.max(visibleSize.width, maxWidth), height: Math.max(visibleSize.height, maxHeight) };
+}
+
+function buildCanvasWorkspaceSize(canvasSize: CanvasSize, count: number): CanvasSize {
+  return minimumTwoRingWorkspaceSize(count, {
+    width: canvasSize.width || 1200,
+    height: canvasSize.height || 760,
+  });
+}
+
+function buildCanvasPoints(count: number, canvasSize: CanvasSize): CanvasPoint[] {
+  return buildCanvasPointsForSize(count, canvasSize) ?? evenlySpacedRingPoints(
+    count,
+    Math.max(DEVICE_CARD_WIDTH / 2, canvasSize.width / 2 - CANVAS_PADDING - DEVICE_CARD_WIDTH / 2),
+    Math.max(DEVICE_CARD_HEIGHT / 2, canvasSize.height / 2 - CANVAS_PADDING - DEVICE_CARD_HEIGHT / 2),
+    0,
+  );
 }
 
 function connectionProtocolLabel(device: DeviceRead): string {
@@ -883,8 +940,8 @@ export default function App() {
 
   const currentScope = useMemo(() => parseConfiguredSubnets(overview?.site.local_subnet ?? ""), [overview?.site.local_subnet]);
   const canvasWorkspaceSize = useMemo(
-    () => buildCanvasWorkspaceSize(canvasSize),
-    [canvasSize.height, canvasSize.width],
+    () => buildCanvasWorkspaceSize(canvasSize, allDevices.length),
+    [allDevices.length, canvasSize.height, canvasSize.width],
   );
   const canvasPoints = useMemo(
     () => buildCanvasPoints(allDevices.length, canvasWorkspaceSize),
