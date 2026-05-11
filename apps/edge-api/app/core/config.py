@@ -22,7 +22,8 @@ class Settings(BaseSettings):
     eebus_timeout_seconds: float = 3.0
     eebus_tls_check_enabled: bool = False
     eebus_ship_bind_host: str = "0.0.0.0"
-    eebus_ship_port: int = 4712
+    eebus_ship_port: int = 0
+    eebus_ship_port_range: str = "4712-4722"
     eebus_ship_path: str = "/ship/"
     eebus_ship_device_id: str = "HELIOS-HOME-HEMS"
     native_writes_enabled: bool = False

@@ -218,14 +218,22 @@ def get_connection_state(
     runtime = runtime_snapshot_for_endpoint(endpoint.id) if endpoint.protocol == "eebus_ship" else {}
     diagnostic = _latest_diagnostic(session, site.id, entity.id, endpoint.id, resolved_path)
     task = _latest_task(session, site.id, entity.id, endpoint.id)
-    diagnostic_result = diagnostic.result if diagnostic is not None else {}
+    diagnostic_result = diagnostic.result if diagnostic is not None and isinstance(diagnostic.result, dict) else {}
+    diagnostic_runtime = diagnostic_result.get("runtime") if isinstance(diagnostic_result.get("runtime"), dict) else {}
+    runtime = _runtime_for_display(endpoint.id, runtime, diagnostic_runtime)
     task_phase = str((task.context or {}).get("current_phase") or "") if task is not None else ""
     phase = str(diagnostic_result.get("phase") or task_phase)
     if not phase:
         phase = _phase_from_runtime(endpoint, runtime)
+    if phase == "ship_ready" and not _runtime_is_ship_ready(runtime):
+        phase = _phase_from_runtime(endpoint, runtime)
     status = str(diagnostic_result.get("status") or facets.get("overall_connection_state") or "unknown")
+    if status == "connected_ship_ready" and not _runtime_is_ship_ready(runtime):
+        status = str(facets.get("overall_connection_state") or _phase_from_runtime(endpoint, runtime))
     required_user_action = dict(diagnostic_result.get("required_user_action") or {})
     last_error = _runtime_error(runtime)
+    if required_user_action and _runtime_failed_without_peer_rejection(runtime, last_error):
+        required_user_action = _required_user_action_for_state(endpoint, local_identity, runtime, last_error)
     if not required_user_action:
         required_user_action = _required_user_action_for_state(endpoint, local_identity, runtime, last_error)
     expected_trust_wait = _is_expected_trust_wait(phase, required_user_action, last_error)
@@ -353,7 +361,7 @@ def _latest_task(session: Session, site_id: int, entity_ref: str, endpoint_ref: 
 def _phase_from_runtime(endpoint: ProtocolEndpoint, runtime: dict[str, Any]) -> str:
     if endpoint.protocol != "eebus_ship":
         return "endpoint_visible"
-    if runtime.get("endpoint_in_runtime") and runtime.get("status") == "ship_ready":
+    if _runtime_is_ship_ready(runtime):
         return "ship_ready"
     if runtime.get("status") == "failed":
         return "ship_failed"
@@ -372,17 +380,22 @@ def _connection_steps(
 ) -> list[dict[str, Any]]:
     properties = endpoint.properties or {}
     runtime_ready = runtime.get("endpoint_in_runtime") is True and runtime.get("status") == "ship_ready"
-    runtime_failed = runtime.get("status") == "failed" or any(
+    runtime_error = _runtime_error(runtime)
+    peer_rejected = _is_peer_rejection_error(runtime_error)
+    raw_runtime_failed = runtime.get("status") == "failed" or any(
         isinstance(state, dict) and state.get("status") == "failed"
         for state in (runtime.get("endpoint_connection_states") or {}).values()
     )
-    runtime_failed = runtime_failed and not expected_trust_wait
+    ship_failed = raw_runtime_failed and not expected_trust_wait and not peer_rejected
     received_limit = int(runtime.get("received_load_power_limit_count") or 0) > 0
-    peer_trust_detail = _runtime_error(runtime) if runtime_failed else "Local SKI may need to be trusted on the peer."
+    peer_trust_detail = "Peer trust is established." if runtime_ready else "Local SKI may need to be trusted on the peer."
     ship_session_detail = str(runtime.get("status") or "not_started")
     if expected_trust_wait:
         peer_trust_detail = "Trust the local SKI on the peer, then continue the connection."
         ship_session_detail = "Waiting for peer trust."
+    elif ship_failed:
+        peer_trust_detail = "No peer trust rejection was reported in the latest attempt."
+        ship_session_detail = runtime_error or "SHIP runtime failed."
     return [
         {
             "key": "endpoint_observed",
@@ -405,13 +418,13 @@ def _connection_steps(
         {
             "key": "peer_trust",
             "label": "Peer trust",
-            "status": "completed" if runtime_ready else "action_required" if (runtime_failed or expected_trust_wait) else "pending",
+            "status": "completed" if runtime_ready else "action_required" if expected_trust_wait else "pending",
             "detail": peer_trust_detail,
         },
         {
             "key": "ship_session",
             "label": "SHIP session",
-            "status": "completed" if runtime_ready else "failed" if runtime_failed else "pending",
+            "status": "completed" if runtime_ready else "failed" if ship_failed else "pending",
             "detail": ship_session_detail,
         },
         {
@@ -440,12 +453,10 @@ def _runtime_error(runtime: dict[str, Any]) -> str:
 
 def _is_expected_trust_wait(phase: str, required_user_action: dict[str, Any], last_error: str) -> bool:
     action = str(required_user_action.get("action") or "")
-    normalized_error = last_error.lower()
-    return (
-        phase == "waiting_for_user_trust"
-        or action.startswith("authorize_local_ski")
-        or "rejected by application" in normalized_error
-        or "node rejected" in normalized_error
+    if last_error and not _is_peer_rejection_error(last_error):
+        return False
+    return phase == "waiting_for_user_trust" or _is_peer_rejection_error(last_error) or (
+        action.startswith("authorize_local_ski") and phase in {"waiting_for_user_trust", "waiting_for_ship_session"}
     )
 
 
@@ -461,10 +472,54 @@ def _required_user_action_for_state(
         return {}
     if local_identity is None:
         return {"action": "press_connect_to_create_local_identity"}
-    if "rejected by application" in last_error.lower() or "node rejected" in last_error.lower():
+    if _is_peer_rejection_error(last_error):
         return {
             "action": "authorize_local_ski_on_peer_then_continue",
             "local_ski": local_identity.ski,
             "retry_action": "connection.establish",
         }
+    if _runtime_failed_without_peer_rejection(runtime, last_error):
+        return {
+            "action": "resolve_ship_runtime_error_then_continue",
+            "reason": "ship_runtime_failed",
+            "local_ski": local_identity.ski,
+            "retry_action": "connection.establish",
+            "last_error": last_error,
+        }
     return {"action": "press_connect_to_continue", "local_ski": local_identity.ski}
+
+
+def _runtime_for_display(
+    endpoint_ref: str,
+    live_runtime: dict[str, Any],
+    diagnostic_runtime: dict[str, Any],
+) -> dict[str, Any]:
+    if not diagnostic_runtime:
+        return live_runtime
+    if diagnostic_runtime.get("status") == "ship_ready" and not _runtime_is_ship_ready(live_runtime):
+        return live_runtime
+    live_status = str(live_runtime.get("status") or "")
+    live_mentions_endpoint = bool(live_runtime.get("endpoint_in_runtime"))
+    if live_mentions_endpoint and live_status not in {"", "not_started"}:
+        return live_runtime
+    merged = dict(diagnostic_runtime)
+    merged["endpoint_in_runtime"] = endpoint_ref in (merged.get("endpoint_refs") or [])
+    merged["endpoint_connection_states"] = dict((merged.get("connection_states") or {}).get(endpoint_ref, {}))
+    return merged
+
+
+def _runtime_is_ship_ready(runtime: dict[str, Any]) -> bool:
+    return runtime.get("endpoint_in_runtime") is True and runtime.get("status") == "ship_ready"
+
+
+def _runtime_failed_without_peer_rejection(runtime: dict[str, Any], last_error: str) -> bool:
+    failed = runtime.get("status") == "failed" or any(
+        isinstance(state, dict) and state.get("status") == "failed"
+        for state in (runtime.get("endpoint_connection_states") or {}).values()
+    )
+    return failed and not _is_peer_rejection_error(last_error)
+
+
+def _is_peer_rejection_error(error: str) -> bool:
+    normalized = error.lower()
+    return "rejected by application" in normalized or "node rejected" in normalized

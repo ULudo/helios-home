@@ -646,25 +646,57 @@ class EebusRuntimeManager:
                     session_factory=session_factory,
                     direction="inbound_from_peer",
                 )
-                server = ShipServer(
-                    ShipServerConfig(
-                        identity=material,
-                        ship_id=material.ship_id,
-                        bind_host=settings.eebus_ship_bind_host,
-                        port=settings.eebus_ship_port,
-                        path=settings.eebus_ship_path,
-                        device_id=material.device_id,
-                        peer_trust_anchors=tuple(peer.certificate_path for peer in peers),
-                        trusted_client_skis=tuple(peer.certificate_ski for peer in peers if peer.certificate_ski),
-                        ship_handshake_mode="compatibility",
-                        spine_profile="default",
-                    ),
-                    trace_logger=trace_logger,
-                )
+                selected_port = None
+                start_errors: list[str] = []
+                for candidate_port in _ship_port_candidates(settings):
+                    server = ShipServer(
+                        ShipServerConfig(
+                            identity=material,
+                            ship_id=material.ship_id,
+                            bind_host=settings.eebus_ship_bind_host,
+                            port=candidate_port,
+                            path=settings.eebus_ship_path,
+                            device_id=material.device_id,
+                            peer_trust_anchors=tuple(peer.certificate_path for peer in peers),
+                            trusted_client_skis=tuple(peer.certificate_ski for peer in peers if peer.certificate_ski),
+                            ship_handshake_mode="compatibility",
+                            spine_profile="default",
+                        ),
+                        trace_logger=trace_logger,
+                    )
+                    try:
+                        await server.start()
+                    except OSError as exc:
+                        server = None
+                        detail = f"{settings.eebus_ship_bind_host}:{candidate_port} unavailable: {exc}"
+                        start_errors.append(detail)
+                        self.record_event(
+                            "ship_port_unavailable",
+                            {
+                                "bind_host": settings.eebus_ship_bind_host,
+                                "port": candidate_port,
+                                "error": str(exc),
+                            },
+                            level="warning",
+                        )
+                        continue
+                    selected_port = _bound_ship_port(server, candidate_port)
+                    if selected_port != candidate_port:
+                        self.record_event(
+                            "ship_port_selected",
+                            {
+                                "bind_host": settings.eebus_ship_bind_host,
+                                "requested_port": candidate_port,
+                                "selected_port": selected_port,
+                            },
+                        )
+                    break
+                if server is None or selected_port is None:
+                    raise OSError("; ".join(start_errors) or "No local EEBus SHIP port could be opened.")
                 advertiser = ShipServiceAdvertiser(
                     ShipServiceAdvertisement(
                         interface_ip=interface_ip,
-                        port=settings.eebus_ship_port,
+                        port=selected_port,
                         ski=material.ski,
                         ship_id=material.ship_id,
                         device_id=settings.eebus_ship_device_id or material.device_id,
@@ -679,13 +711,12 @@ class EebusRuntimeManager:
                 )
                 self._server = server
                 self._advertiser = advertiser
-                await server.start()
                 await advertiser.start()
                 self.mark_listening(
                     local_ski=material.ski,
                     local_ship_id=material.ship_id,
                     bind_host=settings.eebus_ship_bind_host,
-                    port=settings.eebus_ship_port,
+                    port=selected_port,
                     path=settings.eebus_ship_path,
                     interface_ip=interface_ip,
                 )
@@ -997,6 +1028,58 @@ def _requested_connection_directions(peer: EebusRuntimePeer, connection_directio
     if peer.host and peer.port:
         directions.append("outbound_to_peer")
     return directions
+
+
+def _ship_port_candidates(settings: Settings) -> list[int]:
+    configured_port = int(getattr(settings, "eebus_ship_port", 0) or 0)
+    candidates: list[int] = []
+    if configured_port > 0:
+        candidates.append(configured_port)
+    candidates.extend(_parse_ship_port_range(str(getattr(settings, "eebus_ship_port_range", "") or "")))
+    if configured_port <= 0:
+        candidates.append(0)
+    if not candidates:
+        candidates.append(0)
+    unique: list[int] = []
+    for port in candidates:
+        if 0 <= port <= 65535 and port not in unique:
+            unique.append(port)
+    return unique or [0]
+
+
+def _parse_ship_port_range(value: str) -> list[int]:
+    ports: list[int] = []
+    for raw_part in value.split(","):
+        part = raw_part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            raw_start, raw_end = part.split("-", 1)
+            try:
+                start = int(raw_start.strip())
+                end = int(raw_end.strip())
+            except ValueError:
+                continue
+            if end < start:
+                start, end = end, start
+            for port in range(start, min(end, start + 99) + 1):
+                ports.append(port)
+            continue
+        try:
+            ports.append(int(part))
+        except ValueError:
+            continue
+    return ports
+
+
+def _bound_ship_port(server: Any, fallback_port: int) -> int:
+    asyncio_server = getattr(server, "server", None)
+    for socket in getattr(asyncio_server, "sockets", []) or []:
+        with contextlib.suppress(Exception):
+            sockname = socket.getsockname()
+            if isinstance(sockname, tuple) and len(sockname) >= 2 and isinstance(sockname[1], int):
+                return sockname[1]
+    return fallback_port
 
 
 def _peer_signature(peer: EebusRuntimePeer) -> tuple[str, str, str, int, str, str]:

@@ -1160,6 +1160,60 @@ def test_dashboard_connection_action_uses_same_connection_workflow_as_agent_tool
             assert audit_actions == ["start_action", "complete_action"]
 
 
+def test_connection_state_reports_ship_runtime_errors_without_trust_masking(tmp_path, monkeypatch):
+    app = _bootstrap_app(tmp_path, monkeypatch, "dashboard-connection-port-conflict.db")
+    runtime_error = "[Errno 98] error while attempting to bind on address ('0.0.0.0', 4712): address already in use"
+    fake_runtime = FakeEebusRuntimeManager(status="failed", error=runtime_error)
+    monkeypatch.setattr("app.workflows.eebus_connection.probe_eebus_peer_certificate", lambda **_: _fake_eebus_peer_trust())
+    monkeypatch.setattr("app.workflows.eebus_connection.get_eebus_runtime_manager", lambda: fake_runtime)
+
+    with TestClient(app) as client:
+        client.get("/api/v1/agent/thread")
+        _add_device(device_id="dev-ppc", name="PPC SMGW", device_type="grid_meter", manufacturer="PPC")
+        _add_ppc_eebus_candidate("dev-ppc", register=False)
+        endpoint_ref = _endpoint_ref_for_device("dev-ppc", "eebus_ship")
+
+        action_response = client.post(
+            "/api/v1/actions/connection.establish",
+            json={
+                "input": {
+                    "entity_ref": "device:dev-ppc",
+                    "endpoint_ref": endpoint_ref,
+                    "integration_path": "eebus_spine",
+                }
+            },
+        )
+
+        assert action_response.status_code == 200
+        action_result = action_response.json()
+        assert action_result["output"]["phase"] == "ship_failed"
+        assert action_result["output"]["status"] == "failed_ship_runtime"
+        assert action_result["output"]["required_user_action"]["action"] == (
+            "resolve_ship_runtime_error_then_retry_connection_establish"
+        )
+        assert "address already in use" in action_result["output"]["required_user_action"]["last_error"]
+
+        state_response = client.get(
+            "/api/v1/connections/state",
+            params={
+                "entity_ref": "device:dev-ppc",
+                "endpoint_ref": endpoint_ref,
+                "integration_path": "eebus_spine",
+            },
+        )
+
+        assert state_response.status_code == 200
+        state = state_response.json()
+        assert state["phase"] == "ship_failed"
+        assert "address already in use" in state["last_error"]
+        assert state["required_user_action"]["action"] == "resolve_ship_runtime_error_then_continue"
+        peer_trust = next(step for step in state["steps"] if step["key"] == "peer_trust")
+        ship_session = next(step for step in state["steps"] if step["key"] == "ship_session")
+        assert peer_trust["status"] == "pending"
+        assert ship_session["status"] == "failed"
+        assert "address already in use" in ship_session["detail"]
+
+
 def test_connection_establish_continues_after_user_trust_registration(tmp_path, monkeypatch):
     app = _bootstrap_app(tmp_path, monkeypatch, "commissioning-trust-retry.db")
     fake_runtime = FakeEebusRuntimeManager(
@@ -1331,6 +1385,29 @@ def test_connection_establish_reports_ship_ready_without_legacy_trust_blocker(tm
         _add_device(device_id="dev-ppc", name="PPC SMGW", device_type="grid_meter", manufacturer="PPC")
         _add_ppc_eebus_candidate("dev-ppc", register=False)
         endpoint_ref = _endpoint_ref_for_device("dev-ppc", "eebus_ship")
+
+        def ready_runtime_snapshot(endpoint_id: str) -> dict[str, Any]:
+            return {
+                "status": "ship_ready",
+                "endpoint_refs": [endpoint_ref],
+                "endpoint_in_runtime": endpoint_id == endpoint_ref,
+                "ready_peer_skis": ["f819e215a4f292d803325276767d9e27f67fe108"],
+                "received_load_power_limit_count": 1,
+                "endpoint_connection_states": {
+                    "outbound_to_peer": {"status": "ready"},
+                    "inbound_from_peer": {"status": "ready"},
+                },
+                "connection_states": {
+                    endpoint_ref: {
+                        "outbound_to_peer": {"status": "ready"},
+                        "inbound_from_peer": {"status": "ready"},
+                    }
+                },
+                "recent_events": [],
+                "error": "",
+            }
+
+        monkeypatch.setattr("app.home_graph.service.runtime_snapshot_for_endpoint", ready_runtime_snapshot)
         _use_scripted_provider(
             monkeypatch,
             ScriptedModelProvider(
@@ -1362,6 +1439,76 @@ def test_connection_establish_reports_ship_ready_without_legacy_trust_blocker(tm
             diagnostic = session.get(ProtocolDiagnosticRun, result["diagnostic_run_ref"])
             assert diagnostic is not None
             assert diagnostic.result["blocker_codes"] == []
+
+        overview = client.get("/api/v1/overview").json()
+        device = next(row for row in overview["devices"] if row["id"] == "dev-ppc")
+        assert device["primary_status"] == "connected"
+        assert "connected" in device["status_tags"]
+        assert "eebus_ship_ready" in device["status_tags"]
+
+
+def test_connection_state_does_not_use_stale_ship_ready_diagnostic_as_live_state(tmp_path, monkeypatch):
+    app = _bootstrap_app(tmp_path, monkeypatch, "commissioning-stale-ready.db")
+    fake_runtime = FakeEebusRuntimeManager(status="ship_ready")
+    monkeypatch.setattr("app.workflows.eebus_connection.probe_eebus_peer_certificate", lambda **_: _fake_eebus_peer_trust())
+    monkeypatch.setattr("app.workflows.eebus_connection.get_eebus_runtime_manager", lambda: fake_runtime)
+
+    with TestClient(app) as client:
+        client.get("/api/v1/agent/thread")
+        _add_device(device_id="dev-ppc", name="PPC SMGW", device_type="grid_meter", manufacturer="PPC")
+        _add_ppc_eebus_candidate("dev-ppc", register=False)
+        endpoint_ref = _endpoint_ref_for_device("dev-ppc", "eebus_ship")
+
+        _use_scripted_provider(
+            monkeypatch,
+            ScriptedModelProvider(
+                [
+                    ModelToolCall(
+                        "connection.establish",
+                        {
+                            "entity_ref": "device:dev-ppc",
+                            "endpoint_ref": endpoint_ref,
+                            "integration_path": "eebus_spine",
+                            "role": "grid_meter",
+                        },
+                    ),
+                    ModelFinalAnswer("SHIP is ready."),
+                ]
+            ),
+        )
+        _send_and_stream(client, "Verbinde das PPC SMGW weiter.")
+
+        def not_started_runtime_snapshot(endpoint_id: str) -> dict[str, Any]:
+            return {
+                "status": "not_started",
+                "endpoint_refs": [],
+                "endpoint_in_runtime": False,
+                "ready_peer_skis": [],
+                "received_load_power_limit_count": 0,
+                "endpoint_connection_states": {},
+                "connection_states": {},
+                "recent_events": [],
+                "error": "",
+            }
+
+        monkeypatch.setattr("app.actions.service.runtime_snapshot_for_endpoint", not_started_runtime_snapshot)
+        monkeypatch.setattr("app.home_graph.service.runtime_snapshot_for_endpoint", not_started_runtime_snapshot)
+
+        state_response = client.get(
+            "/api/v1/connections/state",
+            params={
+                "entity_ref": "device:dev-ppc",
+                "endpoint_ref": endpoint_ref,
+                "integration_path": "eebus_spine",
+            },
+        )
+
+        assert state_response.status_code == 200
+        state = state_response.json()
+        assert state["phase"] != "ship_ready"
+        assert state["status"] != "connected_ship_ready"
+        assert state["connection_facets"]["overall_connection_state"] == "endpoint_visible"
+        assert next(step for step in state["steps"] if step["key"] == "ship_session")["status"] == "pending"
 
 
 def test_commissioning_get_log_reads_compact_diagnostic_entries(tmp_path, monkeypatch):

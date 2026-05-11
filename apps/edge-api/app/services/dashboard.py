@@ -24,6 +24,11 @@ from app.db.models import (
     utcnow,
 )
 from app.domain.schemas import CapabilityRead, ConnectorAttemptRead, DeviceRead, OverviewResponse, SiteRead
+from app.home_graph.service import connection_facets_for_entity
+
+
+_DEVICE_CONNECTION_STATES = {"connected", "ship_ready"}
+_BASE_VISIBLE_STATUSES = {"", "discovered", "visible_only", "endpoint_visible", "partially_ready"}
 
 
 def _get_site(session: Session) -> Site:
@@ -41,7 +46,7 @@ def _serialize_site(site: Site) -> SiteRead:
     )
 
 
-def _serialize_device(device: Device) -> DeviceRead:
+def _serialize_device(session: Session, device: Device) -> DeviceRead:
     connector_attempts = [
         ConnectorAttemptRead(
             id=attempt.id,
@@ -59,6 +64,15 @@ def _serialize_device(device: Device) -> DeviceRead:
         controllable=bool(device.capabilities.get("controllable")),
         optimizable=bool(device.capabilities.get("optimizable")),
     )
+    primary_status = device.primary_status
+    status_tags = list(device.status_tags or [])
+    connection_facets = _connection_facets_for_device(session, device)
+    connection_state = str(connection_facets.get("overall_connection_state") or "")
+    if connection_state in _DEVICE_CONNECTION_STATES:
+        primary_status = "connected" if primary_status in _BASE_VISIBLE_STATUSES else primary_status
+        status_tags = _append_unique(status_tags, "connected")
+        if connection_state == "ship_ready":
+            status_tags = _append_unique(status_tags, "eebus_ship_ready")
     return DeviceRead(
         id=device.id,
         name=device.name,
@@ -66,8 +80,8 @@ def _serialize_device(device: Device) -> DeviceRead:
         model=device.model,
         firmware=device.firmware,
         device_type=device.device_type,
-        primary_status=device.primary_status,
-        status_tags=device.status_tags or [],
+        primary_status=primary_status,
+        status_tags=status_tags,
         confidence=device.confidence,
         recovery_zone=device.recovery_zone,
         protocols=device.protocols or [],
@@ -98,7 +112,7 @@ def get_device(session: Session, device_id: str) -> DeviceRead | None:
     )
     if device is None:
         return None
-    return _serialize_device(device)
+    return _serialize_device(session, device)
 
 
 def remove_device_from_inventory(session: Session, device_id: str, *, actor: str = "user") -> DeviceRead | None:
@@ -112,7 +126,7 @@ def remove_device_from_inventory(session: Session, device_id: str, *, actor: str
     if device is None:
         return None
 
-    removed_device = _serialize_device(device)
+    removed_device = _serialize_device(session, device)
     site_id = device.site_id
     now = utcnow()
     device_ref = f"device:{device.id}"
@@ -354,8 +368,16 @@ def update_site(session: Session, updates: dict[str, str]) -> SiteRead:
 
 def build_overview(session: Session) -> OverviewResponse:
     site = _get_site(session)
-    devices = [_serialize_device(device) for device in _load_devices(session)]
+    devices = [_serialize_device(session, device) for device in _load_devices(session)]
     return OverviewResponse(
         site=_serialize_site(site),
         devices=devices,
     )
+
+
+def _connection_facets_for_device(session: Session, device: Device) -> dict:
+    return connection_facets_for_entity(session, entity_ref=f"device:{device.id}")
+
+
+def _append_unique(values: list[str], value: str) -> list[str]:
+    return values if value in values else [*values, value]

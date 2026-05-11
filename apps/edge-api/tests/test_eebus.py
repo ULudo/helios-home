@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
@@ -342,6 +343,93 @@ def test_eebus_runtime_connects_outbound_to_discovered_ship_endpoint(monkeypatch
         assert state["status"] == "ready"
         assert state["host"] == "192.0.2.40"
         assert state["port"] == 23292
+    finally:
+        manager.stop()
+
+
+def test_eebus_runtime_selects_next_available_local_ship_port(monkeypatch):
+    started_ports: list[int] = []
+    advertised_ports: list[int] = []
+
+    class FakeShipServer:
+        def __init__(self, config, trace_logger=None):
+            self.config = config
+            self.trace_logger = trace_logger
+            self.server = None
+
+        async def start(self):
+            started_ports.append(self.config.port)
+            if self.config.port == 4712:
+                raise OSError(errno.EADDRINUSE, "address already in use")
+            socket = SimpleNamespace(getsockname=lambda: ("0.0.0.0", self.config.port))
+            self.server = SimpleNamespace(sockets=[socket])
+
+        async def stop(self):
+            return None
+
+        async def events(self):
+            while True:
+                await asyncio.sleep(3600)
+                yield SimpleNamespace(kind="idle", payload={})
+
+    class FakeShipServiceAdvertiser:
+        def __init__(self, advertisement):
+            self.advertisement = advertisement
+
+        async def start(self):
+            advertised_ports.append(self.advertisement.port)
+
+        async def stop(self):
+            return None
+
+    monkeypatch.setattr(
+        "app.services.eebus_runtime.materialize_eebus_identity",
+        lambda identity, directory: SimpleNamespace(
+            ski=identity.ski,
+            ship_id="i:32266_u:HELIOS-HOME-HEMS_r:HEMS",
+            device_id="HELIOS-HOME-HEMS",
+        ),
+    )
+    monkeypatch.setattr("eebus_sdk.ShipServer", FakeShipServer)
+    monkeypatch.setattr("eebus_sdk.advertisement.ShipServiceAdvertiser", FakeShipServiceAdvertiser)
+
+    manager = EebusRuntimeManager()
+    try:
+        snapshot = manager.start_or_update(
+            session_factory=lambda: None,
+            settings=SimpleNamespace(
+                eebus_interface_ip="192.0.2.10",
+                eebus_ship_bind_host="0.0.0.0",
+                eebus_ship_port=0,
+                eebus_ship_port_range="4712-4714",
+                eebus_ship_path="/ship/",
+                eebus_ship_device_id="",
+                eebus_timeout_seconds=1.0,
+            ),
+            local_identity=SimpleNamespace(ski="618a6ecdef40aaf6d5c36f01f971c610a13c0aed"),
+            peer=EebusPeerTrustMaterial(
+                host="192.0.2.40",
+                port=23292,
+                server_name="peer.local",
+                advertised_ski="f819e215a4f292d803325276767d9e27f67fe108",
+                certificate_pem="-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n",
+                certificate_ski="f819e215a4f292d803325276767d9e27f67fe108",
+                txt_ski_matches_certificate_ski=True,
+                client_cert_requested=True,
+                openssl_exit_code=0,
+                path="/ship/",
+            ),
+            entity_ref="device:peer",
+            endpoint_ref="endpoint:peer-eebus",
+            diagnostic_run_ref="",
+            connection_direction="inbound_from_peer",
+        )
+
+        assert snapshot.status == "listening"
+        assert snapshot.port == 4713
+        assert started_ports[:2] == [4712, 4713]
+        assert advertised_ports == [4713]
+        assert snapshot.connection_states["endpoint:peer-eebus"]["inbound_from_peer"]["port"] == 4713
     finally:
         manager.stop()
 

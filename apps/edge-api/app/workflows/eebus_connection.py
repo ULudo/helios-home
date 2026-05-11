@@ -450,6 +450,16 @@ def _required_user_action(
     elif "trust" in errors.lower() or "pair" in errors.lower() or "certificate" in errors.lower():
         reason = "peer_trust_required_or_rejected"
     else:
+        if runtime_payload.get("status") == "failed" or any(state.get("status") == "failed" for state in states):
+            return {
+                "action": "resolve_ship_runtime_error_then_retry_connection_establish",
+                "reason": "ship_runtime_failed",
+                "local_ski": local_ski,
+                "peer_ski": peer.certificate_ski,
+                "retry_tool": "connection.establish",
+                "last_error": runtime_error,
+                "ship_ready": False,
+            }
         reason = "connection_not_ready"
     return {
         "action": "authorize_local_ski_on_peer_then_retry_connection_establish",

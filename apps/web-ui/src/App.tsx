@@ -681,6 +681,7 @@ function deviceHasHemsConnection(device: DeviceRead): boolean {
   const statusTags = new Set(device.status_tags ?? []);
   return (
     statusTags.has("connected") ||
+    statusTags.has("eebus_ship_ready") ||
     ["connected", "monitorable", "controllable", "optimizable"].includes(device.primary_status) ||
     device.capabilities.monitorable ||
     device.capabilities.controllable ||
@@ -1144,6 +1145,9 @@ export default function App() {
         integration_path: target.integrationPath,
       });
       setConnectionOverlayState(state);
+      if (state.phase === "ship_ready" || state.status.startsWith("connected")) {
+        setOverview(await api.getOverview());
+      }
       return state;
     } catch (requestError) {
       const message = requestError instanceof Error ? requestError.message : "Unable to load connection state.";
@@ -1605,6 +1609,7 @@ export default function App() {
                   <div className="mt-5 border-t border-[#d8dfea] pt-5">
                     <p className="section-heading">Connection</p>
                     <div className="mt-3 flex flex-wrap gap-2">
+                      <CapabilityPill label="Connected" enabled={deviceHasHemsConnection(device)} />
                       <CapabilityPill label="Visible" enabled={device.capabilities.visible} />
                       <CapabilityPill label="Telemetry" enabled={device.capabilities.monitorable} />
                       <CapabilityPill label="Control" enabled={device.capabilities.controllable} />
