@@ -83,6 +83,15 @@ type ConnectionOverlayTarget = {
   deviceId?: string;
 };
 
+type LoadControlDraft = {
+  receives_lpc: boolean;
+  receives_lpp: boolean;
+  participates_lpc: boolean;
+  participates_lpp: boolean;
+  lpc_share_pct: number;
+  lpp_share_pct: number;
+};
+
 const NAV_ITEMS: NavItem[] = [
   { view: "overview", label: "Overview", icon: "overview" },
   { view: "settings", label: "Settings", icon: "settings" },
@@ -225,6 +234,22 @@ function connectionActionLabel(state: ConnectionStateRead | null | undefined): s
     return "Continue";
   }
   return "Connect";
+}
+
+function loadControlDraftFromDevice(device: DeviceRead): LoadControlDraft {
+  return {
+    receives_lpc: device.load_control?.receives_lpc ?? false,
+    receives_lpp: device.load_control?.receives_lpp ?? false,
+    participates_lpc: device.load_control?.participates_lpc ?? false,
+    participates_lpp: device.load_control?.participates_lpp ?? false,
+    lpc_share_pct: device.load_control?.lpc_share_pct ?? 0,
+    lpp_share_pct: device.load_control?.lpp_share_pct ?? 0,
+  };
+}
+
+function loadControlDraftChanged(device: DeviceRead, draft: LoadControlDraft): boolean {
+  const current = loadControlDraftFromDevice(device);
+  return Object.keys(current).some((key) => current[key as keyof LoadControlDraft] !== draft[key as keyof LoadControlDraft]);
 }
 
 function stepStatusClass(status: unknown): string {
@@ -892,6 +917,8 @@ export default function App() {
   const [connectionOverlayState, setConnectionOverlayState] = useState<ConnectionStateRead | null>(null);
   const [connectionOverlayBusy, setConnectionOverlayBusy] = useState(false);
   const [connectionOverlayError, setConnectionOverlayError] = useState<string | null>(null);
+  const [loadControlDrafts, setLoadControlDrafts] = useState<Record<string, LoadControlDraft>>({});
+  const [loadControlBusyDeviceId, setLoadControlBusyDeviceId] = useState<string | null>(null);
   const [activeTurnId, setActiveTurnId] = useState<string | null>(null);
   const [streamingAssistant, setStreamingAssistant] = useState<AgentMessageRead | null>(null);
   const [providerForm, setProviderForm] = useState({
@@ -1467,6 +1494,11 @@ export default function App() {
         delete nextRefs[device.id];
         return nextRefs;
       });
+      setLoadControlDrafts((current) => {
+        const nextDrafts = { ...current };
+        delete nextDrafts[device.id];
+        return nextDrafts;
+      });
       if (connectionOptions?.device_id === device.id) {
         setConnectionOptions(null);
       }
@@ -1480,6 +1512,46 @@ export default function App() {
       setError(requestError instanceof Error ? requestError.message : "Unable to remove the device.");
     } finally {
       setBusyAction(null);
+    }
+  }
+
+  function updateLoadControlDraft(device: DeviceRead, patch: Partial<LoadControlDraft>) {
+    setLoadControlDrafts((current) => ({
+      ...current,
+      [device.id]: {
+        ...(current[device.id] ?? loadControlDraftFromDevice(device)),
+        ...patch,
+      },
+    }));
+  }
+
+  async function handleSaveLoadControl(device: DeviceRead, draft: LoadControlDraft) {
+    setLoadControlBusyDeviceId(device.id);
+    setError(null);
+
+    try {
+      await api.executeAction("load_control.configure_device", {
+        input: {
+          device_id: device.id,
+          receives_lpc: draft.receives_lpc,
+          receives_lpp: draft.receives_lpp,
+          participates_lpc: draft.participates_lpc,
+          participates_lpp: draft.participates_lpp,
+          lpc_share_pct: draft.lpc_share_pct,
+          lpp_share_pct: draft.lpp_share_pct,
+          reason: "Configured from device details.",
+        },
+      });
+      setLoadControlDrafts((current) => {
+        const nextDrafts = { ...current };
+        delete nextDrafts[device.id];
+        return nextDrafts;
+      });
+      await refreshAll();
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Unable to save load-control settings.");
+    } finally {
+      setLoadControlBusyDeviceId(null);
     }
   }
 
@@ -1545,6 +1617,9 @@ export default function App() {
         }
       : null;
     const telemetryEntries = Object.entries(device.telemetry).filter(([, value]) => value !== null && value !== undefined && value !== "");
+    const loadControlDraft = loadControlDrafts[device.id] ?? loadControlDraftFromDevice(device);
+    const loadControlChanged = loadControlDraftChanged(device, loadControlDraft);
+    const loadControlBusy = loadControlBusyDeviceId === device.id;
     return (
       <div className="absolute inset-0 z-30 bg-[rgba(247,249,252,0.78)] backdrop-blur-[6px]">
         <div className="h-full w-full p-6">
@@ -1715,6 +1790,82 @@ export default function App() {
                         No connectable endpoint is known yet.
                       </div>
                     )}
+                  </div>
+
+                  <div className="mt-5 border-t border-[#d8dfea] pt-5">
+                    <div className="flex items-center justify-between gap-3">
+                      <p className="section-heading">Load control</p>
+                      <button
+                        type="button"
+                        className="secondary-button h-9 px-3 text-xs"
+                        disabled={!loadControlChanged || loadControlBusy}
+                        onClick={() => void handleSaveLoadControl(device, loadControlDraft)}
+                      >
+                        {loadControlBusy ? "Saving…" : "Save"}
+                      </button>
+                    </div>
+
+                    <label className="mt-4 flex cursor-pointer items-center justify-between gap-3 rounded-[14px] border border-[#d8dfea] bg-white px-4 py-3 text-sm font-medium text-slate-800">
+                      <span>Receives LPC/LPP</span>
+                      <input
+                        type="checkbox"
+                        className="h-4 w-4 accent-[#d08a11]"
+                        checked={loadControlDraft.receives_lpc && loadControlDraft.receives_lpp}
+                        onChange={(event) =>
+                          updateLoadControlDraft(device, {
+                            receives_lpc: event.target.checked,
+                            receives_lpp: event.target.checked,
+                          })
+                        }
+                      />
+                    </label>
+
+                    <div className="mt-3 grid gap-3">
+                      {(
+                        [
+                          ["LPC", "participates_lpc", "lpc_share_pct"],
+                          ["LPP", "participates_lpp", "lpp_share_pct"],
+                        ] as const
+                      ).map(([label, participateKey, shareKey]) => {
+                        const enabled = Boolean(loadControlDraft[participateKey]);
+                        return (
+                          <div key={label} className="rounded-[14px] border border-[#d8dfea] bg-white px-4 py-3">
+                            <label className="flex cursor-pointer items-center justify-between gap-3 text-sm font-medium text-slate-800">
+                              <span>Participates in {label}</span>
+                              <input
+                                type="checkbox"
+                                className="h-4 w-4 accent-[#d08a11]"
+                                checked={enabled}
+                                onChange={(event) =>
+                                  updateLoadControlDraft(device, {
+                                    [participateKey]: event.target.checked,
+                                    [shareKey]: event.target.checked ? Math.max(loadControlDraft[shareKey] || 100, 1) : loadControlDraft[shareKey],
+                                  })
+                                }
+                              />
+                            </label>
+                            <label className="mt-3 flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.08em] text-slate-500">
+                              Share
+                              <input
+                                type="number"
+                                min="0"
+                                max="100"
+                                step="1"
+                                disabled={!enabled}
+                                className="h-9 min-w-0 flex-1 rounded-[10px] border border-[#d8dfea] bg-[#fafcff] px-3 text-right text-sm font-semibold tracking-normal text-slate-900 disabled:opacity-50"
+                                value={loadControlDraft[shareKey]}
+                                onChange={(event) =>
+                                  updateLoadControlDraft(device, {
+                                    [shareKey]: Math.max(0, Math.min(100, Number(event.target.value) || 0)),
+                                  })
+                                }
+                              />
+                              %
+                            </label>
+                          </div>
+                        );
+                      })}
+                    </div>
                   </div>
 
                   {uiState.highlightedDeviceIds.includes(device.id) ? (

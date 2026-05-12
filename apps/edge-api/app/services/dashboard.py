@@ -12,6 +12,7 @@ from app.db.models import (
     Device,
     DeviceAssessment,
     DeviceCandidate,
+    HemsLoadControlDeviceConfig,
     HemsSystemBinding,
     HomeGraphEntity,
     HomeGraphEvidence,
@@ -23,7 +24,15 @@ from app.db.models import (
     UserDecisionRequest,
     utcnow,
 )
-from app.domain.schemas import CapabilityRead, ConnectorAttemptRead, DeviceRead, OverviewResponse, SiteRead
+from app.domain.schemas import (
+    CapabilityRead,
+    ConnectorAttemptRead,
+    DeviceLoadControlRead,
+    DeviceRead,
+    OverviewResponse,
+    SiteRead,
+)
+from app.hems.load_control import get_load_control_config
 from app.home_graph.service import connection_facets_for_entity
 
 
@@ -64,6 +73,15 @@ def _serialize_device(session: Session, device: Device) -> DeviceRead:
         controllable=bool(device.capabilities.get("controllable")),
         optimizable=bool(device.capabilities.get("optimizable")),
     )
+    load_control_config = get_load_control_config(session, device.id)
+    load_control = DeviceLoadControlRead(
+        receives_lpc=load_control_config.receives_lpc,
+        receives_lpp=load_control_config.receives_lpp,
+        participates_lpc=load_control_config.participates_lpc,
+        participates_lpp=load_control_config.participates_lpp,
+        lpc_share_pct=load_control_config.lpc_share_pct,
+        lpp_share_pct=load_control_config.lpp_share_pct,
+    )
     primary_status = device.primary_status
     status_tags = list(device.status_tags or [])
     connection_facets = _connection_facets_for_device(session, device)
@@ -86,6 +104,7 @@ def _serialize_device(session: Session, device: Device) -> DeviceRead:
         recovery_zone=device.recovery_zone,
         protocols=device.protocols or [],
         capabilities=capabilities,
+        load_control=load_control,
         telemetry=device.telemetry or {},
         last_seen_at=device.last_seen_at,
         connector_attempts=connector_attempts,
@@ -160,6 +179,14 @@ def remove_device_from_inventory(session: Session, device_id: str, *, actor: str
         )
     ):
         session.delete(binding)
+
+    for config in session.scalars(
+        select(HemsLoadControlDeviceConfig).where(
+            HemsLoadControlDeviceConfig.site_id == site_id,
+            HemsLoadControlDeviceConfig.device_id == device.id,
+        )
+    ):
+        session.delete(config)
 
     for debug_case in session.scalars(
         select(DebugCase).where(

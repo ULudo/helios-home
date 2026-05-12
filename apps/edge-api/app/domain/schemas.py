@@ -27,6 +27,15 @@ class CapabilityRead(BaseModel):
     optimizable: bool
 
 
+class DeviceLoadControlRead(BaseModel):
+    receives_lpc: bool = False
+    receives_lpp: bool = False
+    participates_lpc: bool = False
+    participates_lpp: bool = False
+    lpc_share_pct: float = 0.0
+    lpp_share_pct: float = 0.0
+
+
 class ConnectorAttemptRead(BaseModel):
     id: int
     connector_name: str
@@ -217,6 +226,7 @@ class DeviceRead(BaseModel):
     recovery_zone: str
     protocols: list[str]
     capabilities: CapabilityRead
+    load_control: DeviceLoadControlRead = Field(default_factory=DeviceLoadControlRead)
     telemetry: dict[str, Any]
     last_seen_at: datetime
     connector_attempts: list[ConnectorAttemptRead] = Field(default_factory=list)

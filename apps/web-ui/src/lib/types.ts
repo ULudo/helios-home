@@ -21,6 +21,15 @@ export interface CapabilityRead {
   optimizable: boolean;
 }
 
+export interface DeviceLoadControlRead {
+  receives_lpc: boolean;
+  receives_lpp: boolean;
+  participates_lpc: boolean;
+  participates_lpp: boolean;
+  lpc_share_pct: number;
+  lpp_share_pct: number;
+}
+
 export interface DeviceRead {
   id: string;
   name: string;
@@ -32,6 +41,7 @@ export interface DeviceRead {
   status_tags: string[];
   protocols: string[];
   capabilities: CapabilityRead;
+  load_control: DeviceLoadControlRead;
   telemetry: Record<string, string | number | boolean>;
   last_seen_at: string;
 }

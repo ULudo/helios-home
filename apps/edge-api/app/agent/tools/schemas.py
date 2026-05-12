@@ -159,6 +159,17 @@ class InventoryRemoveDeviceInput(BaseModel):
     reason: str = ""
 
 
+class LoadControlConfigureDeviceInput(BaseModel):
+    device_id: str
+    receives_lpc: bool | None = None
+    receives_lpp: bool | None = None
+    participates_lpc: bool | None = None
+    participates_lpp: bool | None = None
+    lpc_share_pct: float | None = Field(default=None, ge=0, le=100)
+    lpp_share_pct: float | None = Field(default=None, ge=0, le=100)
+    reason: str = ""
+
+
 class CommissioningGetLogInput(BaseModel):
     entity_ref: str = ""
     diagnostic_run_refs: list[str] = Field(default_factory=list)

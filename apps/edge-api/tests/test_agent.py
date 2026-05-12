@@ -434,6 +434,7 @@ def test_dashboard_ui_actions_are_registered_as_agent_tools():
 
     assert registry.get("ui.open_device_details") is not None
     assert registry.get("ui.open_connection_overlay") is not None
+    assert registry.get("load_control.configure_device") is not None
 
 
 def test_connection_establish_hides_protocol_direction_from_agent_schema():
@@ -448,6 +449,42 @@ def test_connection_establish_hides_protocol_direction_from_agent_schema():
     assert "connection_direction" not in establish_schema.get("properties", {})
     assert "connection_direction" not in inspect_schema.get("properties", {})
     assert registry.get("commissioning.start_or_continue") is None
+
+
+def test_load_control_config_action_updates_overview_and_agent_tool(tmp_path, monkeypatch):
+    app = _bootstrap_app(tmp_path, monkeypatch, "load-control-action.db")
+
+    with TestClient(app) as client:
+        client.get("/api/v1/agent/thread")
+        _add_device(device_id="dev-wallbox", name="Mennekes Wallbox", device_type="wallbox", manufacturer="MENNEKES")
+
+        action_response = client.post(
+            "/api/v1/actions/load_control.configure_device",
+            json={
+                "input": {
+                    "device_id": "dev-wallbox",
+                    "participates_lpc": True,
+                    "lpc_share_pct": 35,
+                    "participates_lpp": True,
+                    "lpp_share_pct": 15,
+                }
+            },
+        )
+        assert action_response.status_code == 200
+        action = action_response.json()
+        assert action["output"]["status"] == "configured"
+        assert action["output"]["load_control"]["lpc_share_pct"] == 35
+        assert action["ui_events"] == [
+            {"event_type": "device.details.open", "payload": {"entity_ref": "device:dev-wallbox"}}
+        ]
+
+        overview_response = client.get("/api/v1/overview")
+        assert overview_response.status_code == 200
+        device = next(entry for entry in overview_response.json()["devices"] if entry["id"] == "dev-wallbox")
+        assert device["load_control"]["participates_lpc"] is True
+        assert device["load_control"]["lpc_share_pct"] == 35
+        assert device["load_control"]["participates_lpp"] is True
+        assert device["load_control"]["lpp_share_pct"] == 15
 
 
 def test_runtime_uses_model_actions_tool_observations_and_model_final_answer(tmp_path, monkeypatch):

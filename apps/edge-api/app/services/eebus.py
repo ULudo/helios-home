@@ -8,7 +8,13 @@ from sqlalchemy.orm import Session
 
 from app.db.models import AuditEvent, utcnow
 from app.domain.enums import RecoveryZone
-from app.hems.policy import get_hems_policy, update_hems_policy
+from app.hems.load_control import (
+    active_load_control_limits,
+    build_constraint_distribution,
+    effective_grid_limits,
+    record_load_control_limit,
+)
+from app.hems.policy import get_or_create_hems_policy
 from app.hems.schemas import (
     EebusLoadPowerLimitCreate,
     EebusLoadPowerLimitDistributionRead,
@@ -282,7 +288,7 @@ def distribute_load_power_limit(
     session: Session,
     command: EebusLoadPowerLimitCreate,
 ) -> EebusLoadPowerLimitDistributionRead:
-    use_case, limit_id, direction, policy_field = _normalize_use_case(
+    use_case, limit_id, direction, _policy_field = _normalize_use_case(
         use_case=command.use_case,
         limit_id=command.limit_id,
     )
@@ -291,24 +297,55 @@ def distribute_load_power_limit(
     if command.limit_watts < 0:
         raise ValueError("EEBus load-power limit must be provided as a positive watt value.")
 
-    policy_before = get_hems_policy(session)
-    previous_import_limit = policy_before.grid_import_limit_kw
-    previous_export_limit = policy_before.grid_export_limit_kw
-    changed_fields: dict[str, float] = {}
-
-    if command.is_active:
-        limit_kw = round(command.limit_watts / 1000.0, 4)
-        current_value = getattr(policy_before, policy_field)
-        applied_value = min(float(current_value), limit_kw)
-        changed_fields[policy_field] = applied_value
-        policy_after = update_hems_policy(session, changed_fields)
-    else:
-        policy_after = policy_before
-
     eebus_payload = build_load_power_limit_payload(command)
+    policy = get_or_create_hems_policy(session)
+    previous_effective_limits = effective_grid_limits(session, policy)
+    previous_import_limit = previous_effective_limits["grid_import_limit_kw"]
+    previous_export_limit = previous_effective_limits["grid_export_limit_kw"]
+
+    record_load_control_limit(
+        session,
+        site_id=policy.site_id,
+        use_case=use_case,
+        limit_id=limit_id,
+        direction=direction,
+        source=command.source or "eebus",
+        peer_ski=command.peer_ski,
+        limit_watts=command.limit_watts,
+        duration_seconds=command.duration_seconds,
+        is_active=command.is_active,
+        raw=command.raw,
+    )
+    applied_effective_limits = effective_grid_limits(session, policy)
+    changed_effective_limits = {
+        field: value
+        for field, value in applied_effective_limits.items()
+        if previous_effective_limits.get(field) != value
+    }
+    active_constraints = [
+        {
+            "id": row.id,
+            "use_case": row.use_case,
+            "limit_id": row.limit_id,
+            "direction": row.direction,
+            "source": row.source,
+            "peer_ski": row.peer_ski,
+            "limit_watts": row.limit_watts,
+            "duration_seconds": row.duration_seconds,
+            "received_at": row.received_at.isoformat(),
+            "expires_at": row.expires_at.isoformat() if row.expires_at else None,
+        }
+        for row in active_load_control_limits(session, site_id=policy.site_id)
+    ]
+    constraint_distribution = build_constraint_distribution(
+        session,
+        site_id=policy.site_id,
+        use_case=use_case,
+        limit_watts=command.limit_watts,
+    )
 
     plan = None
-    if command.is_active:
+    if command.is_active or changed_effective_limits:
         from app.hems.service import run_hems_replan
 
         plan = run_hems_replan(session, triggered_by=f"eebus_{'lpc' if limit_id == 0 else 'lpp'}")
@@ -317,10 +354,10 @@ def distribute_load_power_limit(
         AuditEvent(
             actor=command.source or "eebus",
             action="distribute_eebus_load_power_limit",
-            target_type="hems_policy",
-            target_id=str(policy_after.site_id),
+            target_type="hems_load_control",
+            target_id=str(policy.site_id),
             summary=(
-                f"Applied EEBus {'LPC' if limit_id == 0 else 'LPP'} limit of {command.limit_watts} W."
+                f"Recorded active EEBus {'LPC' if limit_id == 0 else 'LPP'} limit of {command.limit_watts} W."
                 if command.is_active
                 else f"Recorded inactive EEBus {'LPC' if limit_id == 0 else 'LPP'} limit."
             ),
@@ -332,7 +369,9 @@ def distribute_load_power_limit(
                 "duration_seconds": command.duration_seconds,
                 "is_active": command.is_active,
                 "peer_ski": command.peer_ski,
-                "changed_fields": changed_fields,
+                "changed_effective_limits": changed_effective_limits,
+                "active_constraints": active_constraints,
+                "constraint_distribution": constraint_distribution,
                 "raw": command.raw,
             },
             created_at=utcnow(),
@@ -349,9 +388,12 @@ def distribute_load_power_limit(
         duration_seconds=command.duration_seconds,
         previous_grid_import_limit_kw=previous_import_limit,
         previous_grid_export_limit_kw=previous_export_limit,
-        applied_grid_import_limit_kw=policy_after.grid_import_limit_kw,
-        applied_grid_export_limit_kw=policy_after.grid_export_limit_kw,
-        changed_policy_fields=changed_fields,
+        applied_grid_import_limit_kw=applied_effective_limits["grid_import_limit_kw"],
+        applied_grid_export_limit_kw=applied_effective_limits["grid_export_limit_kw"],
+        changed_policy_fields={},
+        changed_effective_limits=changed_effective_limits,
+        active_constraints=active_constraints,
+        constraint_distribution=constraint_distribution,
         eebus_payload=eebus_payload,
         plan=(
             HemsPlanHeaderRead(
@@ -371,8 +413,8 @@ def distribute_load_power_limit(
             else None
         ),
         message=(
-            f"Distributed EEBus {use_case} as a {direction} limit through the HEMS planner."
+            f"Recorded EEBus {use_case} as an active {direction} constraint and replanned HEMS dispatch."
             if command.is_active
-            else f"Recorded inactive EEBus {use_case}; HEMS policy was left unchanged."
+            else f"Recorded inactive EEBus {use_case}; HEMS base policy was left unchanged."
         ),
     )

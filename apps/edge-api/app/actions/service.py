@@ -15,6 +15,8 @@ from app.actions.schemas import (
     ConnectionStateRead,
 )
 from app.db.models import AgentTask, AuditEvent, Device, ProtocolDiagnosticRun, ProtocolEndpoint, Site, utcnow
+from app.hems.load_control import update_load_control_config
+from app.hems.schemas import HemsLoadControlDeviceConfigUpdate
 from app.home_graph.service import connection_facets_for_entity, resolve_entity, sync_inventory_to_home_graph
 from app.services.dashboard import remove_device_from_inventory
 from app.services.eebus_identity import read_eebus_local_identity
@@ -139,6 +141,20 @@ def _execute_action(context: ActionContext, action_name: str, payload: dict[str,
                 "rediscovery_required": True,
             },
             [],
+        )
+    if action_name == "load_control.configure_device":
+        config = update_load_control_config(
+            context.session,
+            HemsLoadControlDeviceConfigUpdate.model_validate(payload),
+            actor=context.actor,
+        )
+        return (
+            {
+                "status": "configured",
+                "device_id": config.device_id,
+                "load_control": config.model_dump(mode="json"),
+            },
+            [{"event_type": "device.details.open", "payload": {"entity_ref": f"device:{config.device_id}"}}],
         )
     if action_name == "ui.open_device_details":
         entity_ref = str(payload.get("entity_ref") or "")

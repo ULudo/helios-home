@@ -40,6 +40,28 @@ class HemsPolicyUpdate(BaseModel):
     step_minutes: int | None = None
 
 
+class HemsLoadControlDeviceConfigRead(BaseModel):
+    device_id: str
+    receives_lpc: bool = False
+    receives_lpp: bool = False
+    participates_lpc: bool = False
+    participates_lpp: bool = False
+    lpc_share_pct: float = 0.0
+    lpp_share_pct: float = 0.0
+    updated_at: datetime | None = None
+
+
+class HemsLoadControlDeviceConfigUpdate(BaseModel):
+    device_id: str
+    receives_lpc: bool | None = None
+    receives_lpp: bool | None = None
+    participates_lpc: bool | None = None
+    participates_lpp: bool | None = None
+    lpc_share_pct: float | None = Field(default=None, ge=0, le=100)
+    lpp_share_pct: float | None = Field(default=None, ge=0, le=100)
+    reason: str = ""
+
+
 class HemsCommandContractRead(BaseModel):
     command_key: str
     value_type: str
@@ -198,6 +220,9 @@ class EebusLoadPowerLimitDistributionRead(BaseModel):
     applied_grid_import_limit_kw: float
     applied_grid_export_limit_kw: float
     changed_policy_fields: dict[str, float] = Field(default_factory=dict)
+    changed_effective_limits: dict[str, float] = Field(default_factory=dict)
+    active_constraints: list[dict[str, Any]] = Field(default_factory=list)
+    constraint_distribution: dict[str, Any] = Field(default_factory=dict)
     eebus_payload: dict[str, Any] = Field(default_factory=dict)
     plan: HemsPlanHeaderRead | None = None
     message: str

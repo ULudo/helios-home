@@ -811,6 +811,42 @@ class HemsPolicy(Base):
     site: Mapped[Site] = relationship(back_populates="hems_policy")
 
 
+class HemsLoadControlDeviceConfig(Base):
+    __tablename__ = "hems_load_control_device_configs"
+
+    device_id: Mapped[str] = mapped_column(ForeignKey("devices.id"), primary_key=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"))
+    receives_lpc: Mapped[bool] = mapped_column(default=False)
+    receives_lpp: Mapped[bool] = mapped_column(default=False)
+    participates_lpc: Mapped[bool] = mapped_column(default=False)
+    participates_lpp: Mapped[bool] = mapped_column(default=False)
+    lpc_share_pct: Mapped[float] = mapped_column(default=0.0)
+    lpp_share_pct: Mapped[float] = mapped_column(default=0.0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        onupdate=utcnow,
+    )
+
+
+class HemsLoadControlLimit(Base):
+    __tablename__ = "hems_load_control_limits"
+
+    id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"))
+    use_case: Mapped[str] = mapped_column(String(80))
+    limit_id: Mapped[int] = mapped_column(default=0)
+    direction: Mapped[str] = mapped_column(String(40))
+    source: Mapped[str] = mapped_column(String(80), default="eebus")
+    peer_ski: Mapped[str] = mapped_column(String(80), default="")
+    limit_watts: Mapped[int] = mapped_column(default=0)
+    duration_seconds: Mapped[int | None] = mapped_column(nullable=True)
+    is_active: Mapped[bool] = mapped_column(default=True)
+    raw: Mapped[dict] = mapped_column(JSON, default=dict)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class HemsPlanRun(Base):
     __tablename__ = "hems_plan_runs"
 

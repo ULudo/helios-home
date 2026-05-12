@@ -12,6 +12,7 @@ from app.domain.enums import HemsAssetType, HemsControlCapability
 from app.hems.bindings import binding_lookup
 from app.hems.dispatchability import assess_dispatchability
 from app.hems.forecast import build_default_forecast
+from app.hems.load_control import effective_grid_limits
 from app.hems.models import CanonicalAsset, ForecastBundle, SiteModel
 from app.hems.policy import get_or_create_hems_policy
 
@@ -234,6 +235,7 @@ def build_site_model(
         raise RuntimeError("Site has not been seeded.")
     policy = get_or_create_hems_policy(session)
     current_time = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    effective_limits = effective_grid_limits(session, policy, now=current_time)
     native_writes_enabled = get_settings().native_writes_enabled
 
     assets = session.scalars(select(Asset).order_by(Asset.asset_type, Asset.name)).all()
@@ -286,6 +288,8 @@ def build_site_model(
             "heat_comfort_max_c": policy.heat_comfort_max_c,
             "grid_import_limit_kw": policy.grid_import_limit_kw,
             "grid_export_limit_kw": policy.grid_export_limit_kw,
+            "effective_grid_import_limit_kw": effective_limits["grid_import_limit_kw"],
+            "effective_grid_export_limit_kw": effective_limits["grid_export_limit_kw"],
             "allow_price_arbitrage": policy.allow_price_arbitrage,
             "allow_heat_precharge": policy.allow_heat_precharge,
             "allow_ev_load_shifting": policy.allow_ev_load_shifting,
@@ -294,8 +298,8 @@ def build_site_model(
         },
         assets=canonical_assets,
         grid_constraints={
-            "import_limit_kw": policy.grid_import_limit_kw,
-            "export_limit_kw": policy.grid_export_limit_kw,
+            "import_limit_kw": effective_limits["grid_import_limit_kw"],
+            "export_limit_kw": effective_limits["grid_export_limit_kw"],
         },
         forecast=forecast,
     )

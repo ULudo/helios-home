@@ -5,9 +5,11 @@ import errno
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 from app.core.config import get_settings
-from app.db.session import get_engine
+from app.db.models import Device, HemsPolicy, Site
+from app.db.session import get_engine, get_session_factory
 from app.hems.schemas import EebusLoadPowerLimitCreate
 from app.main import create_app
 from app.services.discovery import run_discovery
@@ -45,6 +47,37 @@ def _bootstrap_app(tmp_path, monkeypatch, name="eebus.db"):
     get_settings.cache_clear()
     get_engine.cache_clear()
     return create_app()
+
+
+def _add_controllable_device(device_id: str, name: str) -> None:
+    session_factory = get_session_factory()
+    with session_factory() as session:
+        site = session.scalar(select(Site).limit(1))
+        assert site is not None
+        session.add(
+            Device(
+                id=device_id,
+                site_id=site.id,
+                name=name,
+                manufacturer="Test",
+                model="Load",
+                firmware="unknown",
+                device_type="controllable_load",
+                primary_status="visible_only",
+                status_tags=["visible_only"],
+                confidence=0.9,
+                recovery_zone="human_gated",
+                protocols=["http"],
+                capabilities={
+                    "visible": True,
+                    "monitorable": True,
+                    "controllable": True,
+                    "optimizable": True,
+                },
+                telemetry={"power_w": 1000},
+            )
+        )
+        session.commit()
 
 
 def test_eebus_ship_service_materializes_as_visible_candidate():
@@ -168,8 +201,56 @@ def test_eebus_lpc_distribution_tightens_policy_and_replans(tmp_path, monkeypatc
     assert payload["previous_grid_import_limit_kw"] == 12.0
     assert payload["applied_grid_import_limit_kw"] == 4.2
     assert payload["applied_grid_export_limit_kw"] == 12.0
-    assert payload["changed_policy_fields"] == {"grid_import_limit_kw": 4.2}
+    assert payload["changed_policy_fields"] == {}
+    assert payload["changed_effective_limits"] == {"grid_import_limit_kw": 4.2}
+    assert payload["active_constraints"][0]["limit_watts"] == 4200
+    assert payload["constraint_distribution"]["participant_count"] == 0
     assert payload["plan"]["triggered_by"] == "eebus_lpc"
+
+    session_factory = get_session_factory()
+    with session_factory() as session:
+        policy = session.scalar(select(HemsPolicy).limit(1))
+        assert policy is not None
+        assert policy.grid_import_limit_kw == 12.0
+
+
+def test_eebus_lpc_distribution_uses_configured_load_control_participants(tmp_path, monkeypatch):
+    app = _bootstrap_app(tmp_path, monkeypatch, "eebus-lpc-participants.db")
+
+    with TestClient(app) as client:
+        client.get("/api/v1/overview")
+        _add_controllable_device("dev-load-a", "Load A")
+        _add_controllable_device("dev-load-b", "Load B")
+        for device_id, share in [("dev-load-a", 70), ("dev-load-b", 30)]:
+            response = client.post(
+                "/api/v1/actions/load_control.configure_device",
+                json={
+                    "input": {
+                        "device_id": device_id,
+                        "participates_lpc": True,
+                        "lpc_share_pct": share,
+                    }
+                },
+            )
+            assert response.status_code == 200
+
+        response = client.post(
+            "/api/v1/eebus/load-power-limits/distribute",
+            json={
+                "use_case": "lpc",
+                "limit_watts": 10000,
+                "source": "test",
+                "peer_ski": "0123456789abcdef0123456789abcdef01234567",
+            },
+        )
+
+    assert response.status_code == 200
+    distribution = response.json()["constraint_distribution"]
+    assert distribution["participant_count"] == 2
+    assert distribution["enforceable"] is True
+    participants = {row["device_id"]: row for row in distribution["participants"]}
+    assert participants["dev-load-a"]["allocated_limit_watts"] == 7000
+    assert participants["dev-load-b"]["allocated_limit_watts"] == 3000
 
 
 def test_eebus_runtime_extracts_incoming_lpc_write_from_ship_trace_payload():
