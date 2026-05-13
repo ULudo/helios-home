@@ -110,7 +110,7 @@ def _upsert_endpoint(
     endpoint.service_name = service_name
     endpoint.host = host
     endpoint.port = port
-    endpoint.status = "observed"
+    endpoint.status = endpoint.status if endpoint.status in {"connected", "disconnected"} else "observed"
     clean_properties = dict(properties or {})
     if source:
         clean_properties["source"] = source
@@ -454,6 +454,8 @@ def sync_inventory_to_home_graph(session: Session, site_id: int | None = None) -
                 "protocols": device.protocols or [],
                 "capabilities": device.capabilities or {},
                 "telemetry": device.telemetry or {},
+                "telemetry_status": device.telemetry_status,
+                "telemetry_updated_at": device.telemetry_updated_at.isoformat() if device.telemetry_updated_at else "",
                 "confidence": device.confidence,
             },
         )
@@ -945,10 +947,12 @@ def connection_facets_for_entity(
         for endpoint in endpoint_rows
         if endpoint.protocol == "eebus_ship"
     ]
-    eebus_ship_ready = any(
-        snapshot.get("endpoint_in_runtime") is True and snapshot.get("status") == "ship_ready"
+    ready_eebus_endpoint_refs = {
+        str(snapshot.get("endpoint_ref") or "")
         for snapshot in eebus_runtime_snapshots
-    )
+        if _runtime_snapshot_is_endpoint_ready(snapshot)
+    }
+    eebus_ship_ready = bool(ready_eebus_endpoint_refs)
     local_identity = session.scalar(select(EebusLocalIdentity).where(EebusLocalIdentity.site_id == entity.site_id))
     diagnostic_blocker_codes = {
         str(code)
@@ -956,7 +960,13 @@ def connection_facets_for_entity(
         for code in ((diagnostic.result or {}).get("blocker_codes") or [])
     }
 
-    endpoint_state = "visible" if endpoint_rows else "none"
+    connected_endpoint = any(
+        endpoint.status == "connected"
+        and (endpoint.protocol != "eebus_ship" or endpoint.id in ready_eebus_endpoint_refs)
+        for endpoint in endpoint_rows
+    )
+    all_endpoints_disconnected = bool(endpoint_rows) and all(endpoint.status == "disconnected" for endpoint in endpoint_rows)
+    endpoint_state = "connected" if connected_endpoint else "disconnected" if all_endpoints_disconnected else "visible" if endpoint_rows else "none"
     role_state = "bound" if binding is not None else ("user_accepted" if role_candidate_rows else "none")
     trust_state = "unknown"
     if has_eebus:
@@ -973,6 +983,9 @@ def connection_facets_for_entity(
     telemetry_state = "validated" if binding is not None and binding.telemetry_status == "validated" else "unknown"
     control_state = "validated" if binding is not None and binding.control_status == "validated" else "unknown"
     capabilities = (entity.properties or {}).get("capabilities") if isinstance((entity.properties or {}).get("capabilities"), dict) else {}
+    telemetry_status = str((entity.properties or {}).get("telemetry_status") or "")
+    if telemetry_state == "unknown" and telemetry_status in {"live", "stale", "error", "sampled"}:
+        telemetry_state = telemetry_status
     if telemetry_state == "unknown" and capabilities.get("monitorable") is False:
         telemetry_state = "unvalidated"
     if control_state == "unknown" and capabilities.get("controllable") is False:
@@ -983,6 +996,8 @@ def connection_facets_for_entity(
         overall = "connected"
     elif eebus_ship_ready:
         overall = "ship_ready"
+    elif connected_endpoint:
+        overall = "connected"
     elif blocker_rows or diagnostic_blocker_codes:
         overall = "blocked"
     elif role_state == "user_accepted":
@@ -1005,6 +1020,25 @@ def connection_facets_for_entity(
         "blocker_refs": [blocker.id for blocker in blocker_rows],
         "diagnostic_refs": [diagnostic.id for diagnostic in diagnostics],
     }
+
+
+def _runtime_snapshot_is_endpoint_ready(snapshot: dict) -> bool:
+    if snapshot.get("endpoint_in_runtime") is not True:
+        return False
+    states = snapshot.get("endpoint_connection_states") or {}
+    if not isinstance(states, dict):
+        return False
+    if any(isinstance(state, dict) and state.get("status") == "ready" for state in states.values()):
+        return True
+    if snapshot.get("status") != "ship_ready":
+        return False
+    ready_peer_skis = {str(row or "").lower() for row in snapshot.get("ready_peer_skis") or []}
+    endpoint_peer_skis = {
+        str(state.get("peer_ski") or "").lower()
+        for state in states.values()
+        if isinstance(state, dict) and state.get("peer_ski")
+    }
+    return bool(ready_peer_skis & endpoint_peer_skis)
 
 
 def _entity_text_score(text: str, entity: HomeGraphEntity) -> float:

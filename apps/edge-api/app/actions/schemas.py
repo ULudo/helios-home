@@ -39,6 +39,7 @@ class ConnectionEndpointOptionRead(BaseModel):
     connectable: bool
     state: dict[str, Any] = Field(default_factory=dict)
     connect_action: ConnectionActionRef | None = None
+    disconnect_action: ConnectionActionRef | None = None
 
 
 class ConnectionOptionsRead(BaseModel):
@@ -69,3 +70,4 @@ class ConnectionStateRead(BaseModel):
     last_error: str = ""
     updated_at: datetime | None = None
     connect_action: ConnectionActionRef | None = None
+    disconnect_action: ConnectionActionRef | None = None

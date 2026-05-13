@@ -11,6 +11,7 @@ from app.domain.enums import RecoveryZone
 from app.hems.load_control import (
     active_load_control_limits,
     build_constraint_distribution,
+    create_load_control_deliveries,
     effective_grid_limits,
     record_load_control_limit,
 )
@@ -303,7 +304,7 @@ def distribute_load_power_limit(
     previous_import_limit = previous_effective_limits["grid_import_limit_kw"]
     previous_export_limit = previous_effective_limits["grid_export_limit_kw"]
 
-    record_load_control_limit(
+    limit = record_load_control_limit(
         session,
         site_id=policy.site_id,
         use_case=use_case,
@@ -343,6 +344,31 @@ def distribute_load_power_limit(
         use_case=use_case,
         limit_watts=command.limit_watts,
     )
+    constraint_distribution.update(
+        {
+            "constraint_id": limit.id,
+            "limit_id": limit_id,
+            "duration_seconds": command.duration_seconds,
+            "is_active": command.is_active,
+            "source_peer_ski": command.peer_ski or "",
+        }
+    )
+    deliveries = create_load_control_deliveries(session, limit=limit, distribution=constraint_distribution)
+    deliveries_by_device = {delivery.target_device_id: delivery for delivery in deliveries}
+    for participant in constraint_distribution.get("participants", []):
+        if not isinstance(participant, dict):
+            continue
+        delivery = deliveries_by_device.get(str(participant.get("device_id") or ""))
+        if delivery is None:
+            continue
+        participant.update(
+            {
+                "delivery_id": delivery.id,
+                "delivery_status": delivery.status,
+                "delivery_detail": delivery.detail,
+                "delivery_updated_at": delivery.updated_at.isoformat() if delivery.updated_at else None,
+            }
+        )
 
     plan = None
     if command.is_active or changed_effective_limits:

@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import Settings
 from app.db.models import Blocker, ProtocolDiagnosticRun, ProtocolEndpoint, utcnow
+from app.hems.load_control import update_load_control_delivery_status
 from app.hems.schemas import EebusLoadPowerLimitCreate
 from app.services.eebus import distribute_load_power_limit
 from app.services.eebus_identity import materialize_eebus_identity
@@ -157,6 +158,7 @@ class EebusRuntimeTraceLogger:
                         "changed_policy_fields": result.changed_policy_fields,
                     }
                 )
+                self._manager.forward_load_power_limit(result.constraint_distribution)
             except Exception as exc:
                 self._manager.record_event(
                     "load_power_limit_distribution_failed",
@@ -179,6 +181,13 @@ class EebusRuntimeManager:
         self._stop_event: asyncio.Event | None = None
         self._runtime_dir: str | None = None
         self._peers: dict[str, EebusRuntimePeer] = {}
+        self._outbound_clients: dict[str, Any] = {}
+        self._outbound_clients_by_ski: dict[str, Any] = {}
+        self._pending_delivery_writes: dict[tuple[str, int], str] = {}
+        self._pending_delivery_readbacks: dict[tuple[str, int], str] = {}
+        self._session_factory: sessionmaker[Session] | None = None
+        self._settings: Settings | None = None
+        self._material: Any = None
         self._diagnostic_run_refs: set[str] = set()
         self._ready_peer_skis: set[str] = set()
         self._current_peer_ski = ""
@@ -256,12 +265,18 @@ class EebusRuntimeManager:
             self._peers[endpoint_ref] = peer_config
             if diagnostic_run_ref:
                 self._diagnostic_run_refs.add(diagnostic_run_ref)
+            self._session_factory = session_factory
+            self._settings = settings
+            self._material = material
             self._snapshot.trusted_peer_skis = sorted(
                 {row.certificate_ski for row in self._peers.values() if row.certificate_ski}
             )
             self._snapshot.endpoint_refs = sorted(self._peers)
             self._snapshot.diagnostic_run_refs = sorted(self._diagnostic_run_refs)
             for direction in requested_directions:
+                if can_reuse:
+                    self._repair_reused_ready_state_locked(endpoint_ref, direction, peer_config)
+                    continue
                 self._set_connection_state_locked(
                     endpoint_ref,
                     direction,
@@ -280,11 +295,12 @@ class EebusRuntimeManager:
                 return self.snapshot()
             self._snapshot.status = "starting"
             self._snapshot.error = ""
+            runtime_directions = self._runtime_connection_directions_locked(requested_directions)
         self._restart(
             session_factory=session_factory,
             settings=settings,
             material=material,
-            connection_directions=requested_directions,
+            connection_directions=runtime_directions,
         )
         deadline = time.time() + 2.0
         while time.time() < deadline:
@@ -495,6 +511,47 @@ class EebusRuntimeManager:
             self._snapshot.last_load_power_limit = payload
         self.record_event("load_power_limit_received", payload)
 
+    def forward_load_power_limit(self, distribution: dict[str, Any]) -> None:
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            self.record_event(
+                "load_power_forwarding_unavailable",
+                {"error": "EEBUS runtime loop is not running.", "constraint_distribution": distribution},
+                level="error",
+            )
+            self._fail_pending_distribution_deliveries(distribution, "EEBUS runtime loop is not running.")
+            return
+        future = asyncio.run_coroutine_threadsafe(self._forward_load_power_limit_async(distribution), loop)
+        future.add_done_callback(self._handle_forwarding_future)
+
+    def disconnect_endpoint(self, endpoint_ref: str) -> None:
+        with self._lock:
+            removed = self._peers.pop(endpoint_ref, None)
+            self._snapshot.connection_states.pop(endpoint_ref, None)
+            self._outbound_clients.pop(endpoint_ref, None)
+            if removed is not None:
+                normalized_ski = _normalize_ski(removed.certificate_ski)
+                if normalized_ski:
+                    self._outbound_clients_by_ski.pop(normalized_ski, None)
+            self._recompute_ready_peer_skis_locked()
+            remaining = bool(self._peers)
+            session_factory = self._session_factory
+            settings = self._settings
+            material = self._material
+            directions = self._runtime_connection_directions_locked([])
+        if not remaining:
+            self.stop(clear_runtime=True)
+            return
+        if session_factory is None or settings is None or material is None:
+            self.stop(clear_runtime=False)
+            return
+        self._restart(
+            session_factory=session_factory,
+            settings=settings,
+            material=material,
+            connection_directions=directions,
+        )
+
     def _restart(
         self,
         *,
@@ -541,12 +598,19 @@ class EebusRuntimeManager:
         self._server = None
         self._advertiser = None
         self._stop_event = None
+        self._outbound_clients.clear()
+        self._outbound_clients_by_ski.clear()
         if clear_runtime:
             with self._lock:
                 self._peers.clear()
                 self._diagnostic_run_refs.clear()
                 self._ready_peer_skis.clear()
                 self._current_peer_ski = ""
+                self._pending_delivery_writes.clear()
+                self._pending_delivery_readbacks.clear()
+                self._session_factory = None
+                self._settings = None
+                self._material = None
                 self._snapshot = EebusRuntimeSnapshot()
 
     def _can_reuse_runtime_locked(
@@ -570,6 +634,35 @@ class EebusRuntimeManager:
         reusable_statuses = {"starting", "listening", "connecting", "ready"}
         return all(endpoint_states.get(direction, {}).get("status") in reusable_statuses for direction in requested_directions)
 
+    def _repair_reused_ready_state_locked(
+        self,
+        endpoint_ref: str,
+        direction: str,
+        peer: EebusRuntimePeer,
+    ) -> None:
+        endpoint_states = self._snapshot.connection_states.get(endpoint_ref, {})
+        existing = endpoint_states.get(direction, {})
+        if existing.get("status") == "ready":
+            return
+        peer_ski = _normalize_ski(peer.certificate_ski)
+        ready_peer_skis = {_normalize_ski(row) for row in self._snapshot.ready_peer_skis}
+        if peer_ski and peer_ski in ready_peer_skis:
+            self._set_connection_state_locked(
+                endpoint_ref,
+                direction,
+                {
+                    "status": "ready",
+                    "entity_ref": peer.entity_ref,
+                    "endpoint_ref": endpoint_ref,
+                    "host": peer.host,
+                    "port": peer.port,
+                    "path": peer.path,
+                    "server_name": peer.server_name or peer.host,
+                    "peer_ski": peer_ski,
+                    "recovered_from_ready_peer_ski": True,
+                },
+            )
+
     def _set_connection_state_locked(self, endpoint_ref: str, direction: str, updates: dict[str, Any]) -> None:
         if not endpoint_ref or not direction:
             return
@@ -588,6 +681,27 @@ class EebusRuntimeManager:
                 if state.get("status") in {"starting", "listening", "connecting", "ready"}:
                     active.add(state_direction)
         self._snapshot.active_connection_directions = sorted(active)
+
+    def _runtime_connection_directions_locked(self, requested_directions: list[str]) -> list[str]:
+        directions = set(requested_directions)
+        directions.update(self._snapshot.active_connection_directions)
+        return sorted(directions)
+
+    def _recompute_ready_peer_skis_locked(self) -> None:
+        ready: set[str] = set()
+        for endpoint_ref, states in self._snapshot.connection_states.items():
+            if endpoint_ref not in self._peers:
+                continue
+            for state in states.values():
+                if not isinstance(state, dict) or state.get("status") != "ready":
+                    continue
+                peer_ski = _normalize_ski(str(state.get("peer_ski") or ""))
+                if peer_ski:
+                    ready.add(peer_ski)
+        self._ready_peer_skis = ready
+        self._snapshot.ready_peer_skis = sorted(ready)
+        if self._current_peer_ski not in ready:
+            self._current_peer_ski = next(iter(sorted(ready)), "")
 
     def _thread_main(
         self,
@@ -799,10 +913,18 @@ class EebusRuntimeManager:
                 profile="cls-adapter",
             )
             remote_ship_id = str(getattr(client.session, "remote_ship_id", "") or "")
+            with contextlib.suppress(Exception):
+                await client.bootstrap_spine(timeout=1.5)
+            with self._lock:
+                self._outbound_clients[peer.endpoint_ref] = client
+                normalized_ski = _normalize_ski(peer.certificate_ski)
+                if normalized_ski:
+                    self._outbound_clients_by_ski[normalized_ski] = client
             self.mark_outbound_ready(peer, remote_ship_id=remote_ship_id)
             async for event in client.session_events():
                 if event.kind == "datagram":
                     datagram_payload = _spine_datagram_as_ship_payload(event.payload)
+                    self._process_outbound_delivery_result(peer, event.payload)
                     trace_logger._process_incoming_spine_payload(datagram_payload)
                     await client.handle_incoming_datagram(event.payload)
                     self.record_event(
@@ -830,6 +952,12 @@ class EebusRuntimeManager:
         except Exception as exc:
             self.mark_outbound_failed(peer, str(exc))
         finally:
+            with self._lock:
+                if self._outbound_clients.get(peer.endpoint_ref) is client:
+                    self._outbound_clients.pop(peer.endpoint_ref, None)
+                normalized_ski = _normalize_ski(peer.certificate_ski)
+                if normalized_ski and self._outbound_clients_by_ski.get(normalized_ski) is client:
+                    self._outbound_clients_by_ski.pop(normalized_ski, None)
             if client is not None:
                 with contextlib.suppress(Exception):
                     await client.close()
@@ -838,8 +966,328 @@ class EebusRuntimeManager:
         async for event in server.events():
             if event.kind == "ready":
                 self.mark_ready(dict(event.payload or {}))
+            elif event.kind in {"load_power_write_sent", "load_power_write_result", "load_power_readback"}:
+                payload = dict(event.payload or {})
+                self._process_server_delivery_event(event.kind, payload)
+                self.record_event(str(event.kind), payload)
             else:
                 self.record_event(str(event.kind), dict(event.payload or {}))
+
+    async def _forward_load_power_limit_async(self, distribution: dict[str, Any]) -> None:
+        participants = [
+            participant
+            for participant in distribution.get("participants", [])
+            if isinstance(participant, dict)
+            and str(participant.get("delivery_status") or participant.get("status") or "") in {"pending", "delivery_ready"}
+        ]
+        for participant in participants:
+            delivery_id = str(participant.get("delivery_id") or "")
+            peer_ski = _normalize_ski(str(participant.get("target_peer_ski") or ""))
+            endpoint_ref = str(participant.get("target_endpoint_ref") or "")
+            allocated_limit_watts = int(participant.get("allocated_limit_watts") or 0)
+            if not delivery_id or not peer_ski or allocated_limit_watts <= 0:
+                continue
+            try:
+                await self._send_load_power_limit_to_peer(
+                    delivery_id=delivery_id,
+                    endpoint_ref=endpoint_ref,
+                    peer_ski=peer_ski,
+                    watts=allocated_limit_watts,
+                    duration_seconds=_optional_int(distribution.get("duration_seconds")),
+                    limit_id=int(distribution.get("limit_id") or 0),
+                    is_active=bool(distribution.get("is_active", True)),
+                )
+            except Exception as exc:
+                self._update_delivery(
+                    delivery_id,
+                    status="failed",
+                    detail="EEBUS delivery failed.",
+                    error=str(exc),
+                    raw_update={"participant": participant},
+                )
+                self.record_event(
+                    "load_power_forwarding_failed",
+                    {
+                        "delivery_id": delivery_id,
+                        "peer_ski": peer_ski,
+                        "endpoint_ref": endpoint_ref,
+                        "error": str(exc),
+                    },
+                    level="error",
+                )
+
+    async def _send_load_power_limit_to_peer(
+        self,
+        *,
+        delivery_id: str,
+        endpoint_ref: str,
+        peer_ski: str,
+        watts: int,
+        duration_seconds: int | None,
+        limit_id: int,
+        is_active: bool,
+    ) -> None:
+        server = self._server
+        if server is not None:
+            try:
+                metadata = await server.send_load_power_limit_to_peer(
+                    peer_ski,
+                    watts=watts,
+                    duration_seconds=duration_seconds,
+                    limit_id=limit_id,
+                    is_active=is_active,
+                )
+            except Exception as server_exc:
+                self.record_event(
+                    "load_power_server_send_unavailable",
+                    {
+                        "delivery_id": delivery_id,
+                        "peer_ski": peer_ski,
+                        "endpoint_ref": endpoint_ref,
+                        "error": str(server_exc),
+                    },
+                    level="warning",
+                )
+            else:
+                self._register_pending_delivery(peer_ski, delivery_id, metadata)
+                self._update_delivery(
+                    delivery_id,
+                    status="sent",
+                    detail="EEBUS load-power write was sent over an inbound SHIP session.",
+                    raw_update=metadata,
+                )
+                return
+        client = self._outbound_client_for(endpoint_ref, peer_ski)
+        if client is None:
+            raise RuntimeError(f"peer {peer_ski} is not currently connected")
+        metadata = await self._send_load_power_limit_with_client(
+            client,
+            peer_ski=peer_ski,
+            watts=watts,
+            duration_seconds=duration_seconds,
+            limit_id=limit_id,
+            is_active=is_active,
+        )
+        self._register_pending_delivery(peer_ski, delivery_id, metadata)
+        self._update_delivery(
+            delivery_id,
+            status="sent",
+            detail="EEBUS load-power write was sent over an outbound SHIP session.",
+            raw_update=metadata,
+        )
+
+    async def _send_load_power_limit_with_client(
+        self,
+        client: Any,
+        *,
+        peer_ski: str,
+        watts: int,
+        duration_seconds: int | None,
+        limit_id: int,
+        is_active: bool,
+    ) -> dict[str, Any]:
+        from eebus_sdk._load_power import build_limit_payload
+        from eebus_sdk._spine_helpers import feature_addresses
+        from eebus_sdk.spine import build_datagram, build_read_datagram, extract_header
+
+        discovery = getattr(client, "_last_remote_discovery", None)
+        if not isinstance(discovery, dict):
+            raise RuntimeError(f"peer {peer_ski} has not completed LoadControl discovery yet")
+        destinations = feature_addresses(
+            discovery,
+            feature_type="LoadControl",
+            role="server",
+            default_device=getattr(client, "_remote_device_address", None),
+        )
+        if not destinations:
+            raise RuntimeError(f"peer {peer_ski} does not expose a LoadControl server feature")
+        destination = destinations[0]
+        source = {"device": client.local_device_address(), "entity": [1], "feature": 6}
+        write_datagram = build_datagram(
+            source=source,
+            destination=destination,
+            cmd_classifier="write",
+            msg_counter=client._next_msg_counter(),
+            commands=[
+                build_limit_payload(
+                    watts=watts,
+                    duration_seconds=duration_seconds,
+                    limit_id=limit_id,
+                    is_active=is_active,
+                )
+            ],
+            ack_request=True,
+        )
+        readback_datagram = build_read_datagram(
+            source=source,
+            destination=destination,
+            msg_counter=client._next_msg_counter(),
+            function_name="loadControlLimitListData",
+            ack_request=client._outbound_read_ack_request(),
+        )
+        await client.send_datagram(write_datagram)
+        await client.send_datagram(readback_datagram)
+        return {
+            "peer_ski": peer_ski,
+            "limit_id": limit_id,
+            "watts": watts,
+            "duration_seconds": duration_seconds,
+            "is_active": is_active,
+            "msg_counter": extract_header(write_datagram).get("msgCounter"),
+            "readback_msg_counter": extract_header(readback_datagram).get("msgCounter"),
+        }
+
+    def _outbound_client_for(self, endpoint_ref: str, peer_ski: str) -> Any:
+        with self._lock:
+            if endpoint_ref and endpoint_ref in self._outbound_clients:
+                return self._outbound_clients[endpoint_ref]
+            return self._outbound_clients_by_ski.get(_normalize_ski(peer_ski))
+
+    def _register_pending_delivery(self, peer_ski: str, delivery_id: str, metadata: dict[str, Any]) -> None:
+        normalized_peer_ski = _normalize_ski(peer_ski)
+        with self._lock:
+            msg_counter = metadata.get("msg_counter")
+            readback_msg_counter = metadata.get("readback_msg_counter")
+            if isinstance(msg_counter, int):
+                self._pending_delivery_writes[(normalized_peer_ski, msg_counter)] = delivery_id
+            if isinstance(readback_msg_counter, int):
+                self._pending_delivery_readbacks[(normalized_peer_ski, readback_msg_counter)] = delivery_id
+
+    def _process_server_delivery_event(self, kind: str, payload: dict[str, Any]) -> None:
+        peer_ski = _normalize_ski(str(payload.get("peer_ski") or ""))
+        if kind == "load_power_write_sent":
+            delivery_id = self._delivery_id_for_counter(peer_ski, payload.get("msg_counter"), write=True, pop=False)
+            if delivery_id:
+                self._update_delivery(delivery_id, status="sent", detail="EEBUS load-power write was sent.", raw_update=payload)
+            return
+        if kind == "load_power_write_result":
+            delivery_id = self._delivery_id_for_counter(peer_ski, payload.get("msg_counter_reference"), write=True, pop=True)
+            if not delivery_id:
+                return
+            error_number = payload.get("error_number")
+            if error_number == 0:
+                self._update_delivery(
+                    delivery_id,
+                    status="acknowledged",
+                    detail="EEBUS peer acknowledged the load-power write.",
+                    raw_update=payload,
+                )
+            else:
+                self._update_delivery(
+                    delivery_id,
+                    status="rejected",
+                    detail="EEBUS peer rejected the load-power write.",
+                    error=str(payload.get("description") or error_number or "rejected"),
+                    raw_update=payload,
+                )
+            return
+        if kind == "load_power_readback":
+            delivery_id = self._delivery_id_for_counter(peer_ski, payload.get("msg_counter_reference"), write=False, pop=True)
+            if delivery_id:
+                self._update_delivery(
+                    delivery_id,
+                    status="readback_confirmed",
+                    detail="EEBUS peer readback confirmed the load-power state.",
+                    raw_update=payload,
+                )
+
+    def _process_outbound_delivery_result(self, peer: EebusRuntimePeer, datagram: Any) -> None:
+        from eebus_sdk._load_power import extract_limit_state
+        from eebus_sdk.spine import extract_commands, extract_header
+
+        peer_ski = _normalize_ski(peer.certificate_ski)
+        header = extract_header(datagram)
+        msg_counter_reference = header.get("msgCounterReference")
+        if not isinstance(msg_counter_reference, int):
+            return
+        commands = extract_commands(datagram)
+        if header.get("cmdClassifier") == "result":
+            delivery_id = self._delivery_id_for_counter(peer_ski, msg_counter_reference, write=True, pop=True)
+            if not delivery_id:
+                return
+            result = next((command.get("resultData") for command in commands if isinstance(command.get("resultData"), dict)), None)
+            error_number = result.get("errorNumber") if isinstance(result, dict) else None
+            if error_number == 0:
+                self._update_delivery(
+                    delivery_id,
+                    status="acknowledged",
+                    detail="EEBUS peer acknowledged the load-power write.",
+                    raw_update={"header": header, "result": result},
+                )
+            else:
+                self._update_delivery(
+                    delivery_id,
+                    status="rejected",
+                    detail="EEBUS peer rejected the load-power write.",
+                    error=str((result or {}).get("description") or error_number or "rejected"),
+                    raw_update={"header": header, "result": result},
+                )
+            return
+        if header.get("cmdClassifier") == "reply":
+            delivery_id = self._delivery_id_for_counter(peer_ski, msg_counter_reference, write=False, pop=True)
+            if not delivery_id:
+                return
+            load_control_state = next(
+                (
+                    command.get("loadControlLimitListData")
+                    for command in commands
+                    if isinstance(command.get("loadControlLimitListData"), dict)
+                ),
+                None,
+            )
+            state = extract_limit_state(load_control_state)
+            if state is not None:
+                self._update_delivery(
+                    delivery_id,
+                    status="readback_confirmed",
+                    detail="EEBUS peer readback confirmed the load-power state.",
+                    raw_update={"header": header, "state": state},
+                )
+
+    def _delivery_id_for_counter(self, peer_ski: str, counter: Any, *, write: bool, pop: bool) -> str:
+        if not isinstance(counter, int):
+            return ""
+        key = (_normalize_ski(peer_ski), counter)
+        with self._lock:
+            mapping = self._pending_delivery_writes if write else self._pending_delivery_readbacks
+            if pop:
+                return mapping.pop(key, "")
+            return mapping.get(key, "")
+
+    def _update_delivery(
+        self,
+        delivery_id: str,
+        *,
+        status: str,
+        detail: str = "",
+        error: str = "",
+        raw_update: dict[str, Any] | None = None,
+    ) -> None:
+        session_factory = self._session_factory
+        if session_factory is None:
+            return
+        with session_factory() as session:
+            update_load_control_delivery_status(
+                session,
+                delivery_id,
+                status=status,
+                detail=detail,
+                error=error,
+                raw_update=raw_update,
+            )
+            session.commit()
+
+    def _fail_pending_distribution_deliveries(self, distribution: dict[str, Any], error: str) -> None:
+        for participant in distribution.get("participants", []):
+            if not isinstance(participant, dict):
+                continue
+            delivery_id = str(participant.get("delivery_id") or "")
+            if delivery_id:
+                self._update_delivery(delivery_id, status="failed", detail="EEBUS delivery failed.", error=error)
+
+    def _handle_forwarding_future(self, future: asyncio.Future) -> None:
+        with contextlib.suppress(Exception):
+            future.result()
 
     def _append_diagnostic_entries(self, diagnostic_refs: list[str], entries: list[dict[str, Any]]) -> None:
         if not diagnostic_refs:
@@ -939,6 +1387,7 @@ def update_endpoint_peer_trust_material(session: Session, endpoint: ProtocolEndp
 
 def runtime_snapshot_for_endpoint(endpoint_ref: str) -> dict[str, Any]:
     snapshot = get_eebus_runtime_manager().snapshot().as_dict()
+    snapshot["endpoint_ref"] = endpoint_ref
     snapshot["endpoint_in_runtime"] = endpoint_ref in snapshot["endpoint_refs"]
     snapshot["endpoint_connection_states"] = dict(snapshot.get("connection_states", {}).get(endpoint_ref, {}))
     return snapshot
@@ -1017,6 +1466,15 @@ def _duration_to_seconds(value: Any) -> int | None:
     minutes = int(match.group(2) or 0)
     seconds = int(match.group(3) or 0)
     return hours * 3600 + minutes * 60 + seconds
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _requested_connection_directions(peer: EebusRuntimePeer, connection_direction: str) -> list[str]:

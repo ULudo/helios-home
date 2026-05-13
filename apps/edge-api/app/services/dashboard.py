@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from datetime import timezone
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
+from app.core.config import get_settings
 from app.db.models import (
     AgentTask,
     Asset,
@@ -32,7 +35,7 @@ from app.domain.schemas import (
     OverviewResponse,
     SiteRead,
 )
-from app.hems.load_control import get_load_control_config
+from app.hems.load_control import build_load_control_overview, get_load_control_config
 from app.home_graph.service import connection_facets_for_entity
 
 
@@ -53,6 +56,21 @@ def _serialize_site(site: Site) -> SiteRead:
         local_subnet=site.local_subnet,
         updated_at=site.updated_at,
     )
+
+
+def _device_telemetry_status(device: Device) -> tuple[str, float | None]:
+    status = str(device.telemetry_status or "")
+    if not status:
+        status = "sampled" if device.telemetry else "unknown"
+    updated_at = device.telemetry_updated_at
+    if updated_at is None:
+        return status, None
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=timezone.utc)
+    age_seconds = max(0.0, (utcnow() - updated_at).total_seconds())
+    if status == "live" and age_seconds > get_settings().http_telemetry_stale_seconds:
+        status = "stale"
+    return status, round(age_seconds, 1)
 
 
 def _serialize_device(session: Session, device: Device) -> DeviceRead:
@@ -91,6 +109,15 @@ def _serialize_device(session: Session, device: Device) -> DeviceRead:
         status_tags = _append_unique(status_tags, "connected")
         if connection_state == "ship_ready":
             status_tags = _append_unique(status_tags, "eebus_ship_ready")
+    else:
+        status_tags = [
+            tag
+            for tag in status_tags
+            if tag not in {"connected", "eebus_ship_ready", "http_ready"}
+        ]
+        if primary_status == "connected":
+            primary_status = "visible_only"
+    telemetry_status, telemetry_age_seconds = _device_telemetry_status(device)
     return DeviceRead(
         id=device.id,
         name=device.name,
@@ -106,6 +133,9 @@ def _serialize_device(session: Session, device: Device) -> DeviceRead:
         capabilities=capabilities,
         load_control=load_control,
         telemetry=device.telemetry or {},
+        telemetry_status=telemetry_status,
+        telemetry_updated_at=device.telemetry_updated_at,
+        telemetry_age_seconds=telemetry_age_seconds,
         last_seen_at=device.last_seen_at,
         connector_attempts=connector_attempts,
     )
@@ -399,6 +429,7 @@ def build_overview(session: Session) -> OverviewResponse:
     return OverviewResponse(
         site=_serialize_site(site),
         devices=devices,
+        load_control=build_load_control_overview(session, site_id=site.id),
     )
 
 

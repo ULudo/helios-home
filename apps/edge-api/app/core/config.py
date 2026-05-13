@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     eebus_ship_device_id: str = "HELIOS-HOME-HEMS"
     native_writes_enabled: bool = False
     write_http_timeout_seconds: float = 3.0
+    http_telemetry_poll_interval_seconds: float = 2.0
+    http_telemetry_timeout_seconds: float = 1.0
+    http_telemetry_stale_seconds: float = 10.0
     agent_provider: str = "stub"
     agent_config_path: str = "~/.config/helios-home/agent-provider.json"
     agent_stream_delay_ms: int = 12

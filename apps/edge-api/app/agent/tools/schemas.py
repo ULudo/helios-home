@@ -149,8 +149,15 @@ class EebusIdentityGetOrCreateInput(BaseModel):
 class ConnectionEstablishInput(BaseModel):
     entity_ref: str
     endpoint_ref: str = ""
-    integration_path: Literal["eebus_spine"]
+    integration_path: Literal["eebus_spine", "http_local"]
     role: HemsRole | None = None
+    reason: str = ""
+
+
+class ConnectionDisconnectInput(BaseModel):
+    entity_ref: str
+    endpoint_ref: str = ""
+    integration_path: Literal["eebus_spine", "http_local"]
     reason: str = ""
 
 

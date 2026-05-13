@@ -254,10 +254,9 @@ def _inspect_single_path(
         identity = read_eebus_local_identity(context.session, site_id=context.site.id)
         register_value = properties.get("register")
         runtime = runtime_snapshot_for_endpoint(endpoint.id)
-        runtime_ready = (
-            runtime.get("endpoint_in_runtime") is True
-            and runtime.get("status") == "ship_ready"
-            and bool(runtime.get("ready_peer_skis"))
+        runtime_ready = _runtime_endpoint_is_ready(
+            runtime,
+            str(properties.get("peer_certificate_ski") or properties.get("ski") or ""),
         )
         runtime_error = _runtime_error(runtime)
         peer_rejected = _runtime_error_indicates_peer_rejection(runtime_error)
@@ -358,6 +357,29 @@ def _runtime_error(runtime: dict) -> str:
         if isinstance(event, dict) and event.get("reason"):
             errors.append(str(event.get("reason")))
     return " | ".join(dict.fromkeys(errors))
+
+
+def _runtime_endpoint_is_ready(runtime: dict, peer_ski: str = "") -> bool:
+    if runtime.get("endpoint_in_runtime") is not True:
+        return False
+    states = runtime.get("endpoint_connection_states") or {}
+    if not isinstance(states, dict):
+        return False
+    normalized_peer_ski = str(peer_ski or "").lower()
+    for state in states.values():
+        if not isinstance(state, dict) or state.get("status") != "ready":
+            continue
+        if not normalized_peer_ski or str(state.get("peer_ski") or "").lower() == normalized_peer_ski:
+            return True
+    if runtime.get("status") != "ship_ready":
+        return False
+    ready_peer_skis = {str(row or "").lower() for row in runtime.get("ready_peer_skis") or []}
+    endpoint_peer_skis = {
+        str(state.get("peer_ski") or "").lower()
+        for state in states.values()
+        if isinstance(state, dict) and state.get("peer_ski")
+    }
+    return bool(ready_peer_skis & endpoint_peer_skis)
 
 
 def _runtime_error_indicates_peer_rejection(error: str) -> bool:

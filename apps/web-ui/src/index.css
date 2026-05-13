@@ -132,12 +132,21 @@ select {
     vector-effect: non-scaling-stroke;
   }
 
+  .hh-data-link-active {
+    stroke: rgba(216, 139, 8, 0.46);
+    stroke-width: 2.6;
+  }
+
   .hh-data-bubble {
     fill: url("#hemsDataBubbleGradient");
     opacity: 0.94;
     pointer-events: none;
     transform-box: fill-box;
     transform-origin: center;
+  }
+
+  .hh-data-bubble-active {
+    opacity: 1;
   }
 
   .hh-data-link-label rect {
@@ -152,6 +161,11 @@ select {
     font-size: 10px;
     font-weight: 600;
     letter-spacing: 0;
+  }
+
+  .hh-data-link-label-active rect {
+    fill: rgba(255, 247, 232, 0.96);
+    stroke: rgba(216, 139, 8, 0.42);
   }
 
   .message-markdown p,

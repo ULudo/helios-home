@@ -43,7 +43,45 @@ export interface DeviceRead {
   capabilities: CapabilityRead;
   load_control: DeviceLoadControlRead;
   telemetry: Record<string, string | number | boolean>;
+  telemetry_status: string;
+  telemetry_updated_at: string | null;
+  telemetry_age_seconds: number | null;
   last_seen_at: string;
+}
+
+export interface LoadControlParticipantRead {
+  device_id: string;
+  device_name: string;
+  share_pct: number;
+  normalized_share: number;
+  allocated_limit_watts: number;
+  control_available: boolean;
+  status: string;
+  control_path: string;
+  target_endpoint_ref: string;
+  target_peer_ski: string;
+  delivery_id: string;
+  delivery_status: string;
+  delivery_detail: string;
+  delivery_updated_at: string | null;
+}
+
+export interface LoadControlConstraintRead {
+  id: string;
+  use_case: string;
+  direction: string;
+  source: string;
+  peer_ski: string;
+  limit_watts: number;
+  duration_seconds: number | null;
+  received_at: string;
+  expires_at: string | null;
+  receiver_device_ids: string[];
+  participants: LoadControlParticipantRead[];
+}
+
+export interface OverviewLoadControlRead {
+  active_constraints: LoadControlConstraintRead[];
 }
 
 export interface DiscoverySourceResultRead {
@@ -70,6 +108,7 @@ export interface DiscoveryRunRead {
 export interface OverviewResponse {
   site: SiteRead;
   devices: DeviceRead[];
+  load_control: OverviewLoadControlRead;
 }
 
 export interface HemsPolicyRead {
@@ -426,6 +465,7 @@ export interface ConnectionEndpointOptionRead {
   connectable: boolean;
   state: ConnectionStateRead;
   connect_action: ConnectionActionRef | null;
+  disconnect_action: ConnectionActionRef | null;
 }
 
 export interface ConnectionOptionsRead {
@@ -456,6 +496,7 @@ export interface ConnectionStateRead {
   last_error: string;
   updated_at: string | null;
   connect_action: ConnectionActionRef | null;
+  disconnect_action: ConnectionActionRef | null;
 }
 
 export type ViewKey = "overview" | "devices" | "monitoring" | "tasks" | "settings";

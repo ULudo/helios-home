@@ -169,6 +169,11 @@ class Device(Base):
     protocols: Mapped[list[str]] = mapped_column(JSON, default=list)
     capabilities: Mapped[dict] = mapped_column(JSON, default=dict)
     telemetry: Mapped[dict] = mapped_column(JSON, default=dict)
+    telemetry_status: Mapped[str] = mapped_column(String(40), default="unknown")
+    telemetry_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
     last_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=utcnow,
@@ -845,6 +850,38 @@ class HemsLoadControlLimit(Base):
     raw: Mapped[dict] = mapped_column(JSON, default=dict)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class HemsLoadControlDelivery(Base):
+    __tablename__ = "hems_load_control_deliveries"
+
+    id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"))
+    constraint_id: Mapped[str] = mapped_column(ForeignKey("hems_load_control_limits.id"))
+    source_peer_ski: Mapped[str] = mapped_column(String(80), default="")
+    target_device_id: Mapped[str] = mapped_column(ForeignKey("devices.id"))
+    target_endpoint_ref: Mapped[str] = mapped_column(String(96), default="")
+    target_peer_ski: Mapped[str] = mapped_column(String(80), default="")
+    use_case: Mapped[str] = mapped_column(String(80))
+    limit_id: Mapped[int] = mapped_column(default=0)
+    limit_watts: Mapped[int] = mapped_column(default=0)
+    allocated_limit_watts: Mapped[int] = mapped_column(default=0)
+    duration_seconds: Mapped[int | None] = mapped_column(nullable=True)
+    is_active: Mapped[bool] = mapped_column(default=True)
+    status: Mapped[str] = mapped_column(String(40), default="pending")
+    detail: Mapped[str] = mapped_column(Text, default="")
+    attempt_count: Mapped[int] = mapped_column(default=0)
+    last_error: Mapped[str] = mapped_column(Text, default="")
+    raw: Mapped[dict] = mapped_column(JSON, default=dict)
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    readback_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        onupdate=utcnow,
+    )
 
 
 class HemsPlanRun(Base):

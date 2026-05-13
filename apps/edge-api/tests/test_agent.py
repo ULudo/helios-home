@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import timedelta
 import json
 from typing import Any
 
@@ -29,6 +30,7 @@ from app.db.models import (
     UserDecisionRequest,
     Site,
     SiteSetupProfile,
+    utcnow,
 )
 from app.db.session import get_engine, get_session_factory
 from app.agent.configuration import PROVIDER_SPECS, ProviderRuntimeStatus, ProviderState
@@ -45,6 +47,7 @@ from app.agent.provider import (
 )
 from app.agent.tools.registry import create_default_tool_registry
 from app.services.eebus_runtime import EebusPeerTrustMaterial, EebusRuntimeSnapshot
+from app.services.http_telemetry import HttpTelemetryProbeResult
 
 
 def _bootstrap_app(tmp_path, monkeypatch, name: str = "agent.db"):
@@ -434,6 +437,7 @@ def test_dashboard_ui_actions_are_registered_as_agent_tools():
 
     assert registry.get("ui.open_device_details") is not None
     assert registry.get("ui.open_connection_overlay") is not None
+    assert registry.get("connection.disconnect") is not None
     assert registry.get("load_control.configure_device") is not None
 
 
@@ -1197,6 +1201,189 @@ def test_dashboard_connection_action_uses_same_connection_workflow_as_agent_tool
             assert audit_actions == ["start_action", "complete_action"]
 
 
+def test_http_connection_action_connects_and_disconnects_local_endpoint(tmp_path, monkeypatch):
+    app = _bootstrap_app(tmp_path, monkeypatch, "dashboard-http-connection-action.db")
+
+    def fake_refresh_http_telemetry(session, device, endpoint, *, now=None, timeout_seconds=None):
+        assert device is not None
+        device.telemetry = {"switch_0_power_w": 42, "switch_0_voltage_v": 239.9}
+        device.telemetry_status = "live"
+        device.telemetry_updated_at = now
+        device.last_seen_at = now
+        session.add(device)
+        return HttpTelemetryProbeResult(
+            status="updated",
+            telemetry=device.telemetry,
+            source="shelly_http",
+            message="Shelly local HTTP telemetry sample received.",
+        )
+
+    monkeypatch.setattr("app.actions.service.refresh_http_device_telemetry", fake_refresh_http_telemetry)
+
+    with TestClient(app) as client:
+        client.get("/api/v1/agent/thread")
+        _add_device(
+            device_id="dev-http-load",
+            name="HTTP Load",
+            device_type="smart_appliance",
+            manufacturer="Test",
+            protocols=["http_local", "mdns"],
+        )
+        session_factory = get_session_factory()
+        with session_factory() as session:
+            device = session.get(Device, "dev-http-load")
+            assert device is not None
+            device.capabilities = {
+                "visible": True,
+                "monitorable": True,
+                "controllable": True,
+                "optimizable": False,
+            }
+            session.add(device)
+            session.commit()
+
+        endpoint_ref = _endpoint_ref_for_device("dev-http-load", "http_local")
+
+        options_response = client.get("/api/v1/devices/dev-http-load/connection-options")
+        assert options_response.status_code == 200
+        options = options_response.json()
+        assert [endpoint["protocol"] for endpoint in options["endpoints"]] == ["http_local"]
+        assert options["endpoints"][0]["connect_action"]["name"] == "connection.establish"
+
+        connect_response = client.post(
+            "/api/v1/actions/connection.establish",
+            json={
+                "input": {
+                    "entity_ref": "device:dev-http-load",
+                    "endpoint_ref": endpoint_ref,
+                    "integration_path": "http_local",
+                }
+            },
+        )
+        assert connect_response.status_code == 200
+        assert connect_response.json()["output"]["status"] == "connected_http_ready"
+        assert connect_response.json()["output"]["message"] == "Local HTTP telemetry path is live."
+
+        state_response = client.get(
+            "/api/v1/connections/state",
+            params={
+                "entity_ref": "device:dev-http-load",
+                "endpoint_ref": endpoint_ref,
+                "integration_path": "http_local",
+            },
+        )
+        assert state_response.status_code == 200
+        state = state_response.json()
+        assert state["status"] == "connected_http_ready"
+        assert state["connect_action"] is None
+        assert state["disconnect_action"]["name"] == "connection.disconnect"
+
+        with session_factory() as session:
+            endpoint = session.get(ProtocolEndpoint, endpoint_ref)
+            assert endpoint is not None
+            endpoint.status = "observed"
+            session.add(endpoint)
+            session.commit()
+
+        stale_state_response = client.get(
+            "/api/v1/connections/state",
+            params={
+                "entity_ref": "device:dev-http-load",
+                "endpoint_ref": endpoint_ref,
+                "integration_path": "http_local",
+            },
+        )
+        assert stale_state_response.status_code == 200
+        stale_state = stale_state_response.json()
+        assert stale_state["status"] == "ready_http_adapter"
+        assert stale_state["connect_action"]["name"] == "connection.establish"
+        assert stale_state["disconnect_action"] is None
+
+        reconnect_response = client.post(
+            "/api/v1/actions/connection.establish",
+            json={
+                "input": {
+                    "entity_ref": "device:dev-http-load",
+                    "endpoint_ref": endpoint_ref,
+                    "integration_path": "http_local",
+                }
+            },
+        )
+        assert reconnect_response.status_code == 200
+        assert reconnect_response.json()["output"]["status"] == "connected_http_ready"
+
+        overview_response = client.get("/api/v1/overview")
+        assert overview_response.status_code == 200
+        overview_device = next(device for device in overview_response.json()["devices"] if device["id"] == "dev-http-load")
+        assert overview_device["telemetry_status"] == "live"
+        assert overview_device["telemetry"]["switch_0_power_w"] == 42
+        assert overview_device["telemetry_updated_at"] is not None
+
+        disconnect_response = client.post(
+            "/api/v1/actions/connection.disconnect",
+            json={
+                "input": {
+                    "entity_ref": "device:dev-http-load",
+                    "endpoint_ref": endpoint_ref,
+                    "integration_path": "http_local",
+                }
+            },
+        )
+        assert disconnect_response.status_code == 200
+        assert disconnect_response.json()["output"]["status"] == "disconnected"
+
+        disconnected_state_response = client.get(
+            "/api/v1/connections/state",
+            params={
+                "entity_ref": "device:dev-http-load",
+                "endpoint_ref": endpoint_ref,
+                "integration_path": "http_local",
+            },
+        )
+        assert disconnected_state_response.status_code == 200
+        disconnected_state = disconnected_state_response.json()
+        assert disconnected_state["status"] == "disconnected"
+        assert disconnected_state["connect_action"]["name"] == "connection.establish"
+        assert disconnected_state["disconnect_action"] is None
+
+        overview_response = client.get("/api/v1/overview")
+        assert overview_response.status_code == 200
+        overview_device = next(device for device in overview_response.json()["devices"] if device["id"] == "dev-http-load")
+        assert "connected" not in overview_device["status_tags"]
+        assert "http_ready" not in overview_device["status_tags"]
+        assert overview_device["telemetry_status"] == "sampled"
+
+
+def test_overview_reports_stale_live_telemetry_without_hiding_sample(tmp_path, monkeypatch):
+    app = _bootstrap_app(tmp_path, monkeypatch, "dashboard-stale-http-telemetry.db")
+
+    with TestClient(app) as client:
+        client.get("/api/v1/agent/thread")
+        _add_device(
+            device_id="dev-http-stale",
+            name="HTTP Stale Load",
+            device_type="smart_appliance",
+            manufacturer="Shelly",
+            protocols=["http_local"],
+        )
+        session_factory = get_session_factory()
+        with session_factory() as session:
+            device = session.get(Device, "dev-http-stale")
+            assert device is not None
+            device.telemetry = {"switch_0_power_w": 11}
+            device.telemetry_status = "live"
+            device.telemetry_updated_at = utcnow() - timedelta(seconds=60)
+            session.add(device)
+            session.commit()
+
+        overview_response = client.get("/api/v1/overview")
+
+    assert overview_response.status_code == 200
+    overview_device = next(device for device in overview_response.json()["devices"] if device["id"] == "dev-http-stale")
+    assert overview_device["telemetry_status"] == "stale"
+    assert overview_device["telemetry"]["switch_0_power_w"] == 11
+
+
 def test_connection_state_reports_ship_runtime_errors_without_trust_masking(tmp_path, monkeypatch):
     app = _bootstrap_app(tmp_path, monkeypatch, "dashboard-connection-port-conflict.db")
     runtime_error = "[Errno 98] error while attempting to bind on address ('0.0.0.0', 4712): address already in use"
@@ -1544,8 +1731,107 @@ def test_connection_state_does_not_use_stale_ship_ready_diagnostic_as_live_state
         state = state_response.json()
         assert state["phase"] != "ship_ready"
         assert state["status"] != "connected_ship_ready"
+        assert not state["required_user_action"].get("action", "").startswith("authorize_local_ski")
         assert state["connection_facets"]["overall_connection_state"] == "endpoint_visible"
         assert next(step for step in state["steps"] if step["key"] == "ship_session")["status"] == "pending"
+
+
+def test_connection_state_does_not_show_stale_authorize_action_when_endpoint_peer_is_ready(tmp_path, monkeypatch):
+    app = _bootstrap_app(tmp_path, monkeypatch, "commissioning-stale-authorize.db")
+    fake_runtime = FakeEebusRuntimeManager(status="ship_ready")
+    monkeypatch.setattr("app.workflows.eebus_connection.probe_eebus_peer_certificate", lambda **_: _fake_eebus_peer_trust())
+    monkeypatch.setattr("app.workflows.eebus_connection.get_eebus_runtime_manager", lambda: fake_runtime)
+
+    with TestClient(app) as client:
+        client.get("/api/v1/agent/thread")
+        _add_device(device_id="dev-ppc", name="PPC SMGW", device_type="grid_meter", manufacturer="PPC")
+        _add_ppc_eebus_candidate("dev-ppc", register=False)
+        endpoint_ref = _endpoint_ref_for_device("dev-ppc", "eebus_ship")
+
+        _use_scripted_provider(
+            monkeypatch,
+            ScriptedModelProvider(
+                [
+                    ModelToolCall(
+                        "connection.establish",
+                        {
+                            "entity_ref": "device:dev-ppc",
+                            "endpoint_ref": endpoint_ref,
+                            "integration_path": "eebus_spine",
+                            "role": "grid_meter",
+                        },
+                    ),
+                    ModelFinalAnswer("SHIP is ready."),
+                ]
+            ),
+        )
+        events = _send_and_stream(client, "Verbinde das PPC SMGW.")
+        result = next(event for event in events if event["event_type"] == "tool_finished")["payload"]["result"]
+        local_ski = result["local_identity"]["ski"]
+
+        stale_ready_runtime = {
+            "status": "ship_ready",
+            "endpoint_refs": [endpoint_ref],
+            "endpoint_in_runtime": True,
+            "ready_peer_skis": ["f819e215a4f292d803325276767d9e27f67fe108"],
+            "received_load_power_limit_count": 0,
+            "endpoint_connection_states": {
+                "outbound_to_peer": {
+                    "status": "starting",
+                    "peer_ski": "f819e215a4f292d803325276767d9e27f67fe108",
+                }
+            },
+            "connection_states": {
+                endpoint_ref: {
+                    "outbound_to_peer": {
+                        "status": "starting",
+                        "peer_ski": "f819e215a4f292d803325276767d9e27f67fe108",
+                    }
+                }
+            },
+            "recent_events": [],
+            "error": "",
+        }
+        session_factory = get_session_factory()
+        with session_factory() as session:
+            diagnostic = session.get(ProtocolDiagnosticRun, result["diagnostic_run_ref"])
+            assert diagnostic is not None
+            diagnostic.result = {
+                **(diagnostic.result or {}),
+                "phase": "waiting_for_ship_session",
+                "status": "ship_session_pending",
+                "runtime": stale_ready_runtime,
+                "required_user_action": {
+                    "action": "authorize_local_ski_on_peer_then_retry_connection_establish",
+                    "local_ski": local_ski,
+                    "peer_ski": "f819e215a4f292d803325276767d9e27f67fe108",
+                },
+            }
+            session.add(diagnostic)
+            session.commit()
+
+        def stale_ready_snapshot(endpoint_id: str) -> dict[str, Any]:
+            return dict(stale_ready_runtime, endpoint_in_runtime=endpoint_id == endpoint_ref)
+
+        monkeypatch.setattr("app.actions.service.runtime_snapshot_for_endpoint", stale_ready_snapshot)
+        monkeypatch.setattr("app.home_graph.service.runtime_snapshot_for_endpoint", stale_ready_snapshot)
+
+        state_response = client.get(
+            "/api/v1/connections/state",
+            params={
+                "entity_ref": "device:dev-ppc",
+                "endpoint_ref": endpoint_ref,
+                "integration_path": "eebus_spine",
+            },
+        )
+
+        assert state_response.status_code == 200
+        state = state_response.json()
+        assert state["phase"] == "ship_ready"
+        assert state["status"] == "connected_ship_ready"
+        assert state["required_user_action"] == {}
+        assert state["disconnect_action"] is not None
+        assert state["connection_facets"]["overall_connection_state"] == "ship_ready"
 
 
 def test_commissioning_get_log_reads_compact_diagnostic_entries(tmp_path, monkeypatch):

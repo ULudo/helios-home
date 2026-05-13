@@ -7,7 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.db.models import AgentTask, Blocker, ProtocolDiagnosticRun, ProtocolEndpoint, Site, utcnow
+from app.db.models import AgentTask, Blocker, Device, ProtocolDiagnosticRun, ProtocolEndpoint, Site, utcnow
 from app.db.session import get_session_factory
 from app.home_graph.service import connection_facets_for_entity, resolve_entity, sync_inventory_to_home_graph
 from app.services.eebus_identity import eebus_identity_public_payload, get_or_create_eebus_local_identity
@@ -167,11 +167,19 @@ def establish_eebus_connection(
             connection_direction="auto",
         )
         runtime_payload = runtime.as_dict()
-        is_ready = runtime.status == "ship_ready" and peer.certificate_ski in set(runtime.ready_peer_skis)
+        is_ready = _runtime_endpoint_is_ready(runtime_payload, endpoint.id, peer.certificate_ski)
         attempt_count = previous_attempt_count + 1
         if is_ready:
             resolve_eebus_trust_blockers(context.session, subject_ref=entity.id, task_id=task.id)
             _resolve_connection_blockers(context.session, task=task, entity_ref=entity.id)
+            endpoint.status = "connected"
+            endpoint.updated_at = utcnow()
+            context.session.add(endpoint)
+            if entity.id.startswith("device:"):
+                device = context.session.get(Device, entity.id.removeprefix("device:"))
+                if device is not None:
+                    device.last_seen_at = utcnow()
+                    context.session.add(device)
             phase = "ship_ready"
             status = "connected_ship_ready"
             effects_not_included = [
@@ -404,6 +412,29 @@ def _connection_status_from_runtime(runtime_payload: dict) -> str:
     if any(state.get("status") == "connecting" for state in states):
         return "connecting_ship_session"
     return "ship_session_pending"
+
+
+def _runtime_endpoint_is_ready(runtime_payload: dict, endpoint_ref: str, peer_ski: str) -> bool:
+    endpoint_states = (runtime_payload.get("connection_states") or {}).get(endpoint_ref, {})
+    normalized_peer_ski = str(peer_ski or "").lower()
+    if not isinstance(endpoint_states, dict):
+        return False
+    for state in endpoint_states.values():
+        if not isinstance(state, dict) or state.get("status") != "ready":
+            continue
+        if not normalized_peer_ski:
+            return True
+        if str(state.get("peer_ski") or "").lower() == normalized_peer_ski:
+            return True
+    if runtime_payload.get("status") != "ship_ready" or not normalized_peer_ski:
+        return False
+    ready_peer_skis = {str(row or "").lower() for row in runtime_payload.get("ready_peer_skis") or []}
+    endpoint_peer_skis = {
+        str(state.get("peer_ski") or "").lower()
+        for state in endpoint_states.values()
+        if isinstance(state, dict) and state.get("peer_ski")
+    }
+    return normalized_peer_ski in ready_peer_skis or bool(ready_peer_skis & endpoint_peer_skis)
 
 
 def _runtime_error(runtime_payload: dict) -> str:

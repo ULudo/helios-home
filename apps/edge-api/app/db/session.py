@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Generator
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -39,6 +39,21 @@ def init_database() -> None:
     settings = get_settings()
     engine = get_engine(settings.database_url)
     Base.metadata.create_all(bind=engine)
+    _migrate_sqlite_device_telemetry_columns(engine)
+
+
+def _migrate_sqlite_device_telemetry_columns(engine: Engine) -> None:
+    if engine.dialect.name != "sqlite":
+        return
+    with engine.begin() as connection:
+        columns = {
+            str(row[1])
+            for row in connection.execute(text("PRAGMA table_info(devices)")).fetchall()
+        }
+        if "telemetry_status" not in columns:
+            connection.execute(text("ALTER TABLE devices ADD COLUMN telemetry_status VARCHAR(40) NOT NULL DEFAULT 'unknown'"))
+        if "telemetry_updated_at" not in columns:
+            connection.execute(text("ALTER TABLE devices ADD COLUMN telemetry_updated_at DATETIME"))
 
 
 def get_session() -> Generator[Session, None, None]:
@@ -48,4 +63,3 @@ def get_session() -> Generator[Session, None, None]:
         yield session
     finally:
         session.close()
-

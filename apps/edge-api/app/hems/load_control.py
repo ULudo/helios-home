@@ -11,11 +11,14 @@ from app.db.models import (
     AuditEvent,
     Device,
     HemsLoadControlDeviceConfig,
+    HemsLoadControlDelivery,
     HemsLoadControlLimit,
     HemsPolicy,
+    ProtocolEndpoint,
     Site,
     utcnow,
 )
+from app.domain.schemas import LoadControlConstraintRead, LoadControlParticipantRead, OverviewLoadControlRead
 from app.hems.schemas import HemsLoadControlDeviceConfigRead, HemsLoadControlDeviceConfigUpdate
 
 
@@ -119,17 +122,17 @@ def record_load_control_limit(
 ) -> HemsLoadControlLimit:
     now = utcnow()
     normalized_peer_ski = (peer_ski or "").strip().lower()
-    if not is_active:
-        statement = select(HemsLoadControlLimit).where(
-            HemsLoadControlLimit.site_id == site_id,
-            HemsLoadControlLimit.use_case == use_case,
-            HemsLoadControlLimit.limit_id == limit_id,
-            HemsLoadControlLimit.peer_ski == normalized_peer_ski,
-            HemsLoadControlLimit.is_active.is_(True),
-        )
-        for row in session.scalars(statement).all():
-            row.is_active = False
-            session.add(row)
+    statement = select(HemsLoadControlLimit).where(
+        HemsLoadControlLimit.site_id == site_id,
+        HemsLoadControlLimit.use_case == use_case,
+        HemsLoadControlLimit.limit_id == limit_id,
+        HemsLoadControlLimit.peer_ski == normalized_peer_ski,
+        HemsLoadControlLimit.is_active.is_(True),
+    )
+    for row in session.scalars(statement).all():
+        row.is_active = False
+        session.add(row)
+    _touch_load_control_devices(session, site_id=site_id, use_case=use_case, now=now)
     limit = HemsLoadControlLimit(
         id=f"load-control-limit-{uuid4().hex[:12]}",
         site_id=site_id,
@@ -150,6 +153,110 @@ def record_load_control_limit(
     return limit
 
 
+def create_load_control_deliveries(
+    session: Session,
+    *,
+    limit: HemsLoadControlLimit,
+    distribution: dict[str, Any],
+) -> list[HemsLoadControlDelivery]:
+    deliveries: list[HemsLoadControlDelivery] = []
+    for participant in distribution.get("participants", []):
+        if not isinstance(participant, dict):
+            continue
+        device_id = str(participant.get("device_id") or "")
+        if not device_id:
+            continue
+        allocated_limit_watts = int(participant.get("allocated_limit_watts") or 0)
+        target_endpoint_ref = str(participant.get("target_endpoint_ref") or "")
+        target_peer_ski = str(participant.get("target_peer_ski") or "").strip().lower()
+        if allocated_limit_watts <= 0:
+            status = "skipped_zero_allocation"
+            detail = "No power was allocated to this participant."
+        elif target_endpoint_ref and target_peer_ski:
+            status = "pending"
+            detail = "Allocated and waiting for EEBUS delivery."
+        else:
+            status = "not_deliverable"
+            detail = "Allocated locally, but no EEBUS control endpoint is configured for this participant."
+        delivery = HemsLoadControlDelivery(
+            id=f"load-control-delivery-{uuid4().hex[:12]}",
+            site_id=limit.site_id,
+            constraint_id=limit.id,
+            source_peer_ski=limit.peer_ski,
+            target_device_id=device_id,
+            target_endpoint_ref=target_endpoint_ref,
+            target_peer_ski=target_peer_ski,
+            use_case=limit.use_case,
+            limit_id=limit.limit_id,
+            limit_watts=limit.limit_watts,
+            allocated_limit_watts=allocated_limit_watts,
+            duration_seconds=limit.duration_seconds,
+            is_active=limit.is_active,
+            status=status,
+            detail=detail,
+            raw={
+                "participant": participant,
+                "constraint": {
+                    "id": limit.id,
+                    "use_case": limit.use_case,
+                    "limit_id": limit.limit_id,
+                    "limit_watts": limit.limit_watts,
+                    "duration_seconds": limit.duration_seconds,
+                    "is_active": limit.is_active,
+                },
+            },
+            requested_at=limit.received_at,
+            updated_at=limit.received_at,
+        )
+        session.add(delivery)
+        deliveries.append(delivery)
+    session.flush()
+    return deliveries
+
+
+def update_load_control_delivery_status(
+    session: Session,
+    delivery_id: str,
+    *,
+    status: str,
+    detail: str = "",
+    error: str = "",
+    raw_update: dict[str, Any] | None = None,
+) -> HemsLoadControlDelivery | None:
+    delivery = session.get(HemsLoadControlDelivery, delivery_id)
+    if delivery is None:
+        return None
+    now = utcnow()
+    delivery.status = status
+    if detail:
+        delivery.detail = detail
+    if error:
+        delivery.last_error = error
+    delivery.updated_at = now
+    if status in {"sent", "acknowledged", "readback_confirmed"} and delivery.sent_at is None:
+        delivery.sent_at = now
+    if status in {"acknowledged", "readback_confirmed"} and delivery.acknowledged_at is None:
+        delivery.acknowledged_at = now
+    if status == "readback_confirmed":
+        delivery.readback_at = now
+    raw = dict(delivery.raw or {})
+    updates = list(raw.get("updates") or [])
+    updates.append({"status": status, "detail": detail, "error": error, "raw": raw_update or {}, "at": now.isoformat()})
+    raw["updates"] = updates[-20:]
+    delivery.raw = raw
+    session.add(delivery)
+    session.flush()
+    return delivery
+
+
+def load_control_deliveries_for_constraint(session: Session, constraint_id: str) -> list[HemsLoadControlDelivery]:
+    return session.scalars(
+        select(HemsLoadControlDelivery)
+        .where(HemsLoadControlDelivery.constraint_id == constraint_id)
+        .order_by(HemsLoadControlDelivery.requested_at.asc())
+    ).all()
+
+
 def active_load_control_limits(session: Session, *, site_id: int, now=None) -> list[HemsLoadControlLimit]:
     current_time = now or utcnow()
     rows = session.scalars(
@@ -161,6 +268,7 @@ def active_load_control_limits(session: Session, *, site_id: int, now=None) -> l
         .order_by(HemsLoadControlLimit.received_at.desc())
     ).all()
     active: list[HemsLoadControlLimit] = []
+    seen_keys: set[tuple[str, int, str]] = set()
     for row in rows:
         expires_at = row.expires_at
         compare_time = current_time
@@ -170,8 +278,34 @@ def active_load_control_limits(session: Session, *, site_id: int, now=None) -> l
             row.is_active = False
             session.add(row)
             continue
+        key = (row.use_case, row.limit_id, row.peer_ski)
+        if key in seen_keys:
+            row.is_active = False
+            session.add(row)
+            continue
+        seen_keys.add(key)
         active.append(row)
     return active
+
+
+def _touch_load_control_devices(session: Session, *, site_id: int, use_case: str, now) -> None:
+    receiver_field = "receives_lpc" if use_case == LPC_USE_CASE else "receives_lpp"
+    participant_field = "participates_lpc" if use_case == LPC_USE_CASE else "participates_lpp"
+    configs = session.scalars(
+        select(HemsLoadControlDeviceConfig).where(
+            HemsLoadControlDeviceConfig.site_id == site_id,
+            (
+                getattr(HemsLoadControlDeviceConfig, receiver_field).is_(True)
+                | getattr(HemsLoadControlDeviceConfig, participant_field).is_(True)
+            ),
+        )
+    ).all()
+    for config in configs:
+        device = session.get(Device, config.device_id)
+        if device is None:
+            continue
+        device.last_seen_at = now
+        session.add(device)
 
 
 def effective_grid_limits(session: Session, policy: HemsPolicy, *, now=None) -> dict[str, float]:
@@ -210,7 +344,12 @@ def build_constraint_distribution(
         share = max(0.0, float(getattr(config, share_field) or 0.0))
         normalized = share / total_share if total_share > 0 else 0.0
         capabilities = device.capabilities if device is not None else {}
-        control_available = bool(capabilities.get("controllable")) if isinstance(capabilities, dict) else False
+        native_control_available = bool(capabilities.get("controllable")) if isinstance(capabilities, dict) else False
+        eebus_endpoint = _load_control_eebus_endpoint(session, config.device_id)
+        target_peer_ski = _endpoint_peer_ski(eebus_endpoint)
+        eebus_control_available = eebus_endpoint is not None and bool(target_peer_ski)
+        control_available = native_control_available or eebus_control_available
+        control_path = "eebus_spine" if eebus_control_available else "native" if native_control_available else ""
         rows.append(
             {
                 "device_id": config.device_id,
@@ -219,7 +358,10 @@ def build_constraint_distribution(
                 "normalized_share": round(normalized, 6),
                 "allocated_limit_watts": int(round(limit_watts * normalized)) if normalized else 0,
                 "control_available": control_available,
-                "status": "dispatchable" if control_available else "configured_no_control_path",
+                "control_path": control_path,
+                "target_endpoint_ref": eebus_endpoint.id if eebus_endpoint is not None else "",
+                "target_peer_ski": target_peer_ski,
+                "status": "delivery_ready" if eebus_control_available else "dispatchable" if native_control_available else "configured_no_control_path",
             }
         )
     return {
@@ -230,3 +372,91 @@ def build_constraint_distribution(
         "enforceable": any(row["control_available"] for row in rows),
         "participants": rows,
     }
+
+
+def _load_control_eebus_endpoint(session: Session, device_id: str) -> ProtocolEndpoint | None:
+    return session.scalar(
+        select(ProtocolEndpoint)
+        .where(
+            ProtocolEndpoint.owner_ref == f"device:{device_id}",
+            ProtocolEndpoint.protocol == "eebus_ship",
+            ProtocolEndpoint.status != "disconnected",
+        )
+        .order_by(ProtocolEndpoint.updated_at.desc())
+        .limit(1)
+    )
+
+
+def _endpoint_peer_ski(endpoint: ProtocolEndpoint | None) -> str:
+    if endpoint is None:
+        return ""
+    properties = endpoint.properties if isinstance(endpoint.properties, dict) else {}
+    return str(properties.get("peer_certificate_ski") or properties.get("ski") or "").strip().lower()
+
+
+def build_load_control_overview(session: Session, *, site_id: int) -> OverviewLoadControlRead:
+    constraints: list[LoadControlConstraintRead] = []
+    for limit in active_load_control_limits(session, site_id=site_id):
+        receiver_field = "receives_lpc" if limit.use_case == LPC_USE_CASE else "receives_lpp"
+        receiver_device_ids = [
+            config.device_id
+            for config in session.scalars(
+                select(HemsLoadControlDeviceConfig).where(
+                    HemsLoadControlDeviceConfig.site_id == site_id,
+                    getattr(HemsLoadControlDeviceConfig, receiver_field).is_(True),
+                )
+            ).all()
+        ]
+        distribution = build_constraint_distribution(
+            session,
+            site_id=site_id,
+            use_case=limit.use_case,
+            limit_watts=limit.limit_watts,
+        )
+        deliveries = {
+            delivery.target_device_id: delivery
+            for delivery in load_control_deliveries_for_constraint(session, limit.id)
+        }
+        constraints.append(
+            LoadControlConstraintRead(
+                id=limit.id,
+                use_case=limit.use_case,
+                direction=limit.direction,
+                source=limit.source,
+                peer_ski=limit.peer_ski,
+                limit_watts=limit.limit_watts,
+                duration_seconds=limit.duration_seconds,
+                received_at=limit.received_at,
+                expires_at=limit.expires_at,
+                receiver_device_ids=receiver_device_ids,
+                participants=[
+                    LoadControlParticipantRead(
+                        device_id=str(row.get("device_id") or ""),
+                        device_name=str(row.get("device_name") or ""),
+                        share_pct=float(row.get("share_pct") or 0.0),
+                        normalized_share=float(row.get("normalized_share") or 0.0),
+                        allocated_limit_watts=int(row.get("allocated_limit_watts") or 0),
+                        control_available=bool(row.get("control_available")),
+                        status=str(row.get("status") or ""),
+                        control_path=str(row.get("control_path") or ""),
+                        target_endpoint_ref=str(row.get("target_endpoint_ref") or ""),
+                        target_peer_ski=str(row.get("target_peer_ski") or ""),
+                        delivery_id=deliveries.get(str(row.get("device_id") or "")).id
+                        if deliveries.get(str(row.get("device_id") or ""))
+                        else "",
+                        delivery_status=deliveries.get(str(row.get("device_id") or "")).status
+                        if deliveries.get(str(row.get("device_id") or ""))
+                        else "",
+                        delivery_detail=deliveries.get(str(row.get("device_id") or "")).detail
+                        if deliveries.get(str(row.get("device_id") or ""))
+                        else "",
+                        delivery_updated_at=deliveries.get(str(row.get("device_id") or "")).updated_at
+                        if deliveries.get(str(row.get("device_id") or ""))
+                        else None,
+                    )
+                    for row in distribution.get("participants", [])
+                    if isinstance(row, dict)
+                ],
+            )
+        )
+    return OverviewLoadControlRead(active_constraints=constraints)

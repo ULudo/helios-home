@@ -228,8 +228,46 @@ class DeviceRead(BaseModel):
     capabilities: CapabilityRead
     load_control: DeviceLoadControlRead = Field(default_factory=DeviceLoadControlRead)
     telemetry: dict[str, Any]
+    telemetry_status: str = "unknown"
+    telemetry_updated_at: datetime | None = None
+    telemetry_age_seconds: float | None = None
     last_seen_at: datetime
     connector_attempts: list[ConnectorAttemptRead] = Field(default_factory=list)
+
+
+class LoadControlParticipantRead(BaseModel):
+    device_id: str
+    device_name: str
+    share_pct: float
+    normalized_share: float
+    allocated_limit_watts: int
+    control_available: bool
+    status: str
+    control_path: str = ""
+    target_endpoint_ref: str = ""
+    target_peer_ski: str = ""
+    delivery_id: str = ""
+    delivery_status: str = ""
+    delivery_detail: str = ""
+    delivery_updated_at: datetime | None = None
+
+
+class LoadControlConstraintRead(BaseModel):
+    id: str
+    use_case: str
+    direction: str
+    source: str
+    peer_ski: str
+    limit_watts: int
+    duration_seconds: int | None = None
+    received_at: datetime
+    expires_at: datetime | None = None
+    receiver_device_ids: list[str] = Field(default_factory=list)
+    participants: list[LoadControlParticipantRead] = Field(default_factory=list)
+
+
+class OverviewLoadControlRead(BaseModel):
+    active_constraints: list[LoadControlConstraintRead] = Field(default_factory=list)
 
 
 class AssetRead(BaseModel):
@@ -307,3 +345,4 @@ class RecoveryRunRead(BaseModel):
 class OverviewResponse(BaseModel):
     site: SiteRead
     devices: list[DeviceRead]
+    load_control: OverviewLoadControlRead = Field(default_factory=OverviewLoadControlRead)

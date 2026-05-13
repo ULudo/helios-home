@@ -223,7 +223,6 @@ def diagnose_candidate(candidate: RawCandidate, assessments: list[ConnectorAsses
         primary_status = IntegrationStatus.OPTIMIZABLE.value
         status_tags = [
             IntegrationStatus.DISCOVERED.value,
-            IntegrationStatus.CONNECTED.value,
             IntegrationStatus.MONITORABLE.value,
             IntegrationStatus.CONTROLLABLE.value,
             IntegrationStatus.OPTIMIZABLE.value,
@@ -232,7 +231,6 @@ def diagnose_candidate(candidate: RawCandidate, assessments: list[ConnectorAsses
         primary_status = IntegrationStatus.CONTROLLABLE.value
         status_tags = [
             IntegrationStatus.DISCOVERED.value,
-            IntegrationStatus.CONNECTED.value,
             IntegrationStatus.MONITORABLE.value,
             IntegrationStatus.CONTROLLABLE.value,
         ]
@@ -240,7 +238,6 @@ def diagnose_candidate(candidate: RawCandidate, assessments: list[ConnectorAsses
         primary_status = IntegrationStatus.MONITORABLE.value
         status_tags = [
             IntegrationStatus.DISCOVERED.value,
-            IntegrationStatus.CONNECTED.value,
             IntegrationStatus.MONITORABLE.value,
         ]
 

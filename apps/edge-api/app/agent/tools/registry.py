@@ -7,7 +7,7 @@ from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel
 
 from app.agent.tools.commissioning import CommissioningGetLogTool
-from app.agent.tools.connection import ConnectionEstablishTool
+from app.agent.tools.connection import ConnectionDisconnectTool, ConnectionEstablishTool
 from app.agent.tools.device import DeviceAssessTool
 from app.agent.tools.discovery import DiscoveryInspectHomeNetworkTool
 from app.agent.tools.evidence import EvidenceRecordUserAssertionTool
@@ -67,6 +67,7 @@ def create_default_tool_registry() -> ToolRegistry:
             ProtocolListEndpointsTool(),
             ConnectionInspectReadinessTool(),
             ConnectionEstablishTool(),
+            ConnectionDisconnectTool(),
             InventoryRemoveDeviceTool(),
             LoadControlConfigureDeviceTool(),
             EebusIdentityGetOrCreateTool(),

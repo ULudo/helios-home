@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from app.core.config import get_settings
-from app.db.models import Device, HemsPolicy, Site
+from app.db.models import Device, HemsLoadControlDelivery, HemsPolicy, ProtocolEndpoint, Site, utcnow
 from app.db.session import get_engine, get_session_factory
 from app.hems.schemas import EebusLoadPowerLimitCreate
 from app.main import create_app
@@ -75,6 +75,55 @@ def _add_controllable_device(device_id: str, name: str) -> None:
                     "optimizable": True,
                 },
                 telemetry={"power_w": 1000},
+            )
+        )
+        session.commit()
+
+
+def _add_eebus_wallbox_participant(device_id: str, peer_ski: str) -> None:
+    session_factory = get_session_factory()
+    with session_factory() as session:
+        site = session.scalar(select(Site).limit(1))
+        assert site is not None
+        session.add(
+            Device(
+                id=device_id,
+                site_id=site.id,
+                name="Mennekes Wallbox",
+                manufacturer="MENNEKES",
+                model="CC612_2S0R_CC",
+                firmware="unknown",
+                device_type="wallbox",
+                primary_status="connected",
+                status_tags=["connected", "eebus_ship_ready"],
+                confidence=0.9,
+                recovery_zone="human_gated",
+                protocols=["eebus_ship"],
+                capabilities={
+                    "visible": True,
+                    "monitorable": False,
+                    "controllable": False,
+                    "optimizable": False,
+                },
+                telemetry={"eebus_ship_advertised": True, "ship_port": 4711},
+                last_seen_at=utcnow(),
+            )
+        )
+        session.add(
+            ProtocolEndpoint(
+                id=f"endpoint-{device_id}-eebus",
+                site_id=site.id,
+                owner_ref=f"device:{device_id}",
+                protocol="eebus_ship",
+                host="192.0.2.80",
+                port=4711,
+                service_name="wallbox._ship._tcp.local",
+                status="connected",
+                properties={
+                    "peer_certificate_ski": peer_ski,
+                    "ski": peer_ski,
+                    "path": "/ship/",
+                },
             )
         )
         session.commit()
@@ -252,6 +301,71 @@ def test_eebus_lpc_distribution_uses_configured_load_control_participants(tmp_pa
     assert participants["dev-load-a"]["allocated_limit_watts"] == 7000
     assert participants["dev-load-b"]["allocated_limit_watts"] == 3000
 
+    with TestClient(app) as client:
+        overview_response = client.get("/api/v1/overview")
+
+    assert overview_response.status_code == 200
+    load_control = overview_response.json()["load_control"]
+    assert len(load_control["active_constraints"]) == 1
+    constraint = load_control["active_constraints"][0]
+    assert constraint["use_case"] == "limitationOfPowerConsumption"
+    assert constraint["limit_watts"] == 10000
+    overview_participants = {row["device_id"]: row for row in constraint["participants"]}
+    assert overview_participants["dev-load-a"]["allocated_limit_watts"] == 7000
+    assert overview_participants["dev-load-b"]["allocated_limit_watts"] == 3000
+
+
+def test_eebus_lpc_distribution_creates_delivery_state_for_eebus_participant(tmp_path, monkeypatch):
+    app = _bootstrap_app(tmp_path, monkeypatch, "eebus-lpc-delivery.db")
+    wallbox_ski = "8f163fec6d78457f6e7b6dbf7b1608cdfde88388"
+
+    with TestClient(app) as client:
+        client.get("/api/v1/overview")
+        _add_eebus_wallbox_participant("dev-wallbox", wallbox_ski)
+        response = client.post(
+            "/api/v1/actions/load_control.configure_device",
+            json={
+                "input": {
+                    "device_id": "dev-wallbox",
+                    "participates_lpc": True,
+                    "lpc_share_pct": 100,
+                }
+            },
+        )
+        assert response.status_code == 200
+
+        response = client.post(
+            "/api/v1/eebus/load-power-limits/distribute",
+            json={
+                "use_case": "lpc",
+                "limit_watts": 6000,
+                "duration_seconds": 600,
+                "source": "test",
+                "peer_ski": "f819e215a4f292d803325276767d9e27f67fe108",
+            },
+        )
+
+    assert response.status_code == 200
+    participant = response.json()["constraint_distribution"]["participants"][0]
+    assert participant["device_id"] == "dev-wallbox"
+    assert participant["control_path"] == "eebus_spine"
+    assert participant["target_peer_ski"] == wallbox_ski
+    assert participant["delivery_status"] == "pending"
+    assert participant["delivery_id"]
+
+    session_factory = get_session_factory()
+    with session_factory() as session:
+        deliveries = session.scalars(select(HemsLoadControlDelivery)).all()
+        assert len(deliveries) == 1
+        assert deliveries[0].status == "pending"
+        assert deliveries[0].target_peer_ski == wallbox_ski
+
+    with TestClient(app) as client:
+        overview_response = client.get("/api/v1/overview")
+    overview_participant = overview_response.json()["load_control"]["active_constraints"][0]["participants"][0]
+    assert overview_participant["delivery_status"] == "pending"
+    assert overview_participant["control_path"] == "eebus_spine"
+
 
 def test_eebus_runtime_extracts_incoming_lpc_write_from_ship_trace_payload():
     payload = {
@@ -332,6 +446,64 @@ def test_eebus_runtime_extracts_incoming_lpc_write_from_ship_trace_payload():
             },
         }
     ]
+
+
+def test_eebus_runtime_builds_outbound_load_power_write_for_connected_client():
+    sent_datagrams: list[object] = []
+
+    class FakeClient:
+        _last_remote_discovery = {
+            "featureInformation": [
+                {
+                    "description": {
+                        "featureAddress": {"device": "remote-device", "entity": [1], "feature": 2},
+                        "featureType": "LoadControl",
+                        "role": "server",
+                    }
+                }
+            ]
+        }
+        _remote_device_address = "remote-device"
+
+        def __init__(self):
+            self.counter = 10
+
+        def local_device_address(self):
+            return "local-hems"
+
+        def _next_msg_counter(self):
+            self.counter += 1
+            return self.counter
+
+        def _outbound_read_ack_request(self):
+            return True
+
+        async def send_datagram(self, datagram):
+            sent_datagrams.append(datagram)
+
+    manager = EebusRuntimeManager()
+
+    metadata = asyncio.run(
+        manager._send_load_power_limit_with_client(
+            FakeClient(),
+            peer_ski="8f163fec6d78457f6e7b6dbf7b1608cdfde88388",
+            watts=6000,
+            duration_seconds=600,
+            limit_id=0,
+            is_active=True,
+        )
+    )
+
+    assert metadata["msg_counter"] == 11
+    assert metadata["readback_msg_counter"] == 12
+    assert len(sent_datagrams) == 2
+    from eebus_sdk.spine import extract_commands, extract_header
+
+    write_header = extract_header(sent_datagrams[0])
+    write_commands = extract_commands(sent_datagrams[0])
+    assert write_header["cmdClassifier"] == "write"
+    assert write_header["addressDestination"] == {"device": "remote-device", "entity": [1], "feature": 2}
+    assert write_commands[0]["loadControlLimitListData"]["loadControlLimitData"][0]["value"]["number"] == 6000
 
 
 def test_eebus_runtime_connects_outbound_to_discovered_ship_endpoint(monkeypatch, tmp_path):
@@ -595,5 +767,6 @@ def test_eebus_runtime_reuses_same_outbound_endpoint_session(monkeypatch):
         assert first.status == "ship_ready"
         assert second.status == "ship_ready"
         assert calls == ["192.0.2.40"]
+        assert second.connection_states["endpoint:peer-eebus"]["outbound_to_peer"]["status"] == "ready"
     finally:
         manager.stop()

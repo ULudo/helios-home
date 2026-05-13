@@ -351,6 +351,8 @@ def _upsert_device(session: Session, site: Site, raw_candidate: RawCandidate, di
     device.protocols = raw_candidate.protocols
     device.capabilities = diagnosis.capabilities
     device.telemetry = raw_candidate.telemetry
+    device.telemetry_status = "sampled" if raw_candidate.telemetry else "unknown"
+    device.telemetry_updated_at = now if raw_candidate.telemetry else None
     device.last_seen_at = now
 
     _clear_related_records(session, device.id)

@@ -30,6 +30,8 @@ import type {
   ConnectionOptionsRead,
   ConnectionStateRead,
   DeviceRead,
+  LoadControlConstraintRead,
+  LoadControlParticipantRead,
   OverviewResponse,
   ReachableSubnetRead,
 } from "./lib/types";
@@ -66,6 +68,7 @@ type CanvasConnectionLine = {
   to: CanvasPoint;
   label: string;
   labelAt: CanvasPoint;
+  activeLoadControl: boolean;
 };
 
 type ChatTaskView = {
@@ -176,6 +179,39 @@ function formatTelemetryPair(key: string, value: string | number | boolean | nul
   return `${humanize(key)} ${formatTelemetryValue(key, value)}`;
 }
 
+function loadControlUseCaseLabel(useCase: string): string {
+  if (useCase === "limitationOfPowerConsumption") {
+    return "LPC";
+  }
+  if (useCase === "limitationOfPowerProduction") {
+    return "LPP";
+  }
+  return humanize(useCase).toUpperCase();
+}
+
+function formatWatts(value: number): string {
+  const absolute = Math.abs(value);
+  if (absolute >= 1000) {
+    return `${formatNumber(value / 1000)} kW`;
+  }
+  return `${formatNumber(value)} W`;
+}
+
+function formatRemainingTime(expiresAt: string | null): string {
+  if (!expiresAt) {
+    return "active";
+  }
+  const expires = new Date(expiresAt).getTime();
+  const remainingSeconds = Math.max(0, Math.round((expires - Date.now()) / 1000));
+  if (remainingSeconds <= 0) {
+    return "expires now";
+  }
+  if (remainingSeconds < 90) {
+    return `${remainingSeconds}s left`;
+  }
+  return `${Math.round(remainingSeconds / 60)} min left`;
+}
+
 function deviceTelemetrySummary(device: DeviceRead): string {
   const entries = Object.entries(device.telemetry)
     .filter(([, value]) => value !== null && value !== undefined && value !== "")
@@ -183,7 +219,8 @@ function deviceTelemetrySummary(device: DeviceRead): string {
   if (entries.length === 0) {
     return "No live telemetry";
   }
-  return entries.map(([key, value]) => formatTelemetryPair(key, value)).join(" · ");
+  const summary = entries.map(([key, value]) => formatTelemetryPair(key, value)).join(" · ");
+  return device.telemetry_status === "live" ? summary : `${deviceTelemetryStatusLabel(device)} · ${summary}`;
 }
 
 function deviceSpecTooltip(device: DeviceRead): string {
@@ -191,7 +228,7 @@ function deviceSpecTooltip(device: DeviceRead): string {
     .slice(0, 4)
     .map(([key, value]) => formatTelemetryPair(key, value))
     .join("\n");
-  const protocols = device.protocols.length > 0 ? device.protocols.join(", ") : "None";
+  const protocols = deviceProtocolListLabel(device.protocols);
 
   return [
     device.name,
@@ -216,6 +253,42 @@ function endpointAddress(endpoint: ConnectionEndpointOptionRead | ConnectionStat
   return endpoint.host ? `${endpoint.host}${endpoint.port ? `:${endpoint.port}` : ""}` : "Unknown endpoint";
 }
 
+function protocolDisplayLabel(protocol: string): string {
+  const labels: Record<string, string> = {
+    eebus_ship: "EEBUS SHIP",
+    http_local: "HTTP",
+    mdns: "mDNS",
+    modbus_tcp: "Modbus TCP",
+    mqtt: "MQTT",
+    ssdp: "SSDP",
+    vendor_cloud: "Vendor Cloud",
+  };
+  return labels[protocol] ?? humanize(protocol);
+}
+
+function protocolSummaryLabel(protocol: string): string {
+  const labels: Record<string, string> = {
+    eebus_ship: "EEBUS",
+    http_local: "HTTP",
+    modbus_tcp: "Modbus",
+    mqtt: "MQTT",
+    vendor_cloud: "Cloud",
+  };
+  return labels[protocol] ?? protocolDisplayLabel(protocol);
+}
+
+function visibleConnectionProtocols(protocols: string[]): string[] {
+  return protocols.filter((protocol) => protocol !== "mdns" && protocol !== "ssdp");
+}
+
+function deviceProtocolListLabel(protocols: string[]): string {
+  const visible = visibleConnectionProtocols(protocols);
+  if (visible.length === 0) {
+    return protocols.length > 0 ? "Discovery only" : "None";
+  }
+  return visible.map(protocolDisplayLabel).join(", ");
+}
+
 function connectionPhaseLabel(state: Pick<ConnectionStateRead, "phase" | "status"> | null | undefined): string {
   if (!state) {
     return "Not inspected";
@@ -227,13 +300,56 @@ function connectionActionLabel(state: ConnectionStateRead | null | undefined): s
   if (!state) {
     return "Connect";
   }
-  if (state.phase === "ship_ready") {
+  if (state.phase === "ship_ready" || state.phase === "http_ready") {
     return "Refresh";
   }
   if (state.phase === "waiting_for_user_trust" || state.phase === "ship_failed" || state.phase === "waiting_for_ship_session") {
     return "Continue";
   }
   return "Connect";
+}
+
+function loadControlParticipantStatusLabel(status: string): string {
+  if (status === "delivery_ready") {
+    return "delivery path ready";
+  }
+  if (status === "dispatchable") {
+    return "control path ready";
+  }
+  if (status === "configured_no_control_path") {
+    return "control path not validated";
+  }
+  if (!status) {
+    return "configured";
+  }
+  return humanize(status);
+}
+
+function loadControlDeliveryStatusLabel(participant: LoadControlParticipantRead): string {
+  switch (participant.delivery_status) {
+    case "pending":
+      return "delivery pending";
+    case "sent":
+      return "sent, waiting for ACK";
+    case "acknowledged":
+      return "acknowledged";
+    case "readback_confirmed":
+      return "confirmed";
+    case "rejected":
+      return "rejected";
+    case "failed":
+      return "delivery failed";
+    case "not_deliverable":
+      return "not deliverable";
+    case "skipped_zero_allocation":
+      return "no allocation";
+    default:
+      return loadControlParticipantStatusLabel(participant.status);
+  }
+}
+
+function participantHasDeliveredLoadControl(participant: LoadControlParticipantRead): boolean {
+  return ["sent", "acknowledged", "readback_confirmed"].includes(participant.delivery_status);
 }
 
 function loadControlDraftFromDevice(device: DeviceRead): LoadControlDraft {
@@ -673,32 +789,85 @@ function buildCanvasPoints(count: number, canvasSize: CanvasSize): CanvasPoint[]
 }
 
 function connectionProtocolLabel(device: DeviceRead): string {
-  const protocol = device.protocols.find((entry) => entry !== "mdns") ?? device.protocols[0] ?? "linked";
-  const labels: Record<string, string> = {
-    eebus_ship: "EEBus",
-    http_local: "HTTP",
-    mdns: "mDNS",
-    modbus_tcp: "Modbus",
-    mqtt: "MQTT",
-  };
-  return labels[protocol] ?? humanize(protocol);
+  const protocol = visibleConnectionProtocols(device.protocols)[0];
+  return protocol ? protocolSummaryLabel(protocol) : "Local";
 }
 
-function canvasConnectionLine(device: DeviceRead, point: CanvasPoint): CanvasConnectionLine | null {
+function deviceActiveLoadControlConstraints(
+  device: DeviceRead,
+  constraints: LoadControlConstraintRead[],
+): LoadControlConstraintRead[] {
+  return constraints.filter(
+    (constraint) =>
+      constraint.receiver_device_ids.includes(device.id) ||
+      constraint.participants.some((participant) => participant.device_id === device.id),
+  );
+}
+
+function deviceLoadControlParticipant(
+  device: DeviceRead,
+  constraint: LoadControlConstraintRead,
+): LoadControlParticipantRead | null {
+  return constraint.participants.find((participant) => participant.device_id === device.id) ?? null;
+}
+
+function deviceLoadControlSummary(device: DeviceRead, constraints: LoadControlConstraintRead[]): string | null {
+  const active = deviceActiveLoadControlConstraints(device, constraints);
+  if (active.length === 0) {
+    return null;
+  }
+  const received = active.find((constraint) => constraint.receiver_device_ids.includes(device.id));
+  if (received) {
+    return `${loadControlUseCaseLabel(received.use_case)} received ${formatWatts(received.limit_watts)}`;
+  }
+  const allocated = active
+    .map((constraint) => ({ constraint, participant: deviceLoadControlParticipant(device, constraint) }))
+    .find((entry) => entry.participant);
+  if (allocated?.participant) {
+    return `${loadControlUseCaseLabel(allocated.constraint.use_case)} ${loadControlDeliveryStatusLabel(allocated.participant)} ${formatWatts(allocated.participant.allocated_limit_watts)}`;
+  }
+  return null;
+}
+
+function homeLoadControlSummary(constraints: LoadControlConstraintRead[]): string | null {
+  if (constraints.length === 0) {
+    return null;
+  }
+  const primary = constraints[0];
+  const label = loadControlUseCaseLabel(primary.use_case);
+  const suffix = constraints.length > 1 ? ` +${constraints.length - 1}` : "";
+  return `Active ${label}: ${formatWatts(primary.limit_watts)}${suffix}`;
+}
+
+function canvasConnectionLine(
+  device: DeviceRead,
+  point: CanvasPoint,
+  constraints: LoadControlConstraintRead[],
+): CanvasConnectionLine | null {
   const length = Math.hypot(point.x, point.y);
   if (length <= HOME_CARD_WIDTH / 2 + DEVICE_CARD_WIDTH / 2) {
     return null;
   }
 
+  const activeLoadControl = deviceActiveLoadControlConstraints(device, constraints).some(
+    (constraint) =>
+      constraint.receiver_device_ids.includes(device.id) ||
+      constraint.participants.some((participant) => participant.device_id === device.id && participantHasDeliveredLoadControl(participant)),
+  );
+  const activeLabel = deviceActiveLoadControlConstraints(device, constraints)
+    .map((constraint) => loadControlUseCaseLabel(constraint.use_case))
+    .filter((value, index, values) => values.indexOf(value) === index)
+    .join("/");
   return {
     id: device.id,
     from: { x: 0, y: 0 },
     to: point,
-    label: connectionProtocolLabel(device),
+    label: activeLabel ? `${connectionProtocolLabel(device)} · ${activeLabel}` : connectionProtocolLabel(device),
     labelAt: {
       x: point.x * 0.62,
       y: point.y * 0.62,
     },
+    activeLoadControl,
   };
 }
 
@@ -707,11 +876,41 @@ function deviceHasHemsConnection(device: DeviceRead): boolean {
   return (
     statusTags.has("connected") ||
     statusTags.has("eebus_ship_ready") ||
-    ["connected", "monitorable", "controllable", "optimizable"].includes(device.primary_status) ||
-    device.capabilities.monitorable ||
-    device.capabilities.controllable ||
-    device.capabilities.optimizable
+    statusTags.has("http_ready") ||
+    device.primary_status === "connected"
   );
+}
+
+function deviceHasLiveTelemetry(device: DeviceRead): boolean {
+  return device.telemetry_status === "live";
+}
+
+function deviceTelemetryStatusLabel(device: DeviceRead): string {
+  switch (device.telemetry_status) {
+    case "live":
+      return "Live";
+    case "sampled":
+      return "Sampled";
+    case "stale":
+      return "Stale";
+    case "error":
+      return "Error";
+    default:
+      return "Unknown";
+  }
+}
+
+function deviceTelemetryTimeLabel(device: DeviceRead): string {
+  if (device.telemetry_status === "live" && typeof device.telemetry_age_seconds === "number") {
+    if (device.telemetry_age_seconds < 5) {
+      return "Live now";
+    }
+    return `Live ${Math.round(device.telemetry_age_seconds)}s ago`;
+  }
+  if (device.telemetry_updated_at) {
+    return formatDateTime(device.telemetry_updated_at);
+  }
+  return "No live sample";
 }
 
 function seededUnitInterval(seed: string): number {
@@ -967,6 +1166,8 @@ export default function App() {
   }, [agentProviderConfig]);
 
   const currentScope = useMemo(() => parseConfiguredSubnets(overview?.site.local_subnet ?? ""), [overview?.site.local_subnet]);
+  const activeLoadControlConstraints = overview?.load_control?.active_constraints ?? [];
+  const connectedDeviceCount = useMemo(() => allDevices.filter(deviceHasHemsConnection).length, [allDevices]);
   const canvasWorkspaceSize = useMemo(
     () => buildCanvasWorkspaceSize(canvasSize, allDevices.length),
     [allDevices.length, canvasSize.height, canvasSize.width],
@@ -980,11 +1181,12 @@ export default function App() {
       allDevices
         .map((device, index) => {
           const point = canvasPoints[index];
-          return point && deviceHasHemsConnection(device) ? canvasConnectionLine(device, point) : null;
+          return point && deviceHasHemsConnection(device) ? canvasConnectionLine(device, point, activeLoadControlConstraints) : null;
         })
         .filter((line): line is CanvasConnectionLine => line !== null),
-    [allDevices, canvasPoints],
+    [activeLoadControlConstraints, allDevices, canvasPoints],
   );
+  const activeLoadControlSummary = homeLoadControlSummary(activeLoadControlConstraints);
   const currentView: NavView = uiState.currentView === "settings" ? "settings" : "overview";
   const unresolvedItems = thread?.setup_profile.unresolved_items ?? [];
   const confirmedSystems = thread?.setup_profile.confirmed_systems ?? [];
@@ -1184,6 +1386,62 @@ export default function App() {
       setConnectionOverlayBusy(false);
     }
   }
+
+  useEffect(() => {
+    if (loading) {
+      return;
+    }
+
+    let cancelled = false;
+
+    async function refreshMonitoringSnapshot() {
+      if (document.visibilityState !== "visible") {
+        return;
+      }
+
+      const target = connectionOverlayTarget;
+      try {
+        const [nextOverview, nextConnectionState, nextConnectionOptions] = await Promise.all([
+          api.getOverview(),
+          target
+            ? api.getConnectionState({
+                entity_ref: target.entityRef,
+                endpoint_ref: target.endpointRef,
+                integration_path: target.integrationPath,
+              })
+            : Promise.resolve(null),
+          inspectedDeviceId ? api.getDeviceConnectionOptions(inspectedDeviceId) : Promise.resolve(null),
+        ]);
+        if (cancelled) {
+          return;
+        }
+        setOverview(nextOverview);
+        if (nextConnectionState) {
+          setConnectionOverlayState(nextConnectionState);
+        }
+        if (nextConnectionOptions) {
+          setConnectionOptions(nextConnectionOptions);
+        }
+      } catch {
+        // Monitoring refresh is opportunistic; explicit user actions still surface errors.
+      }
+    }
+
+    const interval = window.setInterval(() => {
+      void refreshMonitoringSnapshot();
+    }, 2500);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [
+    connectionOverlayTarget?.endpointRef,
+    connectionOverlayTarget?.entityRef,
+    connectionOverlayTarget?.integrationPath,
+    inspectedDeviceId,
+    loading,
+  ]);
 
   async function openConnectionOverlay(target: ConnectionOverlayTarget) {
     const deviceId = target.deviceId ?? deviceIdFromEntityRef(target.entityRef) ?? undefined;
@@ -1620,6 +1878,15 @@ export default function App() {
     const loadControlDraft = loadControlDrafts[device.id] ?? loadControlDraftFromDevice(device);
     const loadControlChanged = loadControlDraftChanged(device, loadControlDraft);
     const loadControlBusy = loadControlBusyDeviceId === device.id;
+    const activeDeviceLoadControl = deviceActiveLoadControlConstraints(device, activeLoadControlConstraints);
+    const receivedLoadControl = activeDeviceLoadControl.filter((constraint) => constraint.receiver_device_ids.includes(device.id));
+    const allocatedLoadControl = activeDeviceLoadControl
+      .map((constraint) => ({ constraint, participant: deviceLoadControlParticipant(device, constraint) }))
+      .filter((entry): entry is { constraint: LoadControlConstraintRead; participant: LoadControlParticipantRead } => Boolean(entry.participant))
+      .filter((entry, index, entries) => {
+        const key = `${entry.constraint.use_case}:${entry.constraint.peer_ski}:${entry.participant.device_id}`;
+        return entries.findIndex((candidate) => `${candidate.constraint.use_case}:${candidate.constraint.peer_ski}:${candidate.participant.device_id}` === key) === index;
+      });
     return (
       <div className="absolute inset-0 z-30 bg-[rgba(247,249,252,0.78)] backdrop-blur-[6px]">
         <div className="h-full w-full p-6">
@@ -1666,7 +1933,7 @@ export default function App() {
               <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_420px]">
                 <section className="surface-subtle p-5">
                   <p className="section-heading">State</p>
-                  <div className="mt-4 grid gap-3 md:grid-cols-3">
+                  <div className="mt-4 grid gap-3 md:grid-cols-4">
                     <div className="rounded-[16px] border border-[#d8dfea] bg-white px-4 py-4">
                       <p className="section-heading">Status</p>
                       <p className="m-0 mt-2 text-sm font-medium text-slate-900">{humanize(device.primary_status)}</p>
@@ -1676,8 +1943,12 @@ export default function App() {
                       <p className="m-0 mt-2 text-sm font-medium text-slate-900">{humanize(device.device_type)}</p>
                     </div>
                     <div className="rounded-[16px] border border-[#d8dfea] bg-white px-4 py-4">
-                      <p className="section-heading">Last seen</p>
-                      <p className="m-0 mt-2 text-sm font-medium text-slate-900">{formatDateTime(device.last_seen_at)}</p>
+                      <p className="section-heading">Telemetry</p>
+                      <p className="m-0 mt-2 text-sm font-medium text-slate-900">{deviceTelemetryStatusLabel(device)}</p>
+                    </div>
+                    <div className="rounded-[16px] border border-[#d8dfea] bg-white px-4 py-4">
+                      <p className="section-heading">Last sample</p>
+                      <p className="m-0 mt-2 text-sm font-medium text-slate-900">{deviceTelemetryTimeLabel(device)}</p>
                     </div>
                   </div>
 
@@ -1686,14 +1957,52 @@ export default function App() {
                     <div className="mt-3 flex flex-wrap gap-2">
                       <CapabilityPill label="Connected" enabled={deviceHasHemsConnection(device)} />
                       <CapabilityPill label="Visible" enabled={device.capabilities.visible} />
-                      <CapabilityPill label="Telemetry" enabled={device.capabilities.monitorable} />
+                      <CapabilityPill label="Telemetry live" enabled={deviceHasLiveTelemetry(device)} />
                       <CapabilityPill label="Control" enabled={device.capabilities.controllable} />
                       <CapabilityPill label="Optimizable" enabled={device.capabilities.optimizable} />
                     </div>
                   </div>
 
+                  {activeDeviceLoadControl.length > 0 ? (
+                    <div className="mt-5 border-t border-[#d8dfea] pt-5">
+                      <p className="section-heading">Active load control</p>
+                      <div className="mt-4 grid gap-3 md:grid-cols-2">
+                        {receivedLoadControl.map((constraint) => (
+                          <div key={`received-${constraint.id}`} className="rounded-[16px] border border-[#e7b14d] bg-[#fff7e8] px-4 py-4">
+                            <p className="m-0 text-[11px] font-semibold uppercase tracking-[0.08em] text-[#9a6208]">
+                              {loadControlUseCaseLabel(constraint.use_case)} received
+                            </p>
+                            <p className="m-0 mt-2 text-lg font-semibold text-slate-950">{formatWatts(constraint.limit_watts)}</p>
+                            <p className="m-0 mt-1 text-xs text-slate-600">
+                              {formatRemainingTime(constraint.expires_at)} · {formatDateTime(constraint.received_at)}
+                            </p>
+                          </div>
+                        ))}
+                        {allocatedLoadControl.map(({ constraint, participant }) => (
+                          <div key={`allocated-${constraint.id}`} className="rounded-[16px] border border-[#e7b14d] bg-[#fffaf0] px-4 py-4">
+                            <p className="m-0 text-[11px] font-semibold uppercase tracking-[0.08em] text-[#9a6208]">
+                              {loadControlUseCaseLabel(constraint.use_case)} allocation
+                            </p>
+                            <p className="m-0 mt-2 text-lg font-semibold text-slate-950">
+                              {formatWatts(participant.allocated_limit_watts)}
+                            </p>
+	                            <p className="m-0 mt-1 text-xs text-slate-600">
+	                              {formatNumber(participant.share_pct)}% share · {loadControlDeliveryStatusLabel(participant)}
+	                            </p>
+	                            {participant.delivery_detail ? (
+	                              <p className="m-0 mt-1 text-xs text-slate-500">{participant.delivery_detail}</p>
+	                            ) : null}
+	                          </div>
+	                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+
                   <div className="mt-5 border-t border-[#d8dfea] pt-5">
-                    <p className="section-heading">Telemetry</p>
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <p className="section-heading">Telemetry</p>
+                      <p className="m-0 text-xs font-medium text-slate-500">{deviceTelemetryTimeLabel(device)}</p>
+                    </div>
                     {telemetryEntries.length > 0 ? (
                       <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
                         {telemetryEntries.slice(0, 6).map(([key, value]) => (
@@ -1741,14 +2050,14 @@ export default function App() {
                               }
                               title={endpointAddress(endpoint)}
                             >
-                              {humanize(endpoint.protocol)}
+                              {protocolDisplayLabel(endpoint.protocol)}
                             </button>
                           );
                         })}
                       </div>
                     ) : (
                       <p className="m-0 mt-2 text-sm font-medium text-slate-900">
-                        {device.protocols.length > 0 ? device.protocols.join(", ") : "None"}
+                        {deviceProtocolListLabel(device.protocols)}
                       </p>
                     )}
                   </div>
@@ -1762,7 +2071,7 @@ export default function App() {
                       <article className="rounded-[18px] border border-[#d8dfea] bg-white px-4 py-4">
                         <div className="flex flex-wrap items-start justify-between gap-3">
                           <div className="min-w-0">
-                            <p className="m-0 text-sm font-semibold text-slate-950">{humanize(selectedEndpoint.protocol)}</p>
+                            <p className="m-0 text-sm font-semibold text-slate-950">{protocolDisplayLabel(selectedEndpoint.protocol)}</p>
                             <p className="m-0 mt-1 truncate text-xs text-slate-500">{endpointAddress(selectedEndpoint)}</p>
                           </div>
                           <StatusBadge status={selectedEndpoint.state.status || selectedEndpoint.status} />
@@ -1771,19 +2080,38 @@ export default function App() {
                           <span className="truncate">Path: {selectedPath ? humanize(selectedPath) : "Not selected"}</span>
                           <span className="truncate">State: {connectionPhaseLabel(selectedEndpoint.state)}</span>
                         </div>
-                        <button
-                          type="button"
-                          className="primary-button mt-4 w-full"
-                          onClick={() =>
-                            selectedEndpoint.connect_action
-                              ? void executeConnectionAction(selectedEndpoint.connect_action, selectedTarget)
-                              : void openConnectionOverlay(selectedTarget)
-                          }
-                          disabled={!selectedEndpoint.connectable || busyAction === "connection-action"}
-                        >
-                          <AppIcon name="link" className="mr-2 h-4 w-4" />
-                          {connectionActionLabel(selectedEndpoint.state)}
-                        </button>
+                        <div className="mt-4 grid gap-2">
+                          {selectedEndpoint.connect_action ? (
+                            <button
+                              type="button"
+                              className="primary-button w-full"
+                              onClick={() => void executeConnectionAction(selectedEndpoint.connect_action as ConnectionActionRef, selectedTarget)}
+                              disabled={busyAction === "connection-action"}
+                            >
+                              <AppIcon name="link" className="mr-2 h-4 w-4" />
+                              {connectionActionLabel(selectedEndpoint.state)}
+                            </button>
+                          ) : (
+                            <button
+                              type="button"
+                              className="secondary-button w-full"
+                              onClick={() => void openConnectionOverlay(selectedTarget)}
+                              disabled={!selectedEndpoint.connectable || busyAction === "connection-action"}
+                            >
+                              Inspect
+                            </button>
+                          )}
+                          {selectedEndpoint.disconnect_action ? (
+                            <button
+                              type="button"
+                              className="secondary-button w-full"
+                              onClick={() => void executeConnectionAction(selectedEndpoint.disconnect_action as ConnectionActionRef, selectedTarget)}
+                              disabled={busyAction === "connection-action"}
+                            >
+                              Disconnect
+                            </button>
+                          ) : null}
+                        </div>
                       </article>
                     ) : (
                       <div className="rounded-[16px] border border-dashed border-[#d8dfea] bg-[#fafcff] px-4 py-4 text-sm text-slate-500">
@@ -1891,6 +2219,7 @@ export default function App() {
     const requiredAction = fieldFromRecord(state?.required_user_action, "action");
     const localSki = fieldFromRecord(state?.required_user_action, "local_ski") || state?.local_ski || "";
     const actionAvailable = Boolean(state?.connect_action && state.can_connect);
+    const disconnectAvailable = Boolean(state?.disconnect_action);
 
     return (
       <div className="absolute inset-0 z-40 flex items-center justify-center bg-[rgba(15,23,42,0.18)] px-6 py-6 backdrop-blur-[4px]">
@@ -1899,7 +2228,7 @@ export default function App() {
             <div className="min-w-0">
               <p className="section-heading">Connection setup</p>
               <p className="m-0 mt-2 truncate text-xl font-semibold text-slate-950">
-                {state ? humanize(state.protocol) : humanize(connectionOverlayTarget.integrationPath)}
+                {state ? protocolDisplayLabel(state.protocol) : humanize(connectionOverlayTarget.integrationPath)}
               </p>
               <p className="m-0 mt-1 truncate text-sm text-slate-500">
                 {state ? endpointAddress(state) : connectionOverlayTarget.endpointRef}
@@ -1989,15 +2318,31 @@ export default function App() {
             >
               Close
             </button>
-            <button
-              type="button"
-              className="primary-button"
-              onClick={() => void runConnectionAction()}
-              disabled={!actionAvailable || connectionOverlayBusy || busyAction === "connection-action"}
-            >
-              <AppIcon name="link" className="mr-2 h-4 w-4" />
-              {connectionActionLabel(state)}
-            </button>
+            {state?.connect_action ? (
+              <button
+                type="button"
+                className="primary-button"
+                onClick={() => void runConnectionAction()}
+                disabled={!actionAvailable || connectionOverlayBusy || busyAction === "connection-action"}
+              >
+                <AppIcon name="link" className="mr-2 h-4 w-4" />
+                {connectionActionLabel(state)}
+              </button>
+            ) : null}
+            {state?.disconnect_action ? (
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() =>
+                  connectionOverlayTarget
+                    ? void executeConnectionAction(state.disconnect_action as ConnectionActionRef, connectionOverlayTarget)
+                    : undefined
+                }
+                disabled={!disconnectAvailable || connectionOverlayBusy || busyAction === "connection-action"}
+              >
+                Disconnect
+              </button>
+            ) : null}
           </footer>
         </section>
       </div>
@@ -2060,13 +2405,16 @@ export default function App() {
               {connectedDeviceLines.map((line) => (
                 <g key={line.id}>
                   <line
-                    className="hh-data-link"
+                    className={`hh-data-link ${line.activeLoadControl ? "hh-data-link-active" : ""}`}
                     x1={line.from.x}
                     y1={line.from.y}
                     x2={line.to.x}
                     y2={line.to.y}
                   />
-                  <g className="hh-data-link-label" transform={`translate(${line.labelAt.x} ${line.labelAt.y})`}>
+                  <g
+                    className={`hh-data-link-label ${line.activeLoadControl ? "hh-data-link-label-active" : ""}`}
+                    transform={`translate(${line.labelAt.x} ${line.labelAt.y})`}
+                  >
                     <rect
                       x={-(Math.max(46, line.label.length * 7 + 18) / 2)}
                       y="-11"
@@ -2080,7 +2428,12 @@ export default function App() {
                   </g>
                   {(["outbound", "inbound"] as const).flatMap((direction) =>
                     [0, 1].map((index) => (
-                    <ellipse key={`${direction}-${index}`} className="hh-data-bubble" rx="11" ry="3.2">
+                    <ellipse
+                      key={`${direction}-${index}`}
+                      className={`hh-data-bubble ${line.activeLoadControl ? "hh-data-bubble-active" : ""}`}
+                      rx={line.activeLoadControl ? "13" : "11"}
+                      ry={line.activeLoadControl ? "3.8" : "3.2"}
+                    >
                       <animateMotion
                         dur="9.6s"
                         begin={dataBubbleBegin(line.id, direction, index)}
@@ -2134,8 +2487,13 @@ export default function App() {
               <p className="m-0 mt-2 text-sm text-slate-600">
                 {discoveryRunning
                   ? "Scanning network"
-                  : `${allDevices.length} detected device${allDevices.length === 1 ? "" : "s"}`}
+                  : `${connectedDeviceCount} connected device${connectedDeviceCount === 1 ? "" : "s"}`}
               </p>
+              {activeLoadControlSummary ? (
+                <div className="mx-auto mt-3 max-w-full rounded-full border border-[#e7b14d] bg-[#fff7e8] px-3 py-1 text-xs font-semibold text-[#9a6208]">
+                  <span className="block truncate">{activeLoadControlSummary}</span>
+                </div>
+              ) : null}
             </button>
 
             {allDevices.map((device, index) => {
@@ -2147,6 +2505,7 @@ export default function App() {
               const highlighted =
                 uiState.highlightedDeviceIds.includes(device.id) || uiState.selectedDeviceIds.includes(device.id);
               const matchesFocus = deviceMatchesFocusedSystem(device, uiState.focusedSystem);
+              const loadControlSummary = deviceLoadControlSummary(device, activeLoadControlConstraints);
 
               return (
                 <button
@@ -2180,7 +2539,13 @@ export default function App() {
                     </div>
                   </div>
                   <div className="mt-4 flex items-center justify-between gap-3">
-                    <span className="truncate text-xs text-slate-600">{deviceTelemetrySummary(device)}</span>
+                    <span
+                      className={`truncate text-xs ${
+                        loadControlSummary ? "font-semibold text-[#9a6208]" : "text-slate-600"
+                      }`}
+                    >
+                      {loadControlSummary ?? deviceTelemetrySummary(device)}
+                    </span>
                   </div>
                 </button>
               );
