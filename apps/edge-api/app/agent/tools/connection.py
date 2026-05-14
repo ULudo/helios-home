@@ -15,8 +15,8 @@ class ConnectionEstablishTool:
     contexts = ("setup", "commissioning", "debug")
     input_model = ConnectionEstablishInput
     mutates_state = True
-    reads = ["home_graph", "protocol_endpoints", "eebus_local_identity", "work_store"]
-    writes = ["eebus_local_identity", "work_store", "protocol_diagnostic_run"]
+    reads = ["home_graph", "protocol_endpoints", "eebus_local_identity", "modbus_tcp", "work_store"]
+    writes = ["eebus_local_identity", "protocol_endpoints", "device_telemetry", "work_store", "protocol_diagnostic_run"]
     side_effects = ["may open network connections to the selected endpoint and may create a local protocol identity"]
     emitted_ui_events: list[str] = []
 
@@ -46,7 +46,7 @@ class ConnectionDisconnectTool:
     contexts = ("setup", "commissioning", "debug")
     input_model = ConnectionDisconnectInput
     mutates_state = True
-    reads = ["home_graph", "protocol_endpoints", "eebus_runtime", "work_store"]
+    reads = ["home_graph", "protocol_endpoints", "eebus_runtime", "modbus_tcp", "work_store"]
     writes = ["protocol_endpoints", "protocol_diagnostic_run"]
     side_effects = ["may close local protocol sessions and marks the selected endpoint as disconnected"]
     emitted_ui_events: list[str] = []

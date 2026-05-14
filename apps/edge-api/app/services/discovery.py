@@ -30,7 +30,7 @@ from app.services.discovery_blueprints import (
 )
 from app.services.eebus import EEBUS_SOURCE_NAME, discover_eebus_site
 from app.services.local_network import discover_local_network_site
-from app.services.modbus import discover_modbus_site
+from app.services.modbus import discover_modbus_hosts, discover_modbus_site
 from app.services.mqtt import discover_mqtt_site
 from app.services.network_scope import list_reachable_subnets, parse_configured_subnets
 
@@ -189,6 +189,25 @@ def _skipped_batch(source_name: str, message: str) -> SourceDiscoveryBatch:
     )
 
 
+def _known_modbus_probe_hosts(candidates: list[RawCandidate]) -> list[str]:
+    hosts: list[str] = []
+    for candidate in candidates:
+        evidence = candidate.evidence or {}
+        for key in ("modbus_host", "http_host", "host"):
+            value = evidence.get(key)
+            if isinstance(value, str) and value.strip():
+                hosts.append(value.strip())
+        ship = evidence.get("ship_service") if isinstance(evidence.get("ship_service"), dict) else {}
+        addresses = ship.get("addresses") if isinstance(ship.get("addresses"), dict) else {}
+        ipv4 = addresses.get("ipv4") if isinstance(addresses.get("ipv4"), list) else []
+        hosts.extend(str(value).strip() for value in ipv4 if str(value).strip())
+    unique_hosts: list[str] = []
+    for host in hosts:
+        if host and host not in unique_hosts:
+            unique_hosts.append(host)
+    return unique_hosts
+
+
 def _discover_batches(site: Site) -> DiscoveryBatchSelection:
     settings = get_settings()
     attempted_batches: list[SourceDiscoveryBatch] = []
@@ -224,6 +243,22 @@ def _discover_batches(site: Site) -> DiscoveryBatchSelection:
             empty_message=f"completed: 0 local HTTP candidates from {{scope_count}} {scope_kind} subnet scan(s).",
         )
         attempted_batches.append(batch)
+        if not settings.modbus_live_enabled:
+            known_modbus_hosts = _known_modbus_probe_hosts(batch.candidates)[: settings.modbus_max_hosts]
+            if known_modbus_hosts:
+                modbus_batch = discover_modbus_hosts(
+                    known_modbus_hosts,
+                    timeout_seconds=settings.modbus_timeout_seconds,
+                )
+                if modbus_batch.candidates:
+                    attempted_batches.append(
+                        SourceDiscoveryBatch(
+                            source_name=modbus_batch.source_name,
+                            status=modbus_batch.status,
+                            message=modbus_batch.message,
+                            candidates=modbus_batch.candidates,
+                        )
+                    )
     else:
         attempted_batches.append(
             _skipped_batch(

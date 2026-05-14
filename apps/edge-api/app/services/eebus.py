@@ -10,10 +10,12 @@ from app.db.models import AuditEvent, utcnow
 from app.domain.enums import RecoveryZone
 from app.hems.load_control import (
     active_load_control_limits,
+    attach_delivery_state_to_distribution,
     build_constraint_distribution,
     create_load_control_deliveries,
     effective_grid_limits,
     record_load_control_limit,
+    update_native_delivery_statuses_from_plan,
 )
 from app.hems.policy import get_or_create_hems_policy
 from app.hems.schemas import (
@@ -354,27 +356,15 @@ def distribute_load_power_limit(
         }
     )
     deliveries = create_load_control_deliveries(session, limit=limit, distribution=constraint_distribution)
-    deliveries_by_device = {delivery.target_device_id: delivery for delivery in deliveries}
-    for participant in constraint_distribution.get("participants", []):
-        if not isinstance(participant, dict):
-            continue
-        delivery = deliveries_by_device.get(str(participant.get("device_id") or ""))
-        if delivery is None:
-            continue
-        participant.update(
-            {
-                "delivery_id": delivery.id,
-                "delivery_status": delivery.status,
-                "delivery_detail": delivery.detail,
-                "delivery_updated_at": delivery.updated_at.isoformat() if delivery.updated_at else None,
-            }
-        )
+    attach_delivery_state_to_distribution(constraint_distribution, deliveries)
 
     plan = None
     if command.is_active or changed_effective_limits:
         from app.hems.service import run_hems_replan
 
         plan = run_hems_replan(session, triggered_by=f"eebus_{'lpc' if limit_id == 0 else 'lpp'}")
+        update_native_delivery_statuses_from_plan(session, deliveries, plan)
+        attach_delivery_state_to_distribution(constraint_distribution, deliveries)
 
     session.add(
         AuditEvent(

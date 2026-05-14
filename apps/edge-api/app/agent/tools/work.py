@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from sqlalchemy import select
 
-from app.agent.tools.schemas import AgentToolContext, ToolExecutionResult, WorkGetStatusInput, show_task_event
+from app.agent.tools.schemas import AgentToolContext, ToolExecutionResult, WorkGetStatusInput
 from app.db.models import AgentTask, Blocker, UserDecisionRequest
 
 
@@ -16,8 +16,8 @@ class WorkGetStatusTool:
     mutates_state = False
     reads = ["work_store", "user_decision_requests"]
     writes: list[str] = []
-    side_effects = ["may emit task UI event"]
-    emitted_ui_events = ["task.show"]
+    side_effects: list[str] = []
+    emitted_ui_events: list[str] = []
 
     def execute(self, context: AgentToolContext, payload: WorkGetStatusInput) -> ToolExecutionResult:
         task_statement = select(AgentTask).where(AgentTask.site_id == context.site.id).order_by(AgentTask.updated_at.desc())
@@ -55,21 +55,6 @@ class WorkGetStatusTool:
             }
             for blocker in blockers
         ] if payload.include_blockers else []
-        ui_events = []
-        if serialized_tasks:
-            first_task = serialized_tasks[0]
-            task_blockers = [blocker for blocker in serialized_blockers if blocker.get("task_ref") == first_task["task_ref"]]
-            ui_events.append(
-                show_task_event(
-                    str(first_task["task_ref"]),
-                    "blockers" if task_blockers else "summary",
-                    title=str(first_task.get("title") or ""),
-                    status=str(first_task.get("status") or ""),
-                    summary=str(first_task.get("goal") or ""),
-                    blockers=task_blockers,
-                )
-            )
-
         return ToolExecutionResult(
             output={
                 "tasks": serialized_tasks,
@@ -84,5 +69,4 @@ class WorkGetStatusTool:
                     for decision in decisions
                 ],
             },
-            ui_events=ui_events,
         )

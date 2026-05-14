@@ -10,6 +10,7 @@ from app.db.session import get_session_factory, init_database
 from app.services.discovery import prune_legacy_fixture_inventory
 from app.services.eebus_runtime import get_eebus_runtime_manager
 from app.services.http_telemetry import get_http_telemetry_runtime_manager
+from app.services.modbus_telemetry import get_modbus_telemetry_runtime_manager
 
 
 def create_app() -> FastAPI:
@@ -23,7 +24,9 @@ def create_app() -> FastAPI:
             seed_default_site(session)
             prune_legacy_fixture_inventory(session)
         get_http_telemetry_runtime_manager().start(session_factory)
+        get_modbus_telemetry_runtime_manager().start(session_factory)
         yield
+        await get_modbus_telemetry_runtime_manager().stop()
         await get_http_telemetry_runtime_manager().stop()
         get_eebus_runtime_manager().stop()
 

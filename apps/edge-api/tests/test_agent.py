@@ -48,6 +48,7 @@ from app.agent.provider import (
 from app.agent.tools.registry import create_default_tool_registry
 from app.services.eebus_runtime import EebusPeerTrustMaterial, EebusRuntimeSnapshot
 from app.services.http_telemetry import HttpTelemetryProbeResult
+from app.services.modbus import ModbusProbeResult
 
 
 def _bootstrap_app(tmp_path, monkeypatch, name: str = "agent.db"):
@@ -311,6 +312,57 @@ def test_empty_thread_does_not_create_backend_authored_assistant_welcome(tmp_pat
         assert response.json()["messages"] == []
 
 
+def test_workstore_tasks_are_not_auto_rendered_or_injected_into_model_context(tmp_path, monkeypatch):
+    app = _bootstrap_app(tmp_path, monkeypatch, "workstore-context.db")
+    provider = _use_scripted_provider(monkeypatch, ScriptedModelProvider([ModelFinalAnswer("I will inspect state with tools when needed.")]))
+
+    with TestClient(app) as client:
+        thread_response = client.get("/api/v1/agent/thread")
+        assert thread_response.status_code == 200
+        thread_id = thread_response.json()["id"]
+
+        session_factory = get_session_factory()
+        with session_factory() as session:
+            site = session.scalar(select(Site).limit(1))
+            assert site is not None
+            session.add(
+                AgentTask(
+                    id="task-stale-eebus",
+                    site_id=site.id,
+                    thread_id=thread_id,
+                    task_type="commission_role_candidate",
+                    title="commission_role_candidate",
+                    goal="commission_role_candidate",
+                    status="blocked",
+                    target_refs=["device:dev-eebus"],
+                    context={"current_phase": "waiting_for_ship_session"},
+                )
+            )
+            session.add(
+                Blocker(
+                    id="blocker-stale-eebus",
+                    task_id="task-stale-eebus",
+                    subject_ref="device:dev-eebus",
+                    blocker_type="eebus_peer_connection_pending",
+                    summary="eebus_peer_connection_pending",
+                    status="open",
+                )
+            )
+            session.commit()
+
+        thread_with_work = client.get("/api/v1/agent/thread")
+        assert thread_with_work.status_code == 200
+        payload = thread_with_work.json()
+        assert "active_tasks" not in payload
+        assert "open_blockers" not in payload
+
+        events = _send_and_stream(client, "How many EEBUS devices are connected?")
+        assert any(event["event_type"] == "assistant_message_completed" for event in events)
+        assert provider.requests
+        assert "active_tasks" not in provider.requests[0].context
+        assert "open_blockers" not in provider.requests[0].context
+
+
 def test_setup_profile_get_or_create_recovers_from_concurrent_insert(tmp_path, monkeypatch):
     app = _bootstrap_app(tmp_path, monkeypatch, "setup-profile-race.db")
 
@@ -439,6 +491,7 @@ def test_dashboard_ui_actions_are_registered_as_agent_tools():
     assert registry.get("ui.open_connection_overlay") is not None
     assert registry.get("connection.disconnect") is not None
     assert registry.get("load_control.configure_device") is not None
+    assert registry.get("load_control.inspect_status") is not None
 
 
 def test_connection_establish_hides_protocol_direction_from_agent_schema():
@@ -489,6 +542,45 @@ def test_load_control_config_action_updates_overview_and_agent_tool(tmp_path, mo
         assert device["load_control"]["lpc_share_pct"] == 35
         assert device["load_control"]["participates_lpp"] is True
         assert device["load_control"]["lpp_share_pct"] == 15
+
+
+def test_load_control_status_tool_reports_active_constraint_duration(tmp_path, monkeypatch):
+    app = _bootstrap_app(tmp_path, monkeypatch, "load-control-status-tool.db")
+
+    with TestClient(app) as client:
+        client.get("/api/v1/agent/thread")
+        response = client.post(
+            "/api/v1/eebus/load-power-limits/distribute",
+            json={
+                "use_case": "lpc",
+                "limit_watts": 6000,
+                "duration_seconds": 600,
+                "source": "test",
+                "peer_ski": "0123456789abcdef0123456789abcdef01234567",
+            },
+        )
+        assert response.status_code == 200
+        provider = _use_scripted_provider(
+            monkeypatch,
+            ScriptedModelProvider(
+                [
+                    ModelToolCall("load_control.inspect_status", {}),
+                    ModelFinalAnswer("The active LPC is 6 kW and still has time remaining."),
+                ]
+            ),
+        )
+
+        events = _send_and_stream(client, "Wie lange ist der LPC noch aktiv?")
+
+    tool_finished = next(event for event in events if event["event_type"] == "tool_finished")
+    assert tool_finished["payload"]["tool_name"] == "load_control.inspect_status"
+    result = tool_finished["payload"]["result"]
+    assert result["active_constraint_count"] == 1
+    assert result["constraints"][0]["limit_watts"] == 6000
+    assert result["constraints"][0]["duration_seconds"] == 600
+    assert 0 < result["constraints"][0]["remaining_seconds"] <= 600
+    assert result["constraints"][0]["expires_at"]
+    assert provider.requests[0].context["load_control"]["active_constraint_count"] == 1
 
 
 def test_runtime_uses_model_actions_tool_observations_and_model_final_answer(tmp_path, monkeypatch):
@@ -1354,6 +1446,186 @@ def test_http_connection_action_connects_and_disconnects_local_endpoint(tmp_path
         assert overview_device["telemetry_status"] == "sampled"
 
 
+def test_modbus_connection_action_connects_sunspec_endpoint_and_updates_overview(tmp_path, monkeypatch):
+    app = _bootstrap_app(tmp_path, monkeypatch, "dashboard-modbus-connection-action.db")
+
+    def fake_probe_modbus_host(host: str, timeout_seconds: float):
+        assert host == "198.51.100.90"
+        return ModbusProbeResult(
+            host=host,
+            unit_id=1,
+            vendor_name="Fronius",
+            product_code="GEN24 Plus",
+            revision="1.28.4",
+            sunspec_base_register=40000,
+            sunspec_model_ids=[1, 103],
+            telemetry={
+                "power_kw": 5.432,
+                "energy_total_kwh": 123.456,
+                "voltage_v": 230.0,
+            },
+        )
+
+    monkeypatch.setattr("app.services.modbus_telemetry.probe_modbus_host", fake_probe_modbus_host)
+
+    with TestClient(app) as client:
+        client.get("/api/v1/agent/thread")
+        _add_device(
+            device_id="dev-fronius",
+            name="Fronius Inverter",
+            device_type="pv_inverter",
+            manufacturer="Fronius",
+            model="GEN24 Plus",
+            protocols=["modbus_tcp"],
+        )
+        session_factory = get_session_factory()
+        with session_factory() as session:
+            site = session.get(Site, _site_id())
+            assert site is not None
+            session.add(
+                DeviceCandidate(
+                    id="cand-fronius-modbus",
+                    site_id=site.id,
+                    stable_key="dev-fronius",
+                    display_name="Fronius Inverter",
+                    manufacturer="Fronius",
+                    model="GEN24 Plus",
+                    firmware="1.28.4",
+                    device_type="pv_inverter",
+                    discovery_sources=["modbus_live"],
+                    protocols=["modbus_tcp"],
+                    evidence={
+                        "identity_keys": ["network-host:198-51-100-90"],
+                        "modbus_host": "198.51.100.90",
+                        "modbus_port": 502,
+                        "modbus_unit_id": 1,
+                        "sunspec_base_register": 40000,
+                        "sunspec_model_ids": [1, 103],
+                    },
+                    classification_confidence=0.9,
+                    classification_reasoning="SunSpec inverter telemetry exposed production-side metrics.",
+                    state="classified",
+                    matched_device_id="dev-fronius",
+                )
+            )
+            session.commit()
+
+        endpoint_ref = _endpoint_ref_for_device("dev-fronius", "modbus_tcp")
+
+        options_response = client.get("/api/v1/devices/dev-fronius/connection-options")
+        assert options_response.status_code == 200
+        modbus_endpoint = next(endpoint for endpoint in options_response.json()["endpoints"] if endpoint["protocol"] == "modbus_tcp")
+        assert modbus_endpoint["endpoint_ref"] == endpoint_ref
+        assert modbus_endpoint["connect_action"]["input"]["integration_path"] == "sunspec_modbus"
+
+        connect_response = client.post(
+            "/api/v1/actions/connection.establish",
+            json={
+                "input": {
+                    "entity_ref": "device:dev-fronius",
+                    "endpoint_ref": endpoint_ref,
+                    "integration_path": "sunspec_modbus",
+                }
+            },
+        )
+        assert connect_response.status_code == 200
+        assert connect_response.json()["output"]["status"] == "connected_sunspec_ready"
+        assert connect_response.json()["output"]["telemetry_keys"] == ["energy_total_kwh", "power_kw", "voltage_v"]
+
+        state_response = client.get(
+            "/api/v1/connections/state",
+            params={
+                "entity_ref": "device:dev-fronius",
+                "endpoint_ref": endpoint_ref,
+                "integration_path": "sunspec_modbus",
+            },
+        )
+        assert state_response.status_code == 200
+        state = state_response.json()
+        assert state["status"] == "connected_sunspec_ready"
+        assert state["connect_action"] is None
+        assert state["disconnect_action"]["name"] == "connection.disconnect"
+        assert any(step["key"] == "sunspec_signature" and step["status"] == "completed" for step in state["steps"])
+
+        overview_response = client.get("/api/v1/overview")
+        assert overview_response.status_code == 200
+        overview_device = next(device for device in overview_response.json()["devices"] if device["id"] == "dev-fronius")
+        assert overview_device["telemetry_status"] == "live"
+        assert overview_device["telemetry"]["power_kw"] == 5.432
+        assert "connected" in overview_device["status_tags"]
+
+
+def test_connection_options_materialize_modbus_endpoint_for_known_local_host(tmp_path, monkeypatch):
+    app = _bootstrap_app(tmp_path, monkeypatch, "known-host-modbus-materialization.db")
+
+    def fake_probe_modbus_host(host: str, timeout_seconds: float):
+        assert host == "198.51.100.91"
+        return ModbusProbeResult(
+            host=host,
+            unit_id=1,
+            vendor_name="Fronius",
+            product_code="GEN24 Plus",
+            revision="1.28.4",
+            sunspec_base_register=40000,
+            sunspec_model_ids=[1, 103],
+            telemetry={"power_kw": 3.21},
+        )
+
+    monkeypatch.setattr("app.services.modbus_telemetry.probe_modbus_host", fake_probe_modbus_host)
+
+    with TestClient(app) as client:
+        client.get("/api/v1/agent/thread")
+        _add_device(
+            device_id="dev-fronius-http",
+            name="Fronius Inverter",
+            device_type="pv_inverter",
+            manufacturer="Fronius",
+            model="Fronius Inverter",
+            protocols=["http_local"],
+        )
+        session_factory = get_session_factory()
+        with session_factory() as session:
+            site = session.get(Site, _site_id())
+            assert site is not None
+            session.add(
+                DeviceCandidate(
+                    id="cand-fronius-http",
+                    site_id=site.id,
+                    stable_key="dev-fronius-http",
+                    display_name="Fronius Inverter",
+                    manufacturer="Fronius",
+                    model="Fronius Inverter",
+                    firmware="unknown",
+                    device_type="pv_inverter",
+                    discovery_sources=["local_network_live"],
+                    protocols=["http_local"],
+                    evidence={
+                        "identity_keys": ["network-host:198-51-100-91"],
+                        "http_host": "198.51.100.91",
+                        "fingerprint_profile": "generic_http_energy",
+                    },
+                    classification_confidence=0.88,
+                    classification_reasoning="Local HTTP fingerprint matched Fronius inverter.",
+                    state="classified",
+                    matched_device_id="dev-fronius-http",
+                )
+            )
+            session.commit()
+
+        options_response = client.get("/api/v1/devices/dev-fronius-http/connection-options")
+        assert options_response.status_code == 200
+        protocols = {endpoint["protocol"] for endpoint in options_response.json()["endpoints"]}
+        assert protocols == {"http_local", "modbus_tcp"}
+        modbus_endpoint = next(endpoint for endpoint in options_response.json()["endpoints"] if endpoint["protocol"] == "modbus_tcp")
+        assert modbus_endpoint["host"] == "198.51.100.91"
+        assert modbus_endpoint["connect_action"]["input"]["integration_path"] == "sunspec_modbus"
+
+        overview_response = client.get("/api/v1/overview")
+        overview_device = next(device for device in overview_response.json()["devices"] if device["id"] == "dev-fronius-http")
+        assert "modbus_tcp" in overview_device["protocols"]
+        assert overview_device["telemetry"]["power_kw"] == 3.21
+
+
 def test_overview_reports_stale_live_telemetry_without_hiding_sample(tmp_path, monkeypatch):
     app = _bootstrap_app(tmp_path, monkeypatch, "dashboard-stale-http-telemetry.db")
 
@@ -1779,6 +2051,7 @@ def test_connection_state_does_not_show_stale_authorize_action_when_endpoint_pee
                 "outbound_to_peer": {
                     "status": "starting",
                     "peer_ski": "f819e215a4f292d803325276767d9e27f67fe108",
+                    "error": "websocket closed by remote: code=4200 reason='shutdown'",
                 }
             },
             "connection_states": {
@@ -1786,11 +2059,12 @@ def test_connection_state_does_not_show_stale_authorize_action_when_endpoint_pee
                     "outbound_to_peer": {
                         "status": "starting",
                         "peer_ski": "f819e215a4f292d803325276767d9e27f67fe108",
+                        "error": "websocket closed by remote: code=4200 reason='shutdown'",
                     }
                 }
             },
-            "recent_events": [],
-            "error": "",
+            "recent_events": [{"reason": "websocket closed by remote: code=4200 reason='shutdown'"}],
+            "error": "websocket closed by remote: code=4200 reason='shutdown'",
         }
         session_factory = get_session_factory()
         with session_factory() as session:
@@ -1830,6 +2104,8 @@ def test_connection_state_does_not_show_stale_authorize_action_when_endpoint_pee
         assert state["phase"] == "ship_ready"
         assert state["status"] == "connected_ship_ready"
         assert state["required_user_action"] == {}
+        assert state["last_error"] == ""
+        assert state["connect_action"] is None
         assert state["disconnect_action"] is not None
         assert state["connection_facets"]["overall_connection_state"] == "ship_ready"
 

@@ -144,15 +144,17 @@ Default solver stack:
 - `CVXPY`
 - `HiGHS`
 
-Guarded native actuation is available behind an explicit opt-in:
+Guarded native actuation is enabled for validated local write paths. It can be disabled for diagnostics with:
 
-- `HELIOS_NATIVE_WRITES_ENABLED=true`
+- `HELIOS_NATIVE_WRITES_ENABLED=false`
 
 Current write adapters:
 
 - telemetry simulation
 - Shelly local HTTP relay control
 - Tasmota local HTTP power control
+- SunSpec Modbus storage rate control
+- SunSpec Modbus DER / immediate active-power limit control
 
 Relevant endpoints:
 

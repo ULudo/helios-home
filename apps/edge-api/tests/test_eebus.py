@@ -49,11 +49,12 @@ def _bootstrap_app(tmp_path, monkeypatch, name="eebus.db"):
     return create_app()
 
 
-def _add_controllable_device(device_id: str, name: str) -> None:
+def _add_controllable_device(device_id: str, name: str, dispatch_profile: str = "shelly_http_relay") -> None:
     session_factory = get_session_factory()
     with session_factory() as session:
         site = session.scalar(select(Site).limit(1))
         assert site is not None
+        now = utcnow()
         session.add(
             Device(
                 id=device_id,
@@ -75,6 +76,22 @@ def _add_controllable_device(device_id: str, name: str) -> None:
                     "optimizable": True,
                 },
                 telemetry={"power_w": 1000},
+                last_seen_at=now,
+            )
+        )
+        session.add(
+            ProtocolEndpoint(
+                id=f"endpoint-{device_id}-http",
+                site_id=site.id,
+                owner_ref=f"device:{device_id}",
+                protocol="http_local",
+                host="192.0.2.10",
+                port=80,
+                service_name="test-http",
+                status="connected",
+                properties={"dispatch_profile": dispatch_profile},
+                created_at=now,
+                updated_at=now,
             )
         )
         session.commit()
@@ -365,6 +382,124 @@ def test_eebus_lpc_distribution_creates_delivery_state_for_eebus_participant(tmp
     overview_participant = overview_response.json()["load_control"]["active_constraints"][0]["participants"][0]
     assert overview_participant["delivery_status"] == "pending"
     assert overview_participant["control_path"] == "eebus_spine"
+
+
+def test_eebus_transient_load_control_delivery_failure_stays_pending(tmp_path, monkeypatch):
+    app = _bootstrap_app(tmp_path, monkeypatch, "eebus-lpc-transient-delivery.db")
+    wallbox_ski = "8f163fec6d78457f6e7b6dbf7b1608cdfde88388"
+
+    with TestClient(app) as client:
+        client.get("/api/v1/overview")
+        _add_eebus_wallbox_participant("dev-wallbox", wallbox_ski)
+        response = client.post(
+            "/api/v1/actions/load_control.configure_device",
+            json={"input": {"device_id": "dev-wallbox", "participates_lpc": True, "lpc_share_pct": 100}},
+        )
+        assert response.status_code == 200
+        response = client.post(
+            "/api/v1/eebus/load-power-limits/distribute",
+            json={
+                "use_case": "lpc",
+                "limit_watts": 6000,
+                "duration_seconds": 600,
+                "source": "test",
+                "peer_ski": "f819e215a4f292d803325276767d9e27f67fe108",
+            },
+        )
+        assert response.status_code == 200
+        distribution = response.json()["constraint_distribution"]
+
+    manager = EebusRuntimeManager()
+    manager._session_factory = get_session_factory()
+
+    async def fake_send(**kwargs):
+        raise RuntimeError(f"peer {kwargs['peer_ski']} has not completed LoadControl discovery yet")
+
+    monkeypatch.setattr(manager, "_send_load_power_limit_to_peer", fake_send)
+    asyncio.run(manager._forward_load_power_limit_async(distribution))
+
+    session_factory = get_session_factory()
+    with session_factory() as session:
+        delivery = session.scalar(select(HemsLoadControlDelivery).where(HemsLoadControlDelivery.target_device_id == "dev-wallbox"))
+        assert delivery is not None
+        assert delivery.status == "pending"
+        assert delivery.detail == "Waiting for EEBUS LoadControl path."
+        assert delivery.last_error == ""
+
+    with TestClient(app) as client:
+        overview_response = client.get("/api/v1/overview")
+    overview_participant = overview_response.json()["load_control"]["active_constraints"][0]["participants"][0]
+    assert overview_participant["delivery_status"] == "pending"
+    assert overview_participant["delivery_detail"] == "Waiting for EEBUS LoadControl path."
+
+
+def test_eebus_lpp_distribution_acknowledges_native_dispatch_participant(tmp_path, monkeypatch):
+    app = _bootstrap_app(tmp_path, monkeypatch, "eebus-native-dispatch.db")
+
+    def fake_replan(session, triggered_by):
+        now = utcnow()
+        return SimpleNamespace(
+            id="plan-native",
+            status="completed",
+            execution_mode="guarded_auto",
+            triggered_by=triggered_by,
+            solver_name="fake",
+            objective_value=None,
+            summary="Native dispatch completed.",
+            horizon_start=now,
+            horizon_end=now,
+            created_at=now,
+            finished_at=now,
+            dispatch_events=[
+                SimpleNamespace(
+                    device_id="dev-pv-native",
+                    status="applied",
+                    summary="Applied Fronius SunSpec active-power limit.",
+                    details={"adapter": "sunspec_immediate_wmax_pct"},
+                )
+            ],
+        )
+
+    monkeypatch.setattr("app.hems.service.run_hems_replan", fake_replan)
+
+    with TestClient(app) as client:
+        client.get("/api/v1/overview")
+        _add_controllable_device("dev-pv-native", "PV Native", dispatch_profile="sunspec_immediate_wmax_pct")
+        response = client.post(
+            "/api/v1/actions/load_control.configure_device",
+            json={
+                "input": {
+                    "device_id": "dev-pv-native",
+                    "participates_lpp": True,
+                    "lpp_share_pct": 100,
+                }
+            },
+        )
+        assert response.status_code == 200
+
+        response = client.post(
+            "/api/v1/eebus/load-power-limits/distribute",
+            json={
+                "use_case": "lpp",
+                "limit_watts": 2000,
+                "duration_seconds": 600,
+                "source": "test",
+                "peer_ski": "f819e215a4f292d803325276767d9e27f67fe108",
+            },
+        )
+
+    assert response.status_code == 200
+    participant = response.json()["constraint_distribution"]["participants"][0]
+    assert participant["device_id"] == "dev-pv-native"
+    assert participant["control_path"] == "sunspec_immediate_wmax_pct"
+    assert participant["delivery_status"] == "acknowledged"
+    assert participant["delivery_detail"] == "Applied Fronius SunSpec active-power limit."
+
+    session_factory = get_session_factory()
+    with session_factory() as session:
+        delivery = session.scalar(select(HemsLoadControlDelivery).where(HemsLoadControlDelivery.target_device_id == "dev-pv-native"))
+        assert delivery is not None
+        assert delivery.status == "acknowledged"
 
 
 def test_eebus_runtime_extracts_incoming_lpc_write_from_ship_trace_payload():

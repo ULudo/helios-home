@@ -8,6 +8,7 @@ SUPPORTED_NATIVE_WRITE_PROFILES = frozenset(
         "tasmota_http_power",
         "sunspec_storage_basic_rate",
         "sunspec_der_wmax_pct",
+        "sunspec_immediate_wmax_pct",
     }
 )
 

@@ -588,6 +588,121 @@ class SunSpecDerWMaxAdapter:
         )
 
 
+class SunSpecImmediateWMaxAdapter:
+    adapter_name = "sunspec_immediate_wmax_pct"
+
+    def supports(self, target: DispatchTarget, interval: PlannedInterval) -> bool:
+        return target.evidence.get("dispatch_profile") == self.adapter_name
+
+    def apply(self, target: DispatchTarget, interval: PlannedInterval) -> DispatchOutcome:
+        desired_power_kw = _coerce_numeric_command(interval)
+        if desired_power_kw is None:
+            return DispatchOutcome(
+                status=HemsDispatchStatus.FAILED.value,
+                requested_command=interval.command,
+                applied_command={},
+                summary="The SunSpec immediate-control adapter requires a numeric power command.",
+                details={"adapter": self.adapter_name},
+            )
+
+        evidence = target.evidence
+        host = str(evidence.get("modbus_host", "")).strip()
+        unit_id = int(evidence.get("modbus_unit_id", 0))
+        model_block = get_sunspec_model_block(evidence.get("sunspec_model_blocks"), int(evidence.get("dispatch_model_id", 123)))
+        timeout = get_settings().write_http_timeout_seconds
+        if not host or unit_id < 0 or model_block is None:
+            return DispatchOutcome(
+                status=HemsDispatchStatus.FAILED.value,
+                requested_command=interval.command,
+                applied_command={},
+                summary="The SunSpec immediate-control adapter is missing validated control-model metadata.",
+                details={"adapter": self.adapter_name},
+            )
+
+        power_rating_kw = float(
+            target.canonical_asset.constraints.get("power_rating_kw")
+            or target.canonical_asset.telemetry.get("power_rating_kw")
+            or 0.0
+        )
+        if power_rating_kw <= 0.0:
+            return DispatchOutcome(
+                status=HemsDispatchStatus.FAILED.value,
+                requested_command=interval.command,
+                applied_command={},
+                summary="The SunSpec immediate-control adapter is missing the inverter power rating.",
+                details={"adapter": self.adapter_name},
+            )
+
+        current_values = read_sunspec_model_values(host, unit_id, model_block, timeout)
+        if current_values is None:
+            return DispatchOutcome(
+                status=HemsDispatchStatus.FAILED.value,
+                requested_command=interval.command,
+                applied_command={},
+                summary="The SunSpec immediate-control adapter could not read the current control model values.",
+                details={"adapter": self.adapter_name, "host": host, "unit_id": unit_id},
+            )
+
+        desired_limit_pct = min(100.0, max(0.0, desired_power_kw / power_rating_kw * 100.0))
+        try:
+            success = write_sunspec_model_points(
+                host,
+                unit_id,
+                model_block,
+                current_values,
+                {
+                    "WMaxLimPct": desired_limit_pct,
+                    "WMaxLimPct_WinTms": 0,
+                    "WMaxLimPct_RvrtTms": 0,
+                    "WMaxLimPct_RmpTms": 0,
+                    "WMaxLim_Ena": 1,
+                },
+                timeout,
+            )
+        except ModbusSourceError as exc:
+            return DispatchOutcome(
+                status=HemsDispatchStatus.FAILED.value,
+                requested_command=interval.command,
+                applied_command={},
+                summary=f"SunSpec immediate-control write failed: {exc}",
+                details={"adapter": self.adapter_name, "host": host, "unit_id": unit_id},
+            )
+
+        if not success:
+            return DispatchOutcome(
+                status=HemsDispatchStatus.FAILED.value,
+                requested_command=interval.command,
+                applied_command={},
+                summary="SunSpec immediate-control write did not receive a valid Modbus acknowledgement.",
+                details={"adapter": self.adapter_name, "host": host, "unit_id": unit_id},
+            )
+
+        applied_command = dict(interval.command)
+        _update_applied_state(
+            target,
+            applied_command=applied_command,
+            adapter_name=self.adapter_name,
+            extra_metrics={
+                "scheduled_power_kw": round(desired_power_kw, 4),
+                "curtailment_limit_pct": round(desired_limit_pct, 3),
+                "curtailment_enabled": True,
+            },
+        )
+        return DispatchOutcome(
+            status=HemsDispatchStatus.APPLIED.value,
+            requested_command=interval.command,
+            applied_command=applied_command,
+            summary="Applied the command through the SunSpec immediate active-power control profile.",
+            details={
+                "adapter": self.adapter_name,
+                "host": host,
+                "unit_id": unit_id,
+                "model_id": model_block.model_id,
+                "limit_pct": round(desired_limit_pct, 3),
+            },
+        )
+
+
 def resolve_write_adapter(session: Session, target: DispatchTarget, interval: PlannedInterval) -> WriteAdapter | None:
     settings = get_settings()
     adapters: list[WriteAdapter] = [TelemetrySimulationAdapter(session)]
@@ -597,6 +712,7 @@ def resolve_write_adapter(session: Session, target: DispatchTarget, interval: Pl
                 ShellyHttpRelayAdapter(),
                 SunSpecStorageRateAdapter(),
                 SunSpecDerWMaxAdapter(),
+                SunSpecImmediateWMaxAdapter(),
                 TasmotaHttpPowerAdapter(),
             ]
         )

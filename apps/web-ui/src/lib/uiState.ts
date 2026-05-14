@@ -6,15 +6,6 @@ export type ExplanationCard = {
   severity: "info" | "caution" | "critical";
 } | null;
 
-export type ActiveTaskHint = {
-  taskRef: string;
-  mode: "progress" | "blockers" | "summary";
-  title: string;
-  status: string;
-  summary: string;
-  blockers: Array<Record<string, unknown>>;
-} | null;
-
 export type UIState = {
   currentView: ViewKey;
   navigationMode: NavigationMode | null;
@@ -27,7 +18,6 @@ export type UIState = {
     timeRange: TimeRange;
   };
   explanation: ExplanationCard;
-  activeTask: ActiveTaskHint;
   viewLock: boolean;
   lastAgentNavigationAt: string | null;
 };
@@ -40,17 +30,6 @@ type UIStateEffect =
   | {
       type: "show_monitoring";
       payload: { device_ids: string[]; metric_keys: string[]; time_range: TimeRange; mode?: NavigationMode };
-    }
-  | {
-      type: "show_task";
-      payload: {
-        task_ref: string;
-        mode?: "progress" | "blockers" | "summary";
-        title?: string;
-        status?: string;
-        summary?: string;
-        blockers?: Array<Record<string, unknown>>;
-      };
     }
   | { type: "clear_focus"; payload: Record<string, never> };
 
@@ -77,7 +56,6 @@ export function createInitialUIState(): UIState {
       timeRange: "last_24h",
     },
     explanation: null,
-    activeTask: null,
     viewLock: false,
     lastAgentNavigationAt: null,
   };
@@ -155,20 +133,6 @@ function applySingleUiAction(state: UIState, action: UIStateEffect, occurredAt: 
       nextState.currentView = "overview";
     }
     return nextState;
-  }
-
-  if (action.type === "show_task") {
-    return {
-      ...state,
-      activeTask: {
-        taskRef: action.payload.task_ref,
-        mode: action.payload.mode ?? "summary",
-        title: action.payload.title ?? "",
-        status: action.payload.status ?? "",
-        summary: action.payload.summary ?? "",
-        blockers: action.payload.blockers ?? [],
-      },
-    };
   }
 
   if (action.type === "clear_focus") {
@@ -293,9 +257,6 @@ function uiEventToActions(event: AgentUiEvent): UIStateEffect[] {
         ]
       : [];
   }
-  if (event.event_type === "task.show") {
-    return [{ type: "show_task", payload: event.payload }];
-  }
   return [];
 }
 
@@ -315,7 +276,6 @@ export function parseUiEvents(input: unknown): UIStateEffect[] {
         eventType === "device.details.open" ||
         eventType === "connection.overlay.open" ||
         eventType === "entity.relationship.show" ||
-        eventType === "task.show" ||
         eventType === "proposal.present" ||
         eventType === "evidence.recorded" ||
         eventType === "assessment.show"

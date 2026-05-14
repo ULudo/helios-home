@@ -60,40 +60,12 @@ class ActionProposalRead(BaseModel):
     resolved_at: datetime | None = None
 
 
-class AgentBlockerRead(BaseModel):
-    id: str
-    task_id: str | None = None
-    subject_ref: str = ""
-    blocker_type: str
-    summary: str
-    status: str
-    details: dict[str, Any] = Field(default_factory=dict)
-    created_at: datetime
-    resolved_at: datetime | None = None
-
-
-class AgentTaskRead(BaseModel):
-    id: str
-    task_type: str
-    title: str
-    goal: str
-    status: str
-    target_refs: list[str] = Field(default_factory=list)
-    context: dict[str, Any] = Field(default_factory=dict)
-    blockers: list[AgentBlockerRead] = Field(default_factory=list)
-    created_at: datetime
-    updated_at: datetime
-    completed_at: datetime | None = None
-
-
 class AgentThreadRead(BaseModel):
     id: str
     title: str
     status: str
     messages: list[AgentMessageRead] = Field(default_factory=list)
     pending_proposals: list[ActionProposalRead] = Field(default_factory=list)
-    active_tasks: list[AgentTaskRead] = Field(default_factory=list)
-    open_blockers: list[AgentBlockerRead] = Field(default_factory=list)
     setup_profile: SiteSetupProfileRead
     latest_debug_case: DebugCaseRead | None = None
     created_at: datetime

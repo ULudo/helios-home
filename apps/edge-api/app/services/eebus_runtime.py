@@ -16,8 +16,15 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import Settings
-from app.db.models import Blocker, ProtocolDiagnosticRun, ProtocolEndpoint, utcnow
-from app.hems.load_control import update_load_control_delivery_status
+from app.db.models import (
+    Blocker,
+    HemsLoadControlDelivery,
+    HemsLoadControlLimit,
+    ProtocolDiagnosticRun,
+    ProtocolEndpoint,
+    utcnow,
+)
+from app.hems.load_control import is_transient_load_control_delivery_error, update_load_control_delivery_status
 from app.hems.schemas import EebusLoadPowerLimitCreate
 from app.services.eebus import distribute_load_power_limit
 from app.services.eebus_identity import materialize_eebus_identity
@@ -381,9 +388,11 @@ class EebusRuntimeManager:
                     {
                         "status": "ready",
                         "peer_ski": peer_ski,
+                        "error": None,
                     },
                 )
         self.record_event("ship_ready", payload)
+        self._schedule_pending_load_control_retry(peer_ski)
 
     def mark_outbound_connecting(self, peer: EebusRuntimePeer) -> None:
         with self._lock:
@@ -439,6 +448,7 @@ class EebusRuntimeManager:
                     "server_name": peer.server_name or peer.host,
                     "peer_ski": peer_ski,
                     "remote_ship_id": remote_ship_id,
+                    "error": None,
                 },
             )
         self.record_event(
@@ -455,6 +465,7 @@ class EebusRuntimeManager:
                 "connection_direction": "outbound_to_peer",
             },
         )
+        self._schedule_pending_load_control_retry(peer_ski)
 
     def mark_outbound_failed(self, peer: EebusRuntimePeer, error: str) -> None:
         with self._lock:
@@ -499,11 +510,15 @@ class EebusRuntimeManager:
 
     def mark_closed(self, error: str, *, endpoint_ref: str = "", direction: str = "") -> None:
         with self._lock:
-            if self._snapshot.status != "failed":
-                self._snapshot.status = "closed"
-                self._snapshot.error = error
             if endpoint_ref and direction:
                 self._set_connection_state_locked(endpoint_ref, direction, {"status": "closed", "error": error})
+            self._recompute_ready_peer_skis_locked()
+            if self._ready_peer_skis:
+                self._snapshot.status = "ship_ready"
+                self._snapshot.error = ""
+            elif self._snapshot.status != "failed":
+                self._snapshot.status = "closed"
+                self._snapshot.error = error
 
     def record_load_power_limit(self, payload: dict[str, Any]) -> None:
         with self._lock:
@@ -523,6 +538,19 @@ class EebusRuntimeManager:
             return
         future = asyncio.run_coroutine_threadsafe(self._forward_load_power_limit_async(distribution), loop)
         future.add_done_callback(self._handle_forwarding_future)
+
+    def _schedule_pending_load_control_retry(self, peer_ski: str) -> None:
+        normalized_peer_ski = _normalize_ski(peer_ski)
+        if not normalized_peer_ski:
+            return
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return
+
+        def schedule() -> None:
+            asyncio.create_task(self._retry_pending_load_control_deliveries(normalized_peer_ski))
+
+        loop.call_soon_threadsafe(schedule)
 
     def disconnect_endpoint(self, endpoint_ref: str) -> None:
         with self._lock:
@@ -660,6 +688,7 @@ class EebusRuntimeManager:
                     "server_name": peer.server_name or peer.host,
                     "peer_ski": peer_ski,
                     "recovered_from_ready_peer_ski": True,
+                    "error": None,
                 },
             )
 
@@ -672,7 +701,11 @@ class EebusRuntimeManager:
             if isinstance(value, dict)
         }
         direction_state = dict(endpoint_state.get(direction, {}))
-        direction_state.update({key: value for key, value in updates.items() if value is not None})
+        for key, value in updates.items():
+            if value is None:
+                direction_state.pop(key, None)
+            else:
+                direction_state[key] = value
         endpoint_state[direction] = direction_state
         self._snapshot.connection_states[endpoint_ref] = endpoint_state
         active: set[str] = set()
@@ -927,6 +960,7 @@ class EebusRuntimeManager:
                     self._process_outbound_delivery_result(peer, event.payload)
                     trace_logger._process_incoming_spine_payload(datagram_payload)
                     await client.handle_incoming_datagram(event.payload)
+                    self._schedule_pending_load_control_retry(peer.certificate_ski)
                     self.record_event(
                         "outbound_datagram_handled",
                         {
@@ -998,22 +1032,89 @@ class EebusRuntimeManager:
                     is_active=bool(distribution.get("is_active", True)),
                 )
             except Exception as exc:
+                error = str(exc)
+                transient = is_transient_load_control_delivery_error(error)
                 self._update_delivery(
                     delivery_id,
-                    status="failed",
-                    detail="EEBUS delivery failed.",
-                    error=str(exc),
-                    raw_update={"participant": participant},
+                    status="pending" if transient else "failed",
+                    detail="Waiting for EEBUS LoadControl path." if transient else "EEBUS delivery failed.",
+                    error="" if transient else error,
+                    raw_update={"participant": participant, "error": error, "transient": transient},
                 )
                 self.record_event(
-                    "load_power_forwarding_failed",
+                    "load_power_forwarding_pending" if transient else "load_power_forwarding_failed",
                     {
                         "delivery_id": delivery_id,
                         "peer_ski": peer_ski,
                         "endpoint_ref": endpoint_ref,
-                        "error": str(exc),
+                        "error": error,
                     },
-                    level="error",
+                    level="warning" if transient else "error",
+                )
+
+    async def _retry_pending_load_control_deliveries(self, peer_ski: str) -> None:
+        session_factory = self._session_factory
+        if session_factory is None:
+            return
+        normalized_peer_ski = _normalize_ski(peer_ski)
+        if not normalized_peer_ski:
+            return
+        now = utcnow()
+        pending: list[dict[str, Any]] = []
+        with session_factory() as session:
+            deliveries = session.scalars(
+                select(HemsLoadControlDelivery).where(
+                    HemsLoadControlDelivery.target_peer_ski == normalized_peer_ski,
+                    HemsLoadControlDelivery.status.in_(["pending", "failed"]),
+                    HemsLoadControlDelivery.is_active.is_(True),
+                )
+            ).all()
+            for delivery in deliveries:
+                if delivery.status == "failed" and not is_transient_load_control_delivery_error(delivery.last_error):
+                    continue
+                constraint = session.get(HemsLoadControlLimit, delivery.constraint_id)
+                if constraint is None or not constraint.is_active:
+                    continue
+                comparable_now = now
+                if constraint.expires_at is not None and constraint.expires_at.tzinfo is None:
+                    comparable_now = comparable_now.replace(tzinfo=None)
+                if constraint.expires_at is not None and constraint.expires_at <= comparable_now:
+                    continue
+                if delivery.allocated_limit_watts <= 0:
+                    continue
+                pending.append(
+                    {
+                        "delivery_id": delivery.id,
+                        "endpoint_ref": delivery.target_endpoint_ref,
+                        "peer_ski": delivery.target_peer_ski,
+                        "watts": delivery.allocated_limit_watts,
+                        "duration_seconds": delivery.duration_seconds,
+                        "limit_id": delivery.limit_id,
+                        "is_active": delivery.is_active,
+                    }
+                )
+        for delivery in pending:
+            try:
+                await self._send_load_power_limit_to_peer(**delivery)
+            except Exception as exc:
+                error = str(exc)
+                transient = is_transient_load_control_delivery_error(error)
+                self._update_delivery(
+                    str(delivery["delivery_id"]),
+                    status="pending" if transient else "failed",
+                    detail="Waiting for EEBUS LoadControl path." if transient else "EEBUS delivery failed.",
+                    error="" if transient else error,
+                    raw_update={"retry": True, "error": error, "transient": transient},
+                )
+                self.record_event(
+                    "load_power_retry_pending" if transient else "load_power_retry_failed",
+                    {
+                        "delivery_id": delivery["delivery_id"],
+                        "peer_ski": delivery["peer_ski"],
+                        "endpoint_ref": delivery["endpoint_ref"],
+                        "error": error,
+                    },
+                    level="warning" if transient else "error",
                 )
 
     async def _send_load_power_limit_to_peer(

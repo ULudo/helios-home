@@ -19,9 +19,11 @@ SUNSPEC_BASE_ADDRESSES = (40000, 39999)
 SUNSPEC_INVERTER_MODELS = {101, 102, 103}
 SUNSPEC_METER_MODELS = {201, 202, 203, 204, 211, 212, 213}
 SUNSPEC_STORAGE_MODELS = {124, 713}
+SUNSPEC_NAMEPLATE_MODELS = {120}
 SUNSPEC_GENERIC_DER_MODELS = {701}
 SUNSPEC_DER_CAPACITY_MODELS = {702}
 SUNSPEC_DER_CONTROL_MODELS = {704}
+SUNSPEC_IMMEDIATE_CONTROL_MODELS = {123}
 SUNSPEC_TERMINATOR_IDS = {0x0000, 0xFFFF}
 
 
@@ -317,6 +319,14 @@ STORAGE_CAPACITY_POINTS = [
     _point("Pct_SF", "sunssf"),
 ]
 
+DER_NAMEPLATE_POINTS = [
+    _point("ID", "uint16"),
+    _point("L", "uint16"),
+    _point("DERTyp", "enum16"),
+    _point("WRtg", "uint16", scale_factor="WRtg_SF"),
+    _point("WRtg_SF", "sunssf"),
+]
+
 DER_CAPACITY_POINTS = [
     _point("ID", "uint16"),
     _point("L", "uint16"),
@@ -369,6 +379,35 @@ DER_CAPACITY_POINTS = [
     _point("V_SF", "sunssf"),
     _point("A_SF", "sunssf"),
     _point("S_SF", "sunssf"),
+]
+
+IMMEDIATE_CONTROL_POINTS = [
+    _point("ID", "uint16"),
+    _point("L", "uint16"),
+    _point("Conn_WinTms", "uint16"),
+    _point("Conn_RvrtTms", "uint16"),
+    _point("Conn", "enum16"),
+    _point("WMaxLimPct", "uint16", scale_factor="WMaxLimPct_SF"),
+    _point("WMaxLimPct_WinTms", "uint16"),
+    _point("WMaxLimPct_RvrtTms", "uint16"),
+    _point("WMaxLimPct_RmpTms", "uint16"),
+    _point("WMaxLim_Ena", "enum16"),
+    _point("OutPFSet", "uint16", scale_factor="OutPFSet_SF"),
+    _point("OutPFSet_WinTms", "uint16"),
+    _point("OutPFSet_RvrtTms", "uint16"),
+    _point("OutPFSet_RmpTms", "uint16"),
+    _point("OutPFSet_Ena", "enum16"),
+    _point("VArWMaxPct", "int16", scale_factor="VArPct_SF"),
+    _point("VArMaxPct", "int16", scale_factor="VArPct_SF"),
+    _point("VArAvalPct", "int16", scale_factor="VArPct_SF"),
+    _point("VArPct_WinTms", "uint16"),
+    _point("VArPct_RvrtTms", "uint16"),
+    _point("VArPct_RmpTms", "uint16"),
+    _point("VArPct_Mod", "enum16"),
+    _point("Conn_RmpTms", "uint16"),
+    _point("WMaxLimPct_SF", "sunssf"),
+    _point("OutPFSet_SF", "sunssf"),
+    _point("VArPct_SF", "sunssf"),
 ]
 
 DER_CONTROL_POINTS = [
@@ -431,6 +470,8 @@ MODEL_POINT_DEFINITIONS: dict[int, list[SunSpecPoint]] = {
     101: INVERTER_POINTS,
     102: INVERTER_POINTS,
     103: INVERTER_POINTS,
+    120: DER_NAMEPLATE_POINTS,
+    123: IMMEDIATE_CONTROL_POINTS,
     124: STORAGE_BASIC_POINTS,
     201: METER_SCALED_POINTS,
     202: METER_SCALED_POINTS,
@@ -996,6 +1037,14 @@ def _extract_storage_capacity_telemetry(values: dict[str, Any]) -> dict[str, Any
     return telemetry
 
 
+def _extract_der_nameplate_telemetry(values: dict[str, Any]) -> dict[str, Any]:
+    telemetry: dict[str, Any] = {}
+    _set_metric(telemetry, "power_rating_kw", None if (value := _metric_with_sf(values, "WRtg", "WRtg_SF")) is None else value / 1000.0)
+    if values.get("DERTyp") is not None:
+        telemetry["der_type_code"] = values["DERTyp"]
+    return telemetry
+
+
 def _extract_der_capacity_telemetry(values: dict[str, Any]) -> dict[str, Any]:
     telemetry: dict[str, Any] = {}
     _set_metric(telemetry, "power_rating_kw", None if (value := _metric_with_sf(values, "WMax", "W_SF")) is None else value / 1000.0)
@@ -1014,6 +1063,16 @@ def _extract_der_capacity_telemetry(values: dict[str, Any]) -> dict[str, Any]:
     return telemetry
 
 
+def _extract_immediate_control_telemetry(values: dict[str, Any]) -> dict[str, Any]:
+    telemetry: dict[str, Any] = {"curtailment_supported": True}
+    _set_metric(telemetry, "curtailment_limit_pct", _metric_with_sf(values, "WMaxLimPct", "WMaxLimPct_SF"))
+    if values.get("WMaxLim_Ena") is not None:
+        telemetry["curtailment_enabled"] = values["WMaxLim_Ena"] == 1
+    if values.get("Conn") is not None:
+        telemetry["immediate_control_connection_code"] = values["Conn"]
+    return telemetry
+
+
 def _extract_der_control_telemetry(values: dict[str, Any]) -> dict[str, Any]:
     telemetry: dict[str, Any] = {"curtailment_supported": True}
     _set_metric(telemetry, "curtailment_limit_pct", _metric_with_sf(values, "WMaxLimPct", "WMaxLimPct_SF"))
@@ -1026,6 +1085,8 @@ MODEL_TELEMETRY_EXTRACTORS = {
     101: _extract_inverter_telemetry,
     102: _extract_inverter_telemetry,
     103: _extract_inverter_telemetry,
+    120: _extract_der_nameplate_telemetry,
+    123: _extract_immediate_control_telemetry,
     124: _extract_storage_basic_telemetry,
     201: _extract_meter_scaled_telemetry,
     202: _extract_meter_scaled_telemetry,
@@ -1204,14 +1265,29 @@ def probe_modbus_host(host: str, timeout_seconds: float) -> ModbusProbeResult | 
     return None
 
 
+def dispatch_profile_for_modbus_probe(probe: ModbusProbeResult) -> tuple[str, int | None]:
+    telemetry = probe.telemetry or {}
+    model_ids = set(probe.sunspec_model_ids)
+    if 704 in model_ids and telemetry.get("power_rating_kw") is not None:
+        return ("sunspec_der_wmax_pct", 704)
+    if 123 in model_ids and telemetry.get("power_rating_kw") is not None:
+        return ("sunspec_immediate_wmax_pct", 123)
+    if 124 in model_ids and any(
+        telemetry.get(key) is not None
+        for key in ("soc_pct", "max_charge_power_kw", "charge_rate_pct", "discharge_rate_pct")
+    ):
+        return ("sunspec_storage_basic_rate", 124)
+    return ("", None)
+
+
 def _classify_probe_result(probe: ModbusProbeResult) -> tuple[str, float, str]:
     telemetry = probe.telemetry or {}
-    if any(model_id in SUNSPEC_STORAGE_MODELS for model_id in probe.sunspec_model_ids) or "soc_pct" in telemetry:
-        return ("battery", 0.9, "SunSpec storage telemetry exposed state-of-charge or storage capacity metrics.")
     if any(model_id in SUNSPEC_METER_MODELS for model_id in probe.sunspec_model_ids) or "grid_power_kw" in telemetry:
         return ("grid_meter", 0.9, "SunSpec meter telemetry exposed grid power and energy counters.")
     if any(model_id in SUNSPEC_INVERTER_MODELS for model_id in probe.sunspec_model_ids):
         return ("pv_inverter", 0.9, "SunSpec inverter telemetry exposed production-side AC and DC metrics.")
+    if any(model_id in SUNSPEC_STORAGE_MODELS for model_id in probe.sunspec_model_ids) or "soc_pct" in telemetry:
+        return ("battery", 0.9, "SunSpec storage telemetry exposed state-of-charge or storage capacity metrics.")
 
     haystack = _combined_text(
         probe.vendor_name,
@@ -1293,20 +1369,17 @@ def build_candidate_from_modbus_probe(probe: ModbusProbeResult) -> RawCandidate:
         "controllable": False,
         "optimizable": False,
     }
-    if device_type == "battery" and 124 in probe.sunspec_model_ids and monitorable:
-        evidence["dispatch_profile"] = "sunspec_storage_basic_rate"
-        evidence["dispatch_model_id"] = 124
+    dispatch_profile, dispatch_model_id = dispatch_profile_for_modbus_probe(probe)
+    if dispatch_profile and dispatch_model_id is not None:
+        evidence["dispatch_profile"] = dispatch_profile
+        evidence["dispatch_model_id"] = dispatch_model_id
         evidence["dispatch_capabilities"] = ["set_power_kw"]
         capabilities_hint["controllable"] = True
         capabilities_hint["optimizable"] = True
-        telemetry["storage_rate_control_supported"] = True
-    elif device_type == "pv_inverter" and 704 in probe.sunspec_model_ids and telemetry.get("power_rating_kw") is not None:
-        evidence["dispatch_profile"] = "sunspec_der_wmax_pct"
-        evidence["dispatch_model_id"] = 704
-        evidence["dispatch_capabilities"] = ["set_power_kw"]
-        capabilities_hint["controllable"] = True
-        capabilities_hint["optimizable"] = True
-        telemetry["curtailment_supported"] = True
+        if dispatch_profile == "sunspec_storage_basic_rate":
+            telemetry["storage_rate_control_supported"] = True
+        elif dispatch_profile in {"sunspec_der_wmax_pct", "sunspec_immediate_wmax_pct"}:
+            telemetry["curtailment_supported"] = True
 
     return RawCandidate(
         candidate_id=f"cand-modbus-{_slugify(probe.host)}-u{probe.unit_id}",
@@ -1374,5 +1447,53 @@ def discover_modbus_site(
         source_name="modbus_live",
         status="completed",
         message="Modbus discovery completed, but no native Modbus/TCP devices exposed a usable identity or SunSpec signature.",
+        candidates=[],
+    )
+
+
+def discover_modbus_hosts(hosts: list[str], timeout_seconds: float = 1.0) -> ModbusDiscoveryBatch:
+    unique_hosts: list[str] = []
+    for host in hosts:
+        host = str(host).strip()
+        if host and host not in unique_hosts:
+            unique_hosts.append(host)
+
+    candidates: list[RawCandidate] = []
+    failed_hosts: list[str] = []
+    for host in unique_hosts:
+        try:
+            probe = probe_modbus_host(host, timeout_seconds)
+        except (OSError, RuntimeError, ModbusSourceError):
+            failed_hosts.append(host)
+            continue
+        if probe is not None:
+            candidates.append(build_candidate_from_modbus_probe(probe))
+
+    if candidates:
+        monitorable_count = sum(1 for candidate in candidates if candidate.capabilities_hint.get("monitorable"))
+        message = (
+            f"Imported {len(candidates)} candidates from targeted Modbus/TCP probing of known local hosts; "
+            f"{monitorable_count} exposed standardized SunSpec telemetry."
+        )
+        if failed_hosts:
+            message = f"{message} {len(failed_hosts)} host(s) could not be probed."
+        return ModbusDiscoveryBatch(
+            source_name="modbus_live",
+            status="completed",
+            message=message,
+            candidates=sorted(candidates, key=lambda candidate: candidate.display_name.lower()),
+        )
+
+    if failed_hosts and len(failed_hosts) == len(unique_hosts):
+        return ModbusDiscoveryBatch(
+            source_name="modbus_live",
+            status="failed",
+            message=f"Targeted Modbus/TCP probing failed for {len(failed_hosts)} known local host(s).",
+            candidates=[],
+        )
+    return ModbusDiscoveryBatch(
+        source_name="modbus_live",
+        status="completed",
+        message="Targeted Modbus/TCP probing found no usable SunSpec endpoints on known local hosts.",
         candidates=[],
     )

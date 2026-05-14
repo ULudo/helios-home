@@ -18,12 +18,34 @@ from app.db.models import (
     Site,
     utcnow,
 )
+from app.domain.enums import HemsDispatchStatus
 from app.domain.schemas import LoadControlConstraintRead, LoadControlParticipantRead, OverviewLoadControlRead
 from app.hems.schemas import HemsLoadControlDeviceConfigRead, HemsLoadControlDeviceConfigUpdate
 
 
 LPC_USE_CASE = "limitationOfPowerConsumption"
 LPP_USE_CASE = "limitationOfPowerProduction"
+
+TRANSIENT_EEBUS_DELIVERY_ERROR_FRAGMENTS = (
+    "has not completed loadcontrol discovery yet",
+    "is not currently connected",
+    "peer ended ship session",
+    "websocket closed by remote: code=4200",
+    "reason='shutdown'",
+)
+
+
+def is_transient_load_control_delivery_error(error: str) -> bool:
+    normalized = (error or "").strip().lower()
+    return bool(normalized) and any(fragment in normalized for fragment in TRANSIENT_EEBUS_DELIVERY_ERROR_FRAGMENTS)
+
+
+def load_control_delivery_status_for_display(delivery: HemsLoadControlDelivery | None) -> tuple[str, str]:
+    if delivery is None:
+        return "", ""
+    if delivery.status == "failed" and is_transient_load_control_delivery_error(delivery.last_error):
+        return "pending", "Waiting for EEBUS LoadControl path."
+    return delivery.status, delivery.detail
 
 
 def _get_site(session: Session) -> Site:
@@ -167,6 +189,7 @@ def create_load_control_deliveries(
         if not device_id:
             continue
         allocated_limit_watts = int(participant.get("allocated_limit_watts") or 0)
+        control_path = str(participant.get("control_path") or "")
         target_endpoint_ref = str(participant.get("target_endpoint_ref") or "")
         target_peer_ski = str(participant.get("target_peer_ski") or "").strip().lower()
         if allocated_limit_watts <= 0:
@@ -175,9 +198,12 @@ def create_load_control_deliveries(
         elif target_endpoint_ref and target_peer_ski:
             status = "pending"
             detail = "Allocated and waiting for EEBUS delivery."
+        elif target_endpoint_ref and control_path:
+            status = "pending"
+            detail = "Allocated and waiting for native HEMS dispatch."
         else:
             status = "not_deliverable"
-            detail = "Allocated locally, but no EEBUS control endpoint is configured for this participant."
+            detail = "Allocated locally, but no validated control endpoint is configured for this participant."
         delivery = HemsLoadControlDelivery(
             id=f"load-control-delivery-{uuid4().hex[:12]}",
             site_id=limit.site_id,
@@ -214,6 +240,80 @@ def create_load_control_deliveries(
     return deliveries
 
 
+def attach_delivery_state_to_distribution(
+    distribution: dict[str, Any],
+    deliveries: list[HemsLoadControlDelivery],
+) -> None:
+    deliveries_by_device = {delivery.target_device_id: delivery for delivery in deliveries}
+    for participant in distribution.get("participants", []):
+        if not isinstance(participant, dict):
+            continue
+        delivery = deliveries_by_device.get(str(participant.get("device_id") or ""))
+        if delivery is None:
+            continue
+        status, detail = load_control_delivery_status_for_display(delivery)
+        participant.update(
+            {
+                "delivery_id": delivery.id,
+                "delivery_status": status,
+                "delivery_detail": detail,
+                "delivery_updated_at": delivery.updated_at.isoformat() if delivery.updated_at else None,
+            }
+        )
+
+
+def update_native_delivery_statuses_from_plan(
+    session: Session,
+    deliveries: list[HemsLoadControlDelivery],
+    plan: Any,
+) -> None:
+    dispatch_events = list(getattr(plan, "dispatch_events", []) or [])
+    latest_event_by_device: dict[str, Any] = {}
+    for event in dispatch_events:
+        device_id = str(getattr(event, "device_id", "") or "")
+        if device_id:
+            latest_event_by_device[device_id] = event
+
+    for delivery in deliveries:
+        raw = delivery.raw if isinstance(delivery.raw, dict) else {}
+        participant = raw.get("participant") if isinstance(raw.get("participant"), dict) else {}
+        if delivery.target_peer_ski or participant.get("control_path") == "eebus_spine":
+            continue
+        if delivery.status != "pending":
+            continue
+        event = latest_event_by_device.get(delivery.target_device_id)
+        if event is None:
+            continue
+        event_status = str(getattr(event, "status", "") or "")
+        summary = str(getattr(event, "summary", "") or "")
+        details = getattr(event, "details", {}) if isinstance(getattr(event, "details", {}), dict) else {}
+        if event_status in {HemsDispatchStatus.APPLIED.value, HemsDispatchStatus.SIMULATED.value}:
+            update_load_control_delivery_status(
+                session,
+                delivery.id,
+                status="acknowledged",
+                detail=summary or "Native HEMS dispatch applied the allocation.",
+                raw_update={"dispatch_event": details, "dispatch_status": event_status},
+            )
+        elif event_status in {HemsDispatchStatus.FAILED.value, HemsDispatchStatus.BLOCKED.value}:
+            update_load_control_delivery_status(
+                session,
+                delivery.id,
+                status="failed",
+                detail=summary or "Native HEMS dispatch could not apply the allocation.",
+                error=summary,
+                raw_update={"dispatch_event": details, "dispatch_status": event_status},
+            )
+        elif event_status == HemsDispatchStatus.SKIPPED.value:
+            update_load_control_delivery_status(
+                session,
+                delivery.id,
+                status="not_deliverable",
+                detail=summary or "Native HEMS dispatch skipped the allocation.",
+                raw_update={"dispatch_event": details, "dispatch_status": event_status},
+            )
+
+
 def update_load_control_delivery_status(
     session: Session,
     delivery_id: str,
@@ -232,6 +332,8 @@ def update_load_control_delivery_status(
         delivery.detail = detail
     if error:
         delivery.last_error = error
+    elif status in {"pending", "sent", "acknowledged", "readback_confirmed"}:
+        delivery.last_error = ""
     delivery.updated_at = now
     if status in {"sent", "acknowledged", "readback_confirmed"} and delivery.sent_at is None:
         delivery.sent_at = now
@@ -344,12 +446,22 @@ def build_constraint_distribution(
         share = max(0.0, float(getattr(config, share_field) or 0.0))
         normalized = share / total_share if total_share > 0 else 0.0
         capabilities = device.capabilities if device is not None else {}
-        native_control_available = bool(capabilities.get("controllable")) if isinstance(capabilities, dict) else False
         eebus_endpoint = _load_control_eebus_endpoint(session, config.device_id)
         target_peer_ski = _endpoint_peer_ski(eebus_endpoint)
         eebus_control_available = eebus_endpoint is not None and bool(target_peer_ski)
+        native_endpoint = _load_control_native_endpoint(session, config.device_id)
+        native_control_available = (
+            bool(capabilities.get("controllable"))
+            if isinstance(capabilities, dict)
+            else False
+        ) and native_endpoint is not None
         control_available = native_control_available or eebus_control_available
-        control_path = "eebus_spine" if eebus_control_available else "native" if native_control_available else ""
+        target_endpoint = eebus_endpoint if eebus_control_available else native_endpoint if native_control_available else None
+        control_path = (
+            "eebus_spine"
+            if eebus_control_available
+            else _native_control_path(native_endpoint) if native_control_available else ""
+        )
         rows.append(
             {
                 "device_id": config.device_id,
@@ -359,7 +471,7 @@ def build_constraint_distribution(
                 "allocated_limit_watts": int(round(limit_watts * normalized)) if normalized else 0,
                 "control_available": control_available,
                 "control_path": control_path,
-                "target_endpoint_ref": eebus_endpoint.id if eebus_endpoint is not None else "",
+                "target_endpoint_ref": target_endpoint.id if target_endpoint is not None else "",
                 "target_peer_ski": target_peer_ski,
                 "status": "delivery_ready" if eebus_control_available else "dispatchable" if native_control_available else "configured_no_control_path",
             }
@@ -385,6 +497,29 @@ def _load_control_eebus_endpoint(session: Session, device_id: str) -> ProtocolEn
         .order_by(ProtocolEndpoint.updated_at.desc())
         .limit(1)
     )
+
+
+def _load_control_native_endpoint(session: Session, device_id: str) -> ProtocolEndpoint | None:
+    return session.scalar(
+        select(ProtocolEndpoint)
+        .where(
+            ProtocolEndpoint.owner_ref == f"device:{device_id}",
+            ProtocolEndpoint.protocol.in_(["modbus_tcp", "http_local"]),
+            ProtocolEndpoint.status == "connected",
+        )
+        .order_by(ProtocolEndpoint.updated_at.desc())
+        .limit(1)
+    )
+
+
+def _native_control_path(endpoint: ProtocolEndpoint | None) -> str:
+    if endpoint is None:
+        return ""
+    properties = endpoint.properties if isinstance(endpoint.properties, dict) else {}
+    dispatch_profile = str(properties.get("dispatch_profile") or "").strip()
+    if dispatch_profile:
+        return dispatch_profile
+    return "native"
 
 
 def _endpoint_peer_ski(endpoint: ProtocolEndpoint | None) -> str:
@@ -417,6 +552,9 @@ def build_load_control_overview(session: Session, *, site_id: int) -> OverviewLo
             delivery.target_device_id: delivery
             for delivery in load_control_deliveries_for_constraint(session, limit.id)
         }
+        def delivery_status(device_id: str) -> tuple[str, str]:
+            return load_control_delivery_status_for_display(deliveries.get(device_id))
+
         constraints.append(
             LoadControlConstraintRead(
                 id=limit.id,
@@ -444,12 +582,8 @@ def build_load_control_overview(session: Session, *, site_id: int) -> OverviewLo
                         delivery_id=deliveries.get(str(row.get("device_id") or "")).id
                         if deliveries.get(str(row.get("device_id") or ""))
                         else "",
-                        delivery_status=deliveries.get(str(row.get("device_id") or "")).status
-                        if deliveries.get(str(row.get("device_id") or ""))
-                        else "",
-                        delivery_detail=deliveries.get(str(row.get("device_id") or "")).detail
-                        if deliveries.get(str(row.get("device_id") or ""))
-                        else "",
+                        delivery_status=delivery_status(str(row.get("device_id") or ""))[0],
+                        delivery_detail=delivery_status(str(row.get("device_id") or ""))[1],
                         delivery_updated_at=deliveries.get(str(row.get("device_id") or "")).updated_at
                         if deliveries.get(str(row.get("device_id") or ""))
                         else None,

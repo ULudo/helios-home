@@ -32,6 +32,17 @@ _ENDPOINT_RUNTIME_PROPERTY_KEYS = {
     "peer_certificate_pem",
     "peer_certificate_ski",
     "txt_ski_matches_certificate_ski",
+    "modbus_host",
+    "modbus_unit_id",
+    "sunspec_base_register",
+    "sunspec_model_ids",
+    "sunspec_model_blocks",
+    "dispatch_profile",
+    "last_telemetry_probe_at",
+    "last_telemetry_status",
+    "last_telemetry_source",
+    "last_telemetry_message",
+    "last_telemetry_keys",
 }
 
 _ENDPOINT_RUNTIME_TLS_PROBE_KEYS = {
@@ -170,6 +181,12 @@ def _first_int(*values: Any) -> int | None:
     return None
 
 
+def _source_evidence(evidence: dict, source_name: str) -> dict:
+    source_evidence = evidence.get("source_evidence") if isinstance(evidence.get("source_evidence"), dict) else {}
+    payload = source_evidence.get(source_name)
+    return payload if isinstance(payload, dict) else {}
+
+
 def _http_host_from_payload(evidence: dict, telemetry: dict) -> str:
     host = _first_string(evidence.get("http_host"), evidence.get("host"), telemetry.get("http_host"))
     if host:
@@ -287,16 +304,42 @@ def _endpoint_specs(
                 }
             )
         elif protocol == "modbus_tcp":
+            modbus_evidence = _source_evidence(evidence, "modbus_live")
             specs.append(
                 {
                     "protocol": protocol,
-                    "host": _first_string(evidence.get("modbus_host"), evidence.get("host")),
-                    "port": _first_int(evidence.get("modbus_port")) or 502,
-                    "service_name": "modbus_tcp",
+                    "host": _first_string(
+                        evidence.get("modbus_host"),
+                        modbus_evidence.get("modbus_host"),
+                        evidence.get("host"),
+                    ),
+                    "port": _first_int(evidence.get("modbus_port"), modbus_evidence.get("modbus_port")) or 502,
+                    "service_name": "sunspec_modbus",
                     "properties": {
-                        "unit_id": evidence.get("modbus_unit_id"),
-                        "sunspec_model_ids": evidence.get("sunspec_model_ids") if isinstance(evidence.get("sunspec_model_ids"), list) else [],
-                        "dispatch_profile": _first_string(evidence.get("dispatch_profile")),
+                        "modbus_host": _first_string(evidence.get("modbus_host"), modbus_evidence.get("modbus_host")),
+                        "unit_id": _first_int(evidence.get("modbus_unit_id"), modbus_evidence.get("modbus_unit_id")),
+                        "sunspec_base_register": _first_int(
+                            evidence.get("sunspec_base_register"),
+                            modbus_evidence.get("sunspec_base_register"),
+                        ),
+                        "sunspec_model_ids": (
+                            evidence.get("sunspec_model_ids")
+                            if isinstance(evidence.get("sunspec_model_ids"), list)
+                            else modbus_evidence.get("sunspec_model_ids")
+                            if isinstance(modbus_evidence.get("sunspec_model_ids"), list)
+                            else []
+                        ),
+                        "sunspec_model_blocks": (
+                            evidence.get("sunspec_model_blocks")
+                            if isinstance(evidence.get("sunspec_model_blocks"), list)
+                            else modbus_evidence.get("sunspec_model_blocks")
+                            if isinstance(modbus_evidence.get("sunspec_model_blocks"), list)
+                            else []
+                        ),
+                        "dispatch_profile": _first_string(
+                            evidence.get("dispatch_profile"),
+                            modbus_evidence.get("dispatch_profile"),
+                        ),
                     },
                 }
             )

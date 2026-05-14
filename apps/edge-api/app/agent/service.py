@@ -22,13 +22,11 @@ from app.agent.runtime import AgentRuntime
 from app.agent.schemas import (
     ActionProposalDecisionRead,
     ActionProposalRead,
-    AgentBlockerRead,
     AgentMessageCreate,
     AgentProviderConfigRead,
     AgentProviderConfigUpdate,
     AgentProviderOptionRead,
     AgentMessageRead,
-    AgentTaskRead,
     AgentThreadRead,
     AgentTurnAcceptedRead,
     AgentTurnEventRead,
@@ -40,9 +38,7 @@ from app.agent.schemas import (
 from app.agent.tools.registry import create_default_tool_registry
 from app.core.config import get_settings
 from app.db.models import (
-    AgentTask,
     Asset,
-    Blocker,
     ConversationEvent,
     ConversationMessage,
     ConversationThread,
@@ -230,76 +226,6 @@ def _latest_debug_case(session: Session) -> DebugCaseRead | None:
     return get_debug_case(session, debug_case.id)
 
 
-def _serialize_blocker(blocker: Blocker) -> AgentBlockerRead:
-    return AgentBlockerRead(
-        id=blocker.id,
-        task_id=blocker.task_id,
-        subject_ref=blocker.subject_ref,
-        blocker_type=blocker.blocker_type,
-        summary=blocker.summary or blocker.blocker_type,
-        status=blocker.status,
-        details=blocker.details or {},
-        created_at=blocker.created_at,
-        resolved_at=blocker.resolved_at,
-    )
-
-
-def _serialize_active_tasks(session: Session, site_id: int) -> list[AgentTaskRead]:
-    tasks = session.scalars(
-        select(AgentTask)
-        .where(
-            AgentTask.site_id == site_id,
-            AgentTask.status.in_(["open", "running", "blocked"]),
-        )
-        .order_by(AgentTask.updated_at.desc())
-        .limit(12)
-    ).all()
-    if not tasks:
-        return []
-    blockers = session.scalars(
-        select(Blocker)
-        .where(
-            Blocker.status == "open",
-        )
-        .order_by(Blocker.created_at.desc())
-        .limit(40)
-    ).all()
-    blockers_by_task: dict[str, list[Blocker]] = {}
-    for blocker in blockers:
-        if blocker.task_id:
-            blockers_by_task.setdefault(blocker.task_id, []).append(blocker)
-    return [
-        AgentTaskRead(
-            id=task.id,
-            task_type=task.task_type,
-            title=task.title,
-            goal=task.goal,
-            status=task.status,
-            target_refs=task.target_refs or [],
-            context=task.context or {},
-            blockers=[_serialize_blocker(blocker) for blocker in blockers_by_task.get(task.id, [])],
-            created_at=task.created_at,
-            updated_at=task.updated_at,
-            completed_at=task.completed_at,
-        )
-        for task in tasks
-    ]
-
-
-def _serialize_open_blockers(session: Session, site_id: int) -> list[AgentBlockerRead]:
-    blockers = session.scalars(
-        select(Blocker)
-        .join(AgentTask, AgentTask.id == Blocker.task_id, isouter=True)
-        .where(
-            Blocker.status == "open",
-            ((Blocker.task_id.is_(None)) | (AgentTask.site_id == site_id)),
-        )
-        .order_by(Blocker.created_at.desc())
-        .limit(20)
-    ).all()
-    return [_serialize_blocker(blocker) for blocker in blockers]
-
-
 def _serialize_thread(session: Session, thread: ConversationThread, profile: SiteSetupProfile) -> AgentThreadRead:
     session.refresh(thread)
     return AgentThreadRead(
@@ -311,8 +237,6 @@ def _serialize_thread(session: Session, thread: ConversationThread, profile: Sit
             _serialize_proposal(proposal, decision_request)
             for proposal, decision_request in list_pending_proposals(session, thread.id)
         ],
-        active_tasks=_serialize_active_tasks(session, thread.site_id),
-        open_blockers=_serialize_open_blockers(session, thread.site_id),
         setup_profile=_serialize_setup_profile(profile),
         latest_debug_case=_latest_debug_case(session),
         created_at=thread.created_at,
@@ -344,6 +268,36 @@ def _compact_inventory_context(inventory_summary: dict) -> dict:
     }
 
 
+def _compact_load_control_context(overview) -> dict:
+    constraints = list(overview.load_control.active_constraints or [])
+    now = utcnow()
+
+    def remaining_seconds(expires_at) -> int | None:
+        if expires_at is None:
+            return None
+        comparable_now = now
+        if getattr(expires_at, "tzinfo", None) is None and comparable_now.tzinfo is not None:
+            comparable_now = comparable_now.replace(tzinfo=None)
+        return max(0, int((expires_at - comparable_now).total_seconds()))
+
+    return {
+        "active_constraint_count": len(constraints),
+        "active_constraints": [
+            {
+                "constraint_ref": constraint.id,
+                "use_case": constraint.use_case,
+                "limit_watts": constraint.limit_watts,
+                "expires_at": constraint.expires_at.isoformat() if constraint.expires_at else None,
+                "remaining_seconds": remaining_seconds(constraint.expires_at),
+                "receiver_count": len(constraint.receiver_device_ids),
+                "participant_count": len(constraint.participants),
+            }
+            for constraint in constraints[:4]
+        ],
+        "details_available_via": "load_control.inspect_status",
+    }
+
+
 def _context_snapshot(
     session: Session,
     thread: ConversationThread,
@@ -364,21 +318,6 @@ def _context_snapshot(
     inventory_summary = canonical_inventory_summary(session, site.id)
     compact_inventory = _compact_inventory_context(inventory_summary)
     role_candidates = accepted_role_candidates(session, site_id=site.id)
-    active_tasks = session.scalars(
-        select(AgentTask)
-        .where(
-            AgentTask.site_id == site.id,
-            AgentTask.status.in_(["open", "running", "blocked"]),
-        )
-        .order_by(AgentTask.updated_at.desc())
-        .limit(10)
-    ).all()
-    open_blockers = session.scalars(
-        select(Blocker)
-        .where(Blocker.status == "open")
-        .order_by(Blocker.created_at.desc())
-        .limit(10)
-    ).all()
     recent_candidate_sets = _recent_candidate_sets(session, thread.id)
     return {
         "site_id": site.id,
@@ -404,6 +343,7 @@ def _context_snapshot(
             }
             for device in overview.devices
         ],
+        "load_control": _compact_load_control_context(overview),
         "setup_profile": _serialize_setup_profile(profile).model_dump(),
         "hems_bindings": [
             {
@@ -439,31 +379,6 @@ def _context_snapshot(
         },
         "recent_candidate_sets": recent_candidate_sets,
         "accepted_role_candidates": role_candidates,
-        "active_tasks": [
-            {
-                "task_ref": task.id,
-                "task_type": task.task_type,
-                "title": task.title,
-                "goal": task.goal,
-                "status": task.status,
-                "target_refs": task.target_refs or [],
-                "context": task.context or {},
-                "updated_at": task.updated_at,
-            }
-            for task in active_tasks
-        ],
-        "open_blockers": [
-            {
-                "blocker_ref": blocker.id,
-                "task_ref": blocker.task_id,
-                "subject_ref": blocker.subject_ref,
-                "blocker_type": blocker.blocker_type,
-                "summary": blocker.summary,
-                "details": blocker.details or {},
-                "created_at": blocker.created_at,
-            }
-            for blocker in open_blockers
-        ],
         "pending_proposals": [
             _serialize_proposal(proposal, decision_request).model_dump(mode="json")
             for proposal, decision_request in list_pending_proposals(session, thread.id)

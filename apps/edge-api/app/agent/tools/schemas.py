@@ -20,7 +20,6 @@ UiEventType = Literal[
     "device.details.open",
     "connection.overlay.open",
     "entity.relationship.show",
-    "task.show",
     "proposal.present",
     "evidence.recorded",
     "assessment.show",
@@ -149,7 +148,7 @@ class EebusIdentityGetOrCreateInput(BaseModel):
 class ConnectionEstablishInput(BaseModel):
     entity_ref: str
     endpoint_ref: str = ""
-    integration_path: Literal["eebus_spine", "http_local"]
+    integration_path: Literal["eebus_spine", "http_local", "modbus_tcp", "sunspec_modbus"]
     role: HemsRole | None = None
     reason: str = ""
 
@@ -157,7 +156,7 @@ class ConnectionEstablishInput(BaseModel):
 class ConnectionDisconnectInput(BaseModel):
     entity_ref: str
     endpoint_ref: str = ""
-    integration_path: Literal["eebus_spine", "http_local"]
+    integration_path: Literal["eebus_spine", "http_local", "modbus_tcp", "sunspec_modbus"]
     reason: str = ""
 
 
@@ -175,6 +174,11 @@ class LoadControlConfigureDeviceInput(BaseModel):
     lpc_share_pct: float | None = Field(default=None, ge=0, le=100)
     lpp_share_pct: float | None = Field(default=None, ge=0, le=100)
     reason: str = ""
+
+
+class LoadControlInspectStatusInput(BaseModel):
+    device_id: str = ""
+    include_deliveries: bool = True
 
 
 class CommissioningGetLogInput(BaseModel):
@@ -234,27 +238,6 @@ def show_relationship_event(from_ref: str, to_ref: str, relationship: str) -> Ag
         event_type="entity.relationship.show",
         payload={"from_ref": from_ref, "to_ref": to_ref, "relationship": relationship},
     )
-
-
-def show_task_event(
-    task_ref: str,
-    mode: Literal["progress", "blockers", "summary"] = "summary",
-    *,
-    title: str = "",
-    status: str = "",
-    summary: str = "",
-    blockers: list[dict[str, Any]] | None = None,
-) -> AgentUiEvent:
-    payload: dict[str, Any] = {"task_ref": task_ref, "mode": mode}
-    if title:
-        payload["title"] = title
-    if status:
-        payload["status"] = status
-    if summary:
-        payload["summary"] = summary
-    if blockers:
-        payload["blockers"] = blockers
-    return AgentUiEvent(event_type="task.show", payload=payload)
 
 
 def present_proposal_event(proposal_ref: str, decision_request_ref: str) -> AgentUiEvent:

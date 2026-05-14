@@ -18,11 +18,9 @@ import { StatusBadge } from "./components/StatusBadge";
 import { api } from "./lib/api";
 import type {
   ActionProposalRead,
-  AgentBlockerRead,
   AgentMessageRead,
   AgentProviderConfigRead,
   AgentProviderOptionRead,
-  AgentTaskRead,
   AgentThreadRead,
   AgentUiEvent,
   ConnectionActionRef,
@@ -69,14 +67,6 @@ type CanvasConnectionLine = {
   label: string;
   labelAt: CanvasPoint;
   activeLoadControl: boolean;
-};
-
-type ChatTaskView = {
-  id: string;
-  title: string;
-  status: string;
-  summary: string;
-  blockers: Array<Pick<AgentBlockerRead, "id" | "summary" | "blocker_type">>;
 };
 
 type ConnectionOverlayTarget = {
@@ -289,6 +279,32 @@ function deviceProtocolListLabel(protocols: string[]): string {
   return visible.map(protocolDisplayLabel).join(", ");
 }
 
+function primaryConnectionProtocol(device: DeviceRead): string | null {
+  const visible = visibleConnectionProtocols(device.protocols);
+  if (visible.length === 0) {
+    return null;
+  }
+  const statusTags = new Set(device.status_tags ?? []);
+  const connectedPriority = [
+    ["eebus_ship_ready", "eebus_ship"],
+    ["modbus_ready", "modbus_tcp"],
+    ["http_ready", "http_local"],
+  ] as const;
+  for (const [tag, protocol] of connectedPriority) {
+    if (statusTags.has(tag) && visible.includes(protocol)) {
+      return protocol;
+    }
+  }
+  if (statusTags.has("connected") || device.primary_status === "connected") {
+    const protocolPriority = ["eebus_ship", "modbus_tcp", "http_local"];
+    const connectedProtocol = protocolPriority.find((protocol) => visible.includes(protocol));
+    if (connectedProtocol) {
+      return connectedProtocol;
+    }
+  }
+  return visible[0];
+}
+
 function connectionPhaseLabel(state: Pick<ConnectionStateRead, "phase" | "status"> | null | undefined): string {
   if (!state) {
     return "Not inspected";
@@ -299,9 +315,6 @@ function connectionPhaseLabel(state: Pick<ConnectionStateRead, "phase" | "status
 function connectionActionLabel(state: ConnectionStateRead | null | undefined): string {
   if (!state) {
     return "Connect";
-  }
-  if (state.phase === "ship_ready" || state.phase === "http_ready") {
-    return "Refresh";
   }
   if (state.phase === "waiting_for_user_trust" || state.phase === "ship_failed" || state.phase === "waiting_for_ship_session") {
     return "Continue";
@@ -317,7 +330,7 @@ function loadControlParticipantStatusLabel(status: string): string {
     return "control path ready";
   }
   if (status === "configured_no_control_path") {
-    return "control path not validated";
+    return "no validated control path";
   }
   if (!status) {
     return "configured";
@@ -350,6 +363,10 @@ function loadControlDeliveryStatusLabel(participant: LoadControlParticipantRead)
 
 function participantHasDeliveredLoadControl(participant: LoadControlParticipantRead): boolean {
   return ["sent", "acknowledged", "readback_confirmed"].includes(participant.delivery_status);
+}
+
+function shouldShowLoadControlDeliveryDetail(participant: LoadControlParticipantRead): boolean {
+  return Boolean(participant.delivery_detail) && ["failed", "rejected", "not_deliverable"].includes(participant.delivery_status);
 }
 
 function loadControlDraftFromDevice(device: DeviceRead): LoadControlDraft {
@@ -469,39 +486,6 @@ function proposalFacts(proposal: ActionProposalRead): Array<[string, string]> {
     facts.unshift(["Scope", proposal.payload.local_subnet]);
   }
   return facts;
-}
-
-function blockerFromRecord(entry: Record<string, unknown>, index: number): Pick<AgentBlockerRead, "id" | "summary" | "blocker_type"> {
-  const summary = typeof entry.summary === "string" ? entry.summary : "blocked";
-  return {
-    id: typeof entry.blocker_ref === "string" ? entry.blocker_ref : `blocker-${index}`,
-    summary: humanize(summary),
-    blocker_type: typeof entry.blocker_type === "string" ? entry.blocker_type : "blocker",
-  };
-}
-
-function taskFromHint(hint: NonNullable<ReturnType<typeof createInitialUIState>["activeTask"]>): ChatTaskView {
-  return {
-    id: hint.taskRef,
-    title: humanize(hint.title || "active_hems_task"),
-    status: hint.status || hint.mode,
-    summary: humanize(hint.summary || "setup_step_tracked"),
-    blockers: hint.blockers.map(blockerFromRecord),
-  };
-}
-
-function taskFromRead(task: AgentTaskRead): ChatTaskView {
-  return {
-    id: task.id,
-    title: humanize(task.title || "active_hems_task"),
-    status: task.status,
-    summary: humanize(task.goal || "setup_step_tracked"),
-    blockers: task.blockers.map((blocker) => ({
-      id: blocker.id,
-      summary: humanize(blocker.summary),
-      blocker_type: blocker.blocker_type,
-    })),
-  };
 }
 
 function rectFromCenter(point: CanvasPoint, width: number, height: number, gap = 0): CanvasRect {
@@ -789,7 +773,7 @@ function buildCanvasPoints(count: number, canvasSize: CanvasSize): CanvasPoint[]
 }
 
 function connectionProtocolLabel(device: DeviceRead): string {
-  const protocol = visibleConnectionProtocols(device.protocols)[0];
+  const protocol = primaryConnectionProtocol(device);
   return protocol ? protocolSummaryLabel(protocol) : "Local";
 }
 
@@ -818,13 +802,25 @@ function deviceLoadControlSummary(device: DeviceRead, constraints: LoadControlCo
   }
   const received = active.find((constraint) => constraint.receiver_device_ids.includes(device.id));
   if (received) {
-    return `${loadControlUseCaseLabel(received.use_case)} received ${formatWatts(received.limit_watts)}`;
+    return `${loadControlUseCaseLabel(received.use_case)} received ${formatWatts(received.limit_watts)} · ${formatRemainingTime(received.expires_at)}`;
   }
   const allocated = active
     .map((constraint) => ({ constraint, participant: deviceLoadControlParticipant(device, constraint) }))
     .find((entry) => entry.participant);
   if (allocated?.participant) {
-    return `${loadControlUseCaseLabel(allocated.constraint.use_case)} ${loadControlDeliveryStatusLabel(allocated.participant)} ${formatWatts(allocated.participant.allocated_limit_watts)}`;
+    const useCaseLabel = loadControlUseCaseLabel(allocated.constraint.use_case);
+    const allocation = formatWatts(allocated.participant.allocated_limit_watts);
+    const remaining = formatRemainingTime(allocated.constraint.expires_at);
+    if (participantHasDeliveredLoadControl(allocated.participant)) {
+      return `${useCaseLabel} delivered ${allocation} · ${remaining}`;
+    }
+    if (
+      allocated.participant.delivery_status === "not_deliverable" ||
+      allocated.participant.status === "configured_no_control_path"
+    ) {
+      return `${useCaseLabel} allocation ${allocation} · ${remaining} · no control path`;
+    }
+    return `${useCaseLabel} allocation ${allocation} · ${remaining}`;
   }
   return null;
 }
@@ -876,6 +872,7 @@ function deviceHasHemsConnection(device: DeviceRead): boolean {
   return (
     statusTags.has("connected") ||
     statusTags.has("eebus_ship_ready") ||
+    statusTags.has("modbus_ready") ||
     statusTags.has("http_ready") ||
     device.primary_status === "connected"
   );
@@ -1190,15 +1187,6 @@ export default function App() {
   const currentView: NavView = uiState.currentView === "settings" ? "settings" : "overview";
   const unresolvedItems = thread?.setup_profile.unresolved_items ?? [];
   const confirmedSystems = thread?.setup_profile.confirmed_systems ?? [];
-  const activeTaskView = useMemo<ChatTaskView | null>(() => {
-    const activeTasks = thread?.active_tasks ?? [];
-    if (uiState.activeTask) {
-      const persisted = activeTasks.find((task) => task.id === uiState.activeTask?.taskRef);
-      return persisted ? taskFromRead(persisted) : taskFromHint(uiState.activeTask);
-    }
-    return activeTasks.length > 0 ? taskFromRead(activeTasks[0]) : null;
-  }, [thread?.active_tasks, uiState.activeTask]);
-
   function syncProviderForm(config: AgentProviderConfigRead, providerId?: string) {
     const option =
       config.provider_options.find((entry) => entry.provider_id === (providerId ?? config.selected_provider)) ??
@@ -1257,7 +1245,7 @@ export default function App() {
       return;
     }
     timelineRef.current.scrollTop = timelineRef.current.scrollHeight;
-  }, [activeTaskView, thread?.pending_proposals, timelineMessages]);
+  }, [thread?.pending_proposals, timelineMessages]);
 
   useLayoutEffect(() => {
     const node = canvasRef.current;
@@ -1832,40 +1820,11 @@ export default function App() {
     }
   }
 
-  function renderActiveTaskCard(task: ChatTaskView) {
-    return (
-      <article className="rounded-[18px] border border-[#d8dfea] bg-white px-4 py-4 shadow-[0_12px_28px_rgba(15,23,42,0.05)]">
-        <div className="flex items-start justify-between gap-3">
-          <div className="min-w-0">
-            <p className="section-heading">Active HEMS task</p>
-            <p className="m-0 mt-2 text-sm font-semibold text-slate-950">{task.title}</p>
-          </div>
-          <span className="shrink-0 rounded-full border border-[#d8dfea] bg-[#f8fbff] px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.08em] text-slate-600">
-            {humanize(task.status)}
-          </span>
-        </div>
-        <p className="m-0 mt-3 text-sm leading-6 text-slate-600">{task.summary}</p>
-        {task.blockers.length > 0 ? (
-          <div className="mt-3 space-y-2">
-            {task.blockers.slice(0, 2).map((blocker) => (
-              <div key={blocker.id} className="rounded-[14px] border border-[#f1d7a2] bg-[#fffaf0] px-3 py-3">
-                <p className="m-0 text-[11px] font-semibold uppercase tracking-[0.08em] text-[#9c6410]">
-                  {humanize(blocker.blocker_type)}
-                </p>
-                <p className="m-0 mt-1 text-sm leading-6 text-slate-700">{blocker.summary}</p>
-              </div>
-            ))}
-          </div>
-        ) : null}
-      </article>
-    );
-  }
-
   function renderDeviceOverlay(device: DeviceRead) {
     const deviceConnectionOptions = connectionOptions?.device_id === device.id ? connectionOptions : null;
     const endpoints = deviceConnectionOptions?.endpoints ?? [];
     const selectedEndpoint = endpoints.find((endpoint) => endpoint.endpoint_ref === selectedEndpointRefs[device.id]) ?? endpoints[0] ?? null;
-    const selectedPath = selectedEndpoint?.allowed_integration_paths[0] ?? selectedEndpoint?.state.integration_path ?? "";
+    const selectedPath = selectedEndpoint?.state.integration_path ?? selectedEndpoint?.allowed_integration_paths[0] ?? "";
     const selectedTarget: ConnectionOverlayTarget | null = selectedEndpoint
       ? {
           entityRef: selectedEndpoint.owner_ref,
@@ -1986,14 +1945,15 @@ export default function App() {
                             <p className="m-0 mt-2 text-lg font-semibold text-slate-950">
                               {formatWatts(participant.allocated_limit_watts)}
                             </p>
-	                            <p className="m-0 mt-1 text-xs text-slate-600">
-	                              {formatNumber(participant.share_pct)}% share · {loadControlDeliveryStatusLabel(participant)}
-	                            </p>
-	                            {participant.delivery_detail ? (
-	                              <p className="m-0 mt-1 text-xs text-slate-500">{participant.delivery_detail}</p>
-	                            ) : null}
-	                          </div>
-	                        ))}
+                            <p className="m-0 mt-1 text-xs text-slate-600">
+                              {formatRemainingTime(constraint.expires_at)} · {formatNumber(participant.share_pct)}% share ·{" "}
+                              {loadControlDeliveryStatusLabel(participant)}
+                            </p>
+                            {shouldShowLoadControlDeliveryDetail(participant) ? (
+                              <p className="m-0 mt-1 text-xs text-slate-500">{participant.delivery_detail}</p>
+                            ) : null}
+                          </div>
+                        ))}
                       </div>
                     </div>
                   ) : null}
@@ -2318,6 +2278,17 @@ export default function App() {
             >
               Close
             </button>
+            {state ? (
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => void refreshConnectionOverlayState(connectionOverlayTarget).then(() => refreshAll())}
+                disabled={connectionOverlayBusy || busyAction === "connection-action"}
+              >
+                <AppIcon name="refresh" className="mr-2 h-4 w-4" />
+                Refresh
+              </button>
+            ) : null}
             {state?.connect_action ? (
               <button
                 type="button"
@@ -2754,8 +2725,6 @@ export default function App() {
               </article>
             ))
           )}
-
-          {activeTaskView ? renderActiveTaskCard(activeTaskView) : null}
 
           {thread?.pending_proposals.length ? (
             <div className="space-y-3">

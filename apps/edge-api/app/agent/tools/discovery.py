@@ -5,7 +5,6 @@ from app.agent.tools.schemas import (
     DiscoveryInspectHomeNetworkInput,
     ToolExecutionResult,
     focus_entities_event,
-    show_task_event,
     view_open_event,
 )
 from app.home_graph.service import canonical_inventory_summary
@@ -32,7 +31,7 @@ class DiscoveryInspectHomeNetworkTool:
     reads = ["site", "network", "discovery_adapters"]
     writes = ["discovery_run", "device_candidate", "device", "home_graph", "work_store"]
     side_effects = ["runs standard HEMS discovery policy for the configured home network"]
-    emitted_ui_events = ["view.open", "task.show", "entity.focus"]
+    emitted_ui_events = ["view.open", "entity.focus"]
 
     def execute(self, context: AgentToolContext, payload: DiscoveryInspectHomeNetworkInput) -> ToolExecutionResult:
         task = create_task(
@@ -140,7 +139,6 @@ class DiscoveryInspectHomeNetworkTool:
             },
             ui_events=[
                 view_open_event("overview", "focus"),
-                show_task_event(task.id, "summary"),
                 focus_entities_event(entity_refs, mode="highlight"),
             ],
         )

@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     eebus_ship_port_range: str = "4712-4722"
     eebus_ship_path: str = "/ship/"
     eebus_ship_device_id: str = "HELIOS-HOME-HEMS"
-    native_writes_enabled: bool = False
+    native_writes_enabled: bool = True
     write_http_timeout_seconds: float = 3.0
     http_telemetry_poll_interval_seconds: float = 2.0
     http_telemetry_timeout_seconds: float = 1.0

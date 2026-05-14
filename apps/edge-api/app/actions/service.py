@@ -23,6 +23,12 @@ from app.services.dashboard import remove_device_from_inventory
 from app.services.eebus_identity import read_eebus_local_identity
 from app.services.eebus_runtime import get_eebus_runtime_manager, runtime_snapshot_for_endpoint
 from app.services.http_telemetry import HttpTelemetryProbeResult, refresh_http_device_telemetry
+from app.services.modbus_telemetry import (
+    ModbusTelemetryProbeResult,
+    ensure_modbus_endpoint_for_device,
+    record_modbus_probe_evidence,
+    refresh_modbus_device_telemetry,
+)
 from app.workflows.eebus_connection import EebusConnectionContext, establish_eebus_connection
 from app.workflows.role_binding import allowed_integration_paths_for_protocol
 
@@ -99,7 +105,14 @@ def _execute_action(context: ActionContext, action_name: str, payload: dict[str,
                 entity_ref=str(payload.get("entity_ref") or ""),
                 endpoint_ref=str(payload.get("endpoint_ref") or ""),
             )
-        else:
+        elif integration_path in {"modbus_tcp", "sunspec_modbus"}:
+            output = _establish_modbus_connection(
+                context,
+                entity_ref=str(payload.get("entity_ref") or ""),
+                endpoint_ref=str(payload.get("endpoint_ref") or ""),
+                integration_path=integration_path,
+            )
+        elif integration_path == "eebus_spine":
             output = establish_eebus_connection(
                 EebusConnectionContext(
                     session=context.session,
@@ -112,6 +125,8 @@ def _execute_action(context: ActionContext, action_name: str, payload: dict[str,
                 integration_path=integration_path,
                 role=str(payload.get("role") or ""),
             )
+        else:
+            raise ValueError(f"Unsupported connection integration path: {integration_path}")
         ui_events = [
             {
                 "event_type": "connection.overlay.open",
@@ -279,6 +294,91 @@ def _establish_http_local_connection(context: ActionContext, *, entity_ref: str,
     }
 
 
+def _establish_modbus_connection(
+    context: ActionContext,
+    *,
+    entity_ref: str,
+    endpoint_ref: str,
+    integration_path: str,
+) -> dict[str, Any]:
+    entity = resolve_entity(context.session, entity_ref)
+    if entity is None:
+        raise ValueError(f"Unknown Home Graph entity: {entity_ref}")
+    endpoint = _select_endpoint(context.session, entity.id, endpoint_ref, integration_path)
+    if endpoint.protocol != "modbus_tcp":
+        raise ValueError("connection.establish with Modbus requires a Modbus/TCP endpoint.")
+    device = _device_for_entity_ref(context.session, entity.id)
+    now = utcnow()
+    telemetry_probe = refresh_modbus_device_telemetry(context.session, device, endpoint, now=now)
+    if device is not None and telemetry_probe.probe is not None:
+        record_modbus_probe_evidence(context.session, context.site, device, telemetry_probe.probe, now)
+    diagnostic_result = _modbus_connection_result(device, endpoint, attempt_connect=True, telemetry_probe=telemetry_probe)
+    status = str(diagnostic_result["status"])
+    phase = str(diagnostic_result["phase"])
+    if status == "connected_sunspec_ready" and device is not None:
+        tags = list(device.status_tags or [])
+        for tag in ("connected", "modbus_ready"):
+            if tag not in tags:
+                tags.append(tag)
+        device.status_tags = tags
+        if telemetry_probe.telemetry:
+            device.telemetry = telemetry_probe.telemetry
+            device.telemetry_status = "live"
+            device.telemetry_updated_at = now
+            device.last_seen_at = now
+        device.primary_status = "connected" if device.primary_status in {"", "discovered", "visible_only"} else device.primary_status
+        context.session.add(device)
+        endpoint.status = "connected"
+    else:
+        if device is not None:
+            device.status_tags = [tag for tag in (device.status_tags or []) if tag not in {"connected", "modbus_ready"}]
+            if device.primary_status == "connected":
+                device.primary_status = "visible_only"
+            context.session.add(device)
+        endpoint.status = "observed"
+    endpoint.updated_at = now
+    context.session.add(endpoint)
+    diagnostic = ProtocolDiagnosticRun(
+        id=f"protocol-diagnostic-{uuid4().hex[:12]}",
+        site_id=context.site.id,
+        thread_id=context.thread_id,
+        turn_id=context.turn_id,
+        entity_ref=entity.id,
+        endpoint_ref=endpoint.id,
+        protocol=endpoint.protocol,
+        integration_path=integration_path,
+        status=status,
+        log_entries=[
+            {
+                "level": "info" if status == "connected_sunspec_ready" else "warning",
+                "event": "modbus_connection_establish",
+                "host": endpoint.host,
+                "port": endpoint.port,
+                "status": status,
+                "phase": phase,
+                "telemetry_probe": telemetry_probe.status,
+                "sunspec_model_ids": (endpoint.properties or {}).get("sunspec_model_ids", []),
+            }
+        ],
+        result=diagnostic_result,
+        created_at=now,
+    )
+    context.session.add(diagnostic)
+    context.session.commit()
+    return {
+        "status": status,
+        "phase": phase,
+        "entity_ref": entity.id,
+        "endpoint": _endpoint_summary(endpoint),
+        "integration_path": integration_path,
+        "diagnostic_run_ref": diagnostic.id,
+        "required_user_action": diagnostic_result.get("required_user_action", {}),
+        "message": diagnostic_result.get("message", ""),
+        "telemetry_keys": sorted((telemetry_probe.telemetry or {}).keys()),
+        "sunspec_model_ids": (endpoint.properties or {}).get("sunspec_model_ids", []),
+    }
+
+
 def _disconnect_connection(context: ActionContext, *, entity_ref: str, endpoint_ref: str, integration_path: str) -> dict[str, Any]:
     entity = resolve_entity(context.session, entity_ref)
     if entity is None:
@@ -292,10 +392,16 @@ def _disconnect_connection(context: ActionContext, *, entity_ref: str, endpoint_
     context.session.add(endpoint)
     device = _device_for_entity_ref(context.session, entity.id)
     if device is not None:
-        device.status_tags = [tag for tag in (device.status_tags or []) if tag not in {"connected", "eebus_ship_ready", "http_ready"}]
+        device.status_tags = [
+            tag
+            for tag in (device.status_tags or [])
+            if tag not in {"connected", "eebus_ship_ready", "http_ready", "modbus_ready"}
+        ]
         if device.primary_status == "connected":
             device.primary_status = "visible_only"
         if endpoint.protocol == "http_local":
+            device.telemetry_status = "sampled" if device.telemetry else "unknown"
+        elif endpoint.protocol == "modbus_tcp":
             device.telemetry_status = "sampled" if device.telemetry else "unknown"
         context.session.add(device)
     diagnostic = ProtocolDiagnosticRun(
@@ -428,6 +534,122 @@ def _http_connection_steps(endpoint: ProtocolEndpoint, state: dict[str, Any], *,
     ]
 
 
+def _modbus_connection_result(
+    device: Device | None,
+    endpoint: ProtocolEndpoint,
+    *,
+    attempt_connect: bool = False,
+    telemetry_probe: ModbusTelemetryProbeResult | None = None,
+) -> dict[str, Any]:
+    properties = endpoint.properties or {}
+    model_ids = properties.get("sunspec_model_ids") if isinstance(properties.get("sunspec_model_ids"), list) else []
+    telemetry_ready = bool(model_ids) or bool((device.telemetry if device is not None else {}) or {})
+    last_probe_status = str(properties.get("last_telemetry_status") or "")
+    if endpoint.status == "disconnected":
+        return {
+            "phase": "disconnected",
+            "status": "disconnected",
+            "message": "Modbus/TCP endpoint is disconnected from the HEMS inventory state.",
+        }
+    if attempt_connect and telemetry_probe is not None and telemetry_probe.status != "updated":
+        status = "modbus_unreachable" if telemetry_probe.status == "unreachable" else "modbus_no_live_telemetry"
+        return {
+            "phase": "modbus_probe_failed",
+            "status": status,
+            "message": telemetry_probe.message,
+            "required_user_action": {
+                "action": "check_modbus_tcp_device",
+                "reason": telemetry_probe.status,
+            },
+        }
+    if endpoint.status == "connected" and last_probe_status in {"unreachable", "empty"}:
+        return {
+            "phase": "modbus_poll_failed",
+            "status": "modbus_telemetry_stale",
+            "message": str(properties.get("last_telemetry_message") or "Modbus/TCP telemetry is stale."),
+        }
+    if telemetry_ready and (attempt_connect or endpoint.status == "connected"):
+        return {
+            "phase": "sunspec_ready",
+            "status": "connected_sunspec_ready",
+            "message": "SunSpec Modbus telemetry path is live.",
+        }
+    if telemetry_ready:
+        return {
+            "phase": "sunspec_ready_to_connect",
+            "status": "ready_sunspec_adapter",
+            "message": "SunSpec Modbus endpoint is available and can be connected to the HEMS.",
+        }
+    if endpoint.host:
+        return {
+            "phase": "modbus_visible",
+            "status": "visible_modbus_endpoint",
+            "message": "Modbus/TCP endpoint is visible, but SunSpec telemetry has not been validated yet.",
+        }
+    return {
+        "phase": "modbus_not_materialized",
+        "status": "missing_modbus_endpoint",
+        "message": "No Modbus/TCP endpoint host is available.",
+        "required_user_action": {
+            "action": "run_discovery_or_inspect_known_endpoint",
+            "reason": "missing_modbus_endpoint_host",
+        },
+    }
+
+
+def _modbus_connection_steps(endpoint: ProtocolEndpoint, state: dict[str, Any], *, connected: bool) -> list[dict[str, Any]]:
+    properties = endpoint.properties or {}
+    model_ids = properties.get("sunspec_model_ids") if isinstance(properties.get("sunspec_model_ids"), list) else []
+    telemetry_keys = properties.get("last_telemetry_keys") if isinstance(properties.get("last_telemetry_keys"), list) else []
+    dispatch_profile = str(properties.get("dispatch_profile") or "")
+    adapter_ready = str(state.get("status") or "") in {"connected_sunspec_ready", "ready_sunspec_adapter"}
+    return [
+        {
+            "key": "endpoint_observed",
+            "label": "Endpoint observed",
+            "status": "completed" if endpoint.host else "pending",
+            "detail": f"modbus_tcp {endpoint.host}:{endpoint.port or 502}" if endpoint.host else "No Modbus/TCP host.",
+        },
+        {
+            "key": "sunspec_signature",
+            "label": "SunSpec signature",
+            "status": "completed" if model_ids else "pending",
+            "detail": f"Model ids: {', '.join(str(model_id) for model_id in model_ids[:8])}" if model_ids else "Not validated yet.",
+        },
+        {
+            "key": "telemetry_path",
+            "label": "Telemetry path",
+            "status": "completed" if adapter_ready and telemetry_keys else "pending",
+            "detail": (
+                f"Validated metrics: {', '.join(str(key) for key in telemetry_keys[:6])}"
+                if telemetry_keys
+                else "Needs a live SunSpec telemetry sample."
+            ),
+        },
+        {
+            "key": "control_profile",
+            "label": "Control profile",
+            "status": "completed" if dispatch_profile else "pending",
+            "detail": dispatch_profile or "No writable control profile has been validated.",
+        },
+    ]
+
+
+def _connection_endpoint_sort_key(endpoint: ProtocolEndpoint) -> tuple[int, int, int, str, str]:
+    properties = endpoint.properties if isinstance(endpoint.properties, dict) else {}
+    has_control_profile = bool(str(properties.get("dispatch_profile") or "").strip())
+    connection_priority = 0 if endpoint.protocol == "eebus_ship" else 1 if has_control_profile else 2
+    status_priority = {"connected": 0, "observed": 1, "disconnected": 2}.get(endpoint.status, 3)
+    protocol_priority = {"eebus_ship": 0, "modbus_tcp": 1, "http_local": 2}.get(endpoint.protocol, 9)
+    return (
+        connection_priority,
+        status_priority,
+        protocol_priority,
+        endpoint.service_name or "",
+        endpoint.host or "",
+    )
+
+
 def get_connection_options(session: Session, site: Site, device_id: str) -> ConnectionOptionsRead:
     if not device_id:
         raise ValueError("device_id is required.")
@@ -435,6 +657,8 @@ def get_connection_options(session: Session, site: Site, device_id: str) -> Conn
     device = session.get(Device, device_id)
     if device is None:
         raise ValueError(f"Unknown device: {device_id}")
+    ensure_modbus_endpoint_for_device(session, site, device)
+    sync_inventory_to_home_graph(session, site.id)
     entity_ref = f"device:{device.id}"
     endpoints = session.scalars(
         select(ProtocolEndpoint)
@@ -446,6 +670,7 @@ def get_connection_options(session: Session, site: Site, device_id: str) -> Conn
         for endpoint in endpoints
         if endpoint.protocol not in {"mdns", "ssdp"} and allowed_integration_paths_for_protocol(endpoint.protocol)
     ]
+    endpoints = sorted(endpoints, key=_connection_endpoint_sort_key)
     return ConnectionOptionsRead(
         entity_ref=entity_ref,
         device_id=device.id,
@@ -512,6 +737,43 @@ def get_connection_state(
             connect_action=ConnectionActionRef(name="connection.establish", input=action_input) if can_connect else None,
             disconnect_action=ConnectionActionRef(name="connection.disconnect", input=action_input) if connected else None,
         )
+    if endpoint.protocol == "modbus_tcp":
+        device = _device_for_entity_ref(session, entity.id)
+        diagnostic_result = diagnostic.result if diagnostic is not None and isinstance(diagnostic.result, dict) else {}
+        state_payload = _modbus_connection_result(device, endpoint)
+        if endpoint.status == "disconnected":
+            phase = "disconnected"
+            status = "disconnected"
+        elif endpoint.status == "connected":
+            phase = str(diagnostic_result.get("phase") or state_payload["phase"])
+            status = str(diagnostic_result.get("status") or state_payload["status"])
+        else:
+            phase = str(state_payload["phase"])
+            status = str(state_payload["status"])
+        connected = endpoint.status == "connected" and status == "connected_sunspec_ready"
+        can_connect = not connected
+        action_input = {"entity_ref": entity.id, "endpoint_ref": endpoint.id, "integration_path": resolved_path or "sunspec_modbus"}
+        return ConnectionStateRead(
+            entity_ref=entity.id,
+            endpoint_ref=endpoint.id,
+            protocol=endpoint.protocol,
+            host=endpoint.host,
+            port=endpoint.port,
+            service_name=endpoint.service_name,
+            integration_path=resolved_path or "sunspec_modbus",
+            phase=phase,
+            status=status,
+            can_connect=can_connect,
+            steps=_modbus_connection_steps(endpoint, state_payload, connected=connected),
+            required_user_action=state_payload.get("required_user_action", {}),
+            connection_facets=facets,
+            diagnostic_run_ref=diagnostic.id if diagnostic is not None and endpoint.status == "connected" else "",
+            task_ref="",
+            last_error=str(state_payload.get("last_error") or ""),
+            updated_at=diagnostic.created_at if diagnostic is not None and endpoint.status == "connected" else endpoint.updated_at,
+            connect_action=ConnectionActionRef(name="connection.establish", input=action_input) if can_connect else None,
+            disconnect_action=ConnectionActionRef(name="connection.disconnect", input=action_input) if connected else None,
+        )
     diagnostic_result = diagnostic.result if diagnostic is not None and isinstance(diagnostic.result, dict) else {}
     diagnostic_runtime = diagnostic_result.get("runtime") if isinstance(diagnostic_result.get("runtime"), dict) else {}
     runtime = _runtime_for_display(endpoint.id, runtime, diagnostic_runtime)
@@ -543,8 +805,8 @@ def get_connection_state(
     if not required_user_action:
         required_user_action = _required_user_action_for_state(endpoint, local_identity, runtime, last_error)
     expected_trust_wait = _is_expected_trust_wait(phase, required_user_action, last_error)
-    display_last_error = "" if expected_trust_wait else last_error
-    can_connect = resolved_path == "eebus_spine" and endpoint.protocol == "eebus_ship"
+    display_last_error = "" if ready or expected_trust_wait else last_error
+    can_connect = resolved_path == "eebus_spine" and endpoint.protocol == "eebus_ship" and not ready
     action_input = {"entity_ref": entity.id, "endpoint_ref": endpoint.id, "integration_path": resolved_path}
     return ConnectionStateRead(
         entity_ref=entity.id,
@@ -622,6 +884,10 @@ def _select_endpoint(session: Session, entity_ref: str, endpoint_ref: str, integ
 
 
 def _default_integration_path(endpoint: ProtocolEndpoint) -> str:
+    if endpoint.protocol == "modbus_tcp":
+        properties = endpoint.properties or {}
+        model_ids = properties.get("sunspec_model_ids") if isinstance(properties.get("sunspec_model_ids"), list) else []
+        return "sunspec_modbus" if model_ids else "modbus_tcp"
     allowed_paths = allowed_integration_paths_for_protocol(endpoint.protocol)
     return allowed_paths[0] if len(allowed_paths) == 1 else ""
 

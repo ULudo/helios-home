@@ -320,32 +320,6 @@ export interface ActionProposalRead {
   resolved_at: string | null;
 }
 
-export interface AgentBlockerRead {
-  id: string;
-  task_id: string | null;
-  subject_ref: string;
-  blocker_type: string;
-  summary: string;
-  status: string;
-  details: Record<string, unknown>;
-  created_at: string;
-  resolved_at: string | null;
-}
-
-export interface AgentTaskRead {
-  id: string;
-  task_type: string;
-  title: string;
-  goal: string;
-  status: string;
-  target_refs: string[];
-  context: Record<string, unknown>;
-  blockers: AgentBlockerRead[];
-  created_at: string;
-  updated_at: string;
-  completed_at: string | null;
-}
-
 export interface DebugEvidenceRead {
   kind: string;
   label: string;
@@ -396,8 +370,6 @@ export interface AgentThreadRead {
   status: string;
   messages: AgentMessageRead[];
   pending_proposals: ActionProposalRead[];
-  active_tasks: AgentTaskRead[];
-  open_blockers: AgentBlockerRead[];
   setup_profile: SiteSetupProfileRead;
   latest_debug_case: DebugCaseRead | null;
   created_at: string;
@@ -514,17 +486,6 @@ export type AgentUiEvent =
   | {
       event_type: "entity.relationship.show";
       payload: { from_ref: string; to_ref: string; relationship: string };
-    }
-  | {
-      event_type: "task.show";
-      payload: {
-        task_ref: string;
-        mode?: "progress" | "blockers" | "summary";
-        title?: string;
-        status?: string;
-        summary?: string;
-        blockers?: Array<Record<string, unknown>>;
-      };
     }
   | { event_type: "proposal.present"; payload: { proposal_ref: string; decision_request_ref: string } }
   | { event_type: "evidence.recorded"; payload: { evidence_ref: string; subject_ref: string } }

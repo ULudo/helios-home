@@ -394,3 +394,69 @@ def test_dispatch_uses_sunspec_inverter_write_adapter(tmp_path, monkeypatch):
     finally:
         session.close()
         get_settings.cache_clear()
+
+
+def test_dispatch_uses_sunspec_immediate_control_write_adapter(tmp_path, monkeypatch):
+    monkeypatch.setenv("HELIOS_NATIVE_WRITES_ENABLED", "true")
+    get_settings.cache_clear()
+    session = _build_session(tmp_path, monkeypatch, name="immediate-control.db")
+    try:
+        asset = _create_dispatchable_target(
+            session,
+            device_id="dev-fronius-immediate",
+            asset_id="asset-fronius-immediate",
+            evidence={
+                "modbus_host": "198.51.100.187",
+                "modbus_unit_id": 1,
+                "dispatch_profile": "sunspec_immediate_wmax_pct",
+                "dispatch_model_id": 123,
+                "sunspec_model_blocks": [{"model_id": 123, "length": 24, "start_register": 40227}],
+            },
+            telemetry={"power_rating_kw": 6.0, "curtailment_supported": True},
+        )
+        asset.asset_type = "pv_inverter"
+        asset.control_capability = "set_power"
+        asset.constraints = {"power_rating_kw": 6.0}
+
+        monkeypatch.setattr(
+            "app.hems.write_adapters.read_sunspec_model_values",
+            lambda host, unit_id, model_block, timeout: {"WMaxLimPct_SF": -2},
+        )
+
+        calls = {}
+
+        def fake_write(host, unit_id, model_block, current_values, point_values, timeout):
+            calls["points"] = point_values
+            calls["model_id"] = model_block.model_id
+            return True
+
+        monkeypatch.setattr("app.hems.write_adapters.write_sunspec_model_points", fake_write)
+
+        now = datetime(2026, 3, 11, 8, 0, tzinfo=timezone.utc)
+        records, violations = dispatch_current_interval(
+            session,
+            _site_model(asset),
+            [
+                PlannedInterval(
+                    asset_key=asset.asset_key,
+                    asset_type=asset.asset_type,
+                    device_id=asset.device_id,
+                    starts_at=now,
+                    ends_at=now + timedelta(minutes=15),
+                    command={"set_power_kw": 2.0},
+                    predicted_state={},
+                )
+            ],
+            execution_mode=HemsExecutionMode.GUARDED_AUTO.value,
+            now=now,
+        )
+
+        assert not violations
+        assert records[0].outcome.status == "applied"
+        assert records[0].outcome.details["adapter"] == "sunspec_immediate_wmax_pct"
+        assert calls["model_id"] == 123
+        assert calls["points"]["WMaxLim_Ena"] == 1
+        assert round(calls["points"]["WMaxLimPct"], 3) == 33.333
+    finally:
+        session.close()
+        get_settings.cache_clear()

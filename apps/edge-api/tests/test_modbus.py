@@ -1,15 +1,20 @@
 import struct
 
 from app.services.modbus import (
+    DER_NAMEPLATE_POINTS,
+    IMMEDIATE_CONTROL_POINTS,
     INVERTER_POINTS,
     METER_SCALED_POINTS,
     STORAGE_CAPACITY_POINTS,
     ModbusProbeResult,
     build_candidate_from_modbus_probe,
+    dispatch_profile_for_modbus_probe,
     discover_modbus_site,
     parse_sunspec_model_blocks,
     parse_sunspec_model_ids,
+    _extract_der_nameplate_telemetry,
     _extract_inverter_telemetry,
+    _extract_immediate_control_telemetry,
     _extract_meter_scaled_telemetry,
     _extract_storage_capacity_telemetry,
     _parse_sunspec_register_block,
@@ -214,6 +219,46 @@ def test_extract_storage_capacity_telemetry_from_sunspec_block():
     assert telemetry["state_of_health_pct"] == 97.0
 
 
+def test_extract_der_nameplate_telemetry_from_sunspec_block():
+    registers = _build_register_block(
+        DER_NAMEPLATE_POINTS,
+        {
+            "ID": 120,
+            "L": 26,
+            "DERTyp": 4,
+            "WRtg": 600,
+            "WRtg_SF": 1,
+        },
+    )
+
+    values = _parse_sunspec_register_block(registers, DER_NAMEPLATE_POINTS)
+    telemetry = _extract_der_nameplate_telemetry(values)
+
+    assert telemetry["power_rating_kw"] == 6.0
+    assert telemetry["der_type_code"] == 4
+
+
+def test_extract_immediate_control_telemetry_from_sunspec_block():
+    registers = _build_register_block(
+        IMMEDIATE_CONTROL_POINTS,
+        {
+            "ID": 123,
+            "L": 24,
+            "Conn": 1,
+            "WMaxLimPct": 10000,
+            "WMaxLim_Ena": 1,
+            "WMaxLimPct_SF": -2,
+        },
+    )
+
+    values = _parse_sunspec_register_block(registers, IMMEDIATE_CONTROL_POINTS)
+    telemetry = _extract_immediate_control_telemetry(values)
+
+    assert telemetry["curtailment_supported"] is True
+    assert telemetry["curtailment_limit_pct"] == 100.0
+    assert telemetry["curtailment_enabled"] is True
+
+
 def test_build_candidate_from_sunspec_inverter_probe_promotes_monitoring():
     candidate = build_candidate_from_modbus_probe(
         ModbusProbeResult(
@@ -241,6 +286,34 @@ def test_build_candidate_from_sunspec_inverter_probe_promotes_monitoring():
     assert candidate.telemetry["power_kw"] == 5.432
     assert candidate.evidence["dispatch_profile"] == "sunspec_der_wmax_pct"
     assert candidate.evidence["validated_metrics"] == ["energy_total_kwh", "power_kw", "power_rating_kw", "voltage_v"]
+
+
+def test_build_candidate_from_fronius_immediate_control_probe_marks_dispatch_profile():
+    probe = ModbusProbeResult(
+        host="198.51.100.187",
+        unit_id=1,
+        vendor_name="Fronius",
+        product_code="GEN24 Plus",
+        revision="1.37.0",
+        sunspec_base_register=40000,
+        sunspec_model_ids=[1, 103, 120, 121, 122, 123, 160, 124],
+        telemetry={
+            "power_kw": 0.28,
+            "energy_total_kwh": 1187.4,
+            "soc_pct": 30.4,
+            "power_rating_kw": 6.0,
+            "curtailment_supported": True,
+            "curtailment_limit_pct": 100.0,
+        },
+    )
+
+    candidate = build_candidate_from_modbus_probe(probe)
+
+    assert candidate.device_type == "pv_inverter"
+    assert candidate.capabilities_hint["controllable"] is True
+    assert dispatch_profile_for_modbus_probe(probe) == ("sunspec_immediate_wmax_pct", 123)
+    assert candidate.evidence["dispatch_profile"] == "sunspec_immediate_wmax_pct"
+    assert candidate.evidence["dispatch_model_id"] == 123
 
 
 def test_build_candidate_from_generic_der_probe_stays_unclassified_without_storage_signals():
