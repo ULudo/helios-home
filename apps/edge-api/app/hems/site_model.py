@@ -7,11 +7,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.db.models import Asset, Device, DeviceCandidate, Site
+from app.db.models import Asset, Device, DeviceCandidate, ProtocolEndpoint, Site
 from app.domain.enums import HemsAssetType, HemsControlCapability
 from app.hems.bindings import binding_lookup
 from app.hems.dispatchability import assess_dispatchability
 from app.hems.forecast import build_default_forecast
+from app.hems.materialization import materialize_configured_hems_assets
 from app.hems.load_control import effective_grid_limits
 from app.hems.models import CanonicalAsset, ForecastBundle, SiteModel
 from app.hems.policy import get_or_create_hems_policy
@@ -183,6 +184,47 @@ def _asset_constraints(asset_type: str, telemetry: dict[str, Any], policy, now: 
     return {}
 
 
+def _endpoint_device_id(endpoint: ProtocolEndpoint) -> str | None:
+    if not endpoint.owner_ref.startswith("device:"):
+        return None
+    return endpoint.owner_ref.removeprefix("device:") or None
+
+
+def _dispatch_evidence_for_endpoint(endpoint: ProtocolEndpoint) -> dict[str, Any]:
+    properties = dict(endpoint.properties or {}) if isinstance(endpoint.properties, dict) else {}
+    evidence = dict(properties)
+    if endpoint.host:
+        evidence.setdefault("host", endpoint.host)
+    if endpoint.port is not None:
+        evidence.setdefault("port", endpoint.port)
+    if endpoint.protocol == "modbus_tcp":
+        evidence.setdefault("modbus_host", properties.get("modbus_host") or endpoint.host)
+        evidence.setdefault("modbus_port", properties.get("modbus_port") or endpoint.port or 502)
+        evidence.setdefault("modbus_unit_id", properties.get("modbus_unit_id") or properties.get("unit_id") or 1)
+    elif endpoint.protocol == "http_local":
+        evidence.setdefault("http_base_url", properties.get("base_url") or (f"http://{endpoint.host}" if endpoint.host else ""))
+        evidence.setdefault("http_host", endpoint.host)
+    return evidence
+
+
+def _endpoint_evidence_by_device_id(session: Session, site_id: int) -> dict[str, dict[str, Any]]:
+    evidence_by_device_id: dict[str, dict[str, Any]] = {}
+    endpoints = session.scalars(
+        select(ProtocolEndpoint)
+        .where(
+            ProtocolEndpoint.site_id == site_id,
+            ProtocolEndpoint.status == "connected",
+        )
+        .order_by(ProtocolEndpoint.updated_at.asc())
+    ).all()
+    for endpoint in endpoints:
+        device_id = _endpoint_device_id(endpoint)
+        if not device_id:
+            continue
+        evidence_by_device_id.setdefault(device_id, {}).update(_dispatch_evidence_for_endpoint(endpoint))
+    return evidence_by_device_id
+
+
 def _canonical_asset(
     asset: Asset,
     device: Device | None,
@@ -235,6 +277,8 @@ def build_site_model(
         raise RuntimeError("Site has not been seeded.")
     policy = get_or_create_hems_policy(session)
     current_time = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    materialize_configured_hems_assets(session, site_id=site.id)
+    session.flush()
     effective_limits = effective_grid_limits(session, policy, now=current_time)
     native_writes_enabled = get_settings().native_writes_enabled
 
@@ -246,6 +290,7 @@ def build_site_model(
         for candidate in session.scalars(select(DeviceCandidate).order_by(DeviceCandidate.updated_at.desc())).all()
         if candidate.matched_device_id
     }
+    endpoint_evidence_by_device_id = _endpoint_evidence_by_device_id(session, site.id)
     bindings_by_asset_id, bindings_by_device_id = binding_lookup(session)
 
     canonical_assets: list[CanonicalAsset] = []
@@ -256,6 +301,8 @@ def build_site_model(
             if device is not None:
                 break
         evidence = dict(candidate_evidence_by_device_id.get(device.id, {}) if device is not None else {})
+        if device is not None:
+            evidence.update(endpoint_evidence_by_device_id.get(device.id, {}))
         binding = bindings_by_asset_id.get(asset.id)
         if binding is None and device is not None:
             binding = bindings_by_device_id.get(device.id)

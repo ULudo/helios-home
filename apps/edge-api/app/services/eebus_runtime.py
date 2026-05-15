@@ -10,6 +10,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy import select
@@ -957,18 +958,30 @@ class EebusRuntimeManager:
             async for event in client.session_events():
                 if event.kind == "datagram":
                     datagram_payload = _spine_datagram_as_ship_payload(event.payload)
-                    self._process_outbound_delivery_result(peer, event.payload)
-                    trace_logger._process_incoming_spine_payload(datagram_payload)
-                    await client.handle_incoming_datagram(event.payload)
-                    self._schedule_pending_load_control_retry(peer.certificate_ski)
-                    self.record_event(
-                        "outbound_datagram_handled",
-                        {
-                            "endpoint_ref": peer.endpoint_ref,
-                            "entity_ref": peer.entity_ref,
-                            "connection_direction": "outbound_to_peer",
-                        },
-                    )
+                    try:
+                        self._process_outbound_delivery_result(peer, event.payload)
+                        trace_logger._process_incoming_spine_payload(datagram_payload)
+                        await client.handle_incoming_datagram(event.payload)
+                        self._schedule_pending_load_control_retry(peer.certificate_ski)
+                        self.record_event(
+                            "outbound_datagram_handled",
+                            {
+                                "endpoint_ref": peer.endpoint_ref,
+                                "entity_ref": peer.entity_ref,
+                                "connection_direction": "outbound_to_peer",
+                            },
+                        )
+                    except Exception as exc:
+                        self.record_event(
+                            "outbound_datagram_handling_failed",
+                            {
+                                "endpoint_ref": peer.endpoint_ref,
+                                "entity_ref": peer.entity_ref,
+                                "connection_direction": "outbound_to_peer",
+                                "error": str(exc),
+                            },
+                            level="warning",
+                        )
                 elif event.kind == "end":
                     self.mark_closed("peer ended SHIP session", endpoint_ref=peer.endpoint_ref, direction="outbound_to_peer")
                     break
@@ -998,14 +1011,29 @@ class EebusRuntimeManager:
 
     async def _consume_server_events(self, server: Any) -> None:
         async for event in server.events():
-            if event.kind == "ready":
-                self.mark_ready(dict(event.payload or {}))
-            elif event.kind in {"load_power_write_sent", "load_power_write_result", "load_power_readback"}:
-                payload = dict(event.payload or {})
-                self._process_server_delivery_event(event.kind, payload)
-                self.record_event(str(event.kind), payload)
-            else:
-                self.record_event(str(event.kind), dict(event.payload or {}))
+            try:
+                if event.kind == "ready":
+                    self.mark_ready(_event_payload_as_dict(event.payload))
+                elif event.kind in {"load_power_write_sent", "load_power_write_result", "load_power_readback"}:
+                    payload = _event_payload_as_dict(event.payload)
+                    self._process_server_delivery_event(event.kind, payload)
+                    self.record_event(str(event.kind), payload)
+                elif event.kind == "datagram":
+                    self.record_event(
+                        "server_datagram_received",
+                        {"payload": _spine_datagram_as_ship_payload(event.payload)},
+                    )
+                else:
+                    self.record_event(str(event.kind), _event_payload_as_dict(event.payload))
+            except Exception as exc:
+                self.record_event(
+                    "server_event_handling_failed",
+                    {
+                        "kind": str(getattr(event, "kind", "")),
+                        "error": str(exc),
+                    },
+                    level="warning",
+                )
 
     async def _forward_load_power_limit_async(self, distribution: dict[str, Any]) -> None:
         participants = [
@@ -1494,6 +1522,66 @@ def runtime_snapshot_for_endpoint(endpoint_ref: str) -> dict[str, Any]:
     return snapshot
 
 
+def resume_connected_eebus_runtime(
+    *,
+    session_factory: sessionmaker[Session],
+    settings: Settings,
+) -> EebusRuntimeSnapshot:
+    from app.services.eebus_identity import get_or_create_eebus_local_identity
+
+    peers: list[tuple[int, str, str, EebusPeerTrustMaterial]] = []
+    identities: dict[int, Any] = {}
+    with session_factory() as session:
+        endpoints = session.scalars(
+            select(ProtocolEndpoint).where(
+                ProtocolEndpoint.protocol == "eebus_ship",
+                ProtocolEndpoint.status != "disconnected",
+            )
+        ).all()
+        for endpoint in endpoints:
+            if not endpoint.host or not endpoint.port:
+                continue
+            properties = endpoint.properties or {}
+            if not properties.get("peer_certificate_pem") or not properties.get("peer_certificate_ski"):
+                continue
+            try:
+                peers.append((endpoint.site_id, endpoint.owner_ref, endpoint.id, _peer_trust_material_from_endpoint(endpoint)))
+            except Exception:
+                continue
+        for site_id in {site_id for site_id, _, _, _ in peers}:
+            identity = get_or_create_eebus_local_identity(
+                session,
+                site_id=site_id,
+                common_name="Helios Home HEMS",
+            )
+            session.refresh(identity)
+            identities[site_id] = SimpleNamespace(
+                site_id=identity.site_id,
+                common_name=identity.common_name,
+                ski=identity.ski,
+                certificate_pem=identity.certificate_pem,
+                private_key_pem=identity.private_key_pem,
+            )
+
+    manager = get_eebus_runtime_manager()
+    snapshot = manager.snapshot()
+    for site_id, entity_ref, endpoint_ref, peer in peers:
+        identity = identities.get(site_id)
+        if identity is None:
+            continue
+        snapshot = manager.start_or_update(
+            session_factory=session_factory,
+            settings=settings,
+            local_identity=identity,
+            peer=peer,
+            entity_ref=entity_ref,
+            endpoint_ref=endpoint_ref,
+            diagnostic_run_ref="",
+            connection_direction="auto",
+        )
+    return snapshot
+
+
 def resolve_eebus_trust_blockers(session: Session, *, subject_ref: str, task_id: str | None = None) -> None:
     statement = select(Blocker).where(
         Blocker.subject_ref == subject_ref,
@@ -1679,6 +1767,42 @@ def _spine_datagram_as_ship_payload(datagram: Any) -> dict[str, Any]:
     return {}
 
 
+def _peer_trust_material_from_endpoint(endpoint: ProtocolEndpoint) -> EebusPeerTrustMaterial:
+    properties = endpoint.properties or {}
+    certificate_pem = str(properties.get("peer_certificate_pem") or "")
+    certificate_ski = str(properties.get("peer_certificate_ski") or "")
+    advertised_ski = str(properties.get("ski") or "")
+    if certificate_pem and certificate_ski:
+        return EebusPeerTrustMaterial(
+            host=endpoint.host,
+            port=int(endpoint.port or 0),
+            server_name=str(properties.get("target") or endpoint.host),
+            advertised_ski=advertised_ski,
+            certificate_pem=certificate_pem,
+            certificate_ski=certificate_ski,
+            txt_ski_matches_certificate_ski=properties.get("txt_ski_matches_certificate_ski"),
+            client_cert_requested=bool((properties.get("tls_probe") or {}).get("client_cert_requested")),
+            openssl_exit_code=int((properties.get("tls_probe") or {}).get("openssl_exit_code") or 0),
+            path=str(properties.get("path") or "/ship/"),
+        )
+    return probe_eebus_peer_certificate(
+        host=endpoint.host,
+        port=int(endpoint.port or 0),
+        server_name=str(properties.get("target") or endpoint.host),
+        advertised_ski=advertised_ski,
+        timeout_seconds=6.0,
+    )
+
+
+def _event_payload_as_dict(payload: Any) -> dict[str, Any]:
+    if isinstance(payload, dict):
+        return dict(payload)
+    ship_payload = _spine_datagram_as_ship_payload(payload)
+    if ship_payload:
+        return {"payload": ship_payload}
+    return {}
+
+
 def _looks_like_ipv4(value: str) -> bool:
     parts = value.split(".")
     if len(parts) != 4:
@@ -1720,6 +1844,8 @@ def _safe_filename(value: str) -> str:
 
 
 def _sanitize_trace_data(value: Any) -> Any:
+    if hasattr(value, "as_ship_payload"):
+        return _sanitize_trace_data(value.as_ship_payload())
     if isinstance(value, dict):
         sanitized = {}
         for key, child in value.items():

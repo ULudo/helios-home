@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.db.models import Asset, Device, DeviceCandidate
+from app.db.models import Asset, Device, DeviceCandidate, ProtocolEndpoint
 from app.domain.enums import HemsDispatchStatus
 from app.hems.adapter_registry import SIMULATION_ADAPTER_NAME
 from app.hems.models import CanonicalAsset, DispatchOutcome, PlannedInterval
@@ -26,12 +26,32 @@ class DispatchTarget:
     device: Device | None
     linked_asset: Asset | None
     candidate: DeviceCandidate | None
+    endpoint_evidence: dict[str, Any]
 
     @property
     def evidence(self) -> dict[str, Any]:
-        if self.candidate is None or not isinstance(self.candidate.evidence, dict):
-            return {}
-        return self.candidate.evidence
+        evidence: dict[str, Any] = {}
+        if self.candidate is not None and isinstance(self.candidate.evidence, dict):
+            evidence.update(self.candidate.evidence)
+        evidence.update(self.endpoint_evidence)
+        return evidence
+
+
+def _endpoint_evidence(endpoint: ProtocolEndpoint) -> dict[str, Any]:
+    properties = dict(endpoint.properties or {}) if isinstance(endpoint.properties, dict) else {}
+    evidence = dict(properties)
+    if endpoint.host:
+        evidence.setdefault("host", endpoint.host)
+    if endpoint.port is not None:
+        evidence.setdefault("port", endpoint.port)
+    if endpoint.protocol == "modbus_tcp":
+        evidence.setdefault("modbus_host", properties.get("modbus_host") or endpoint.host)
+        evidence.setdefault("modbus_port", properties.get("modbus_port") or endpoint.port or 502)
+        evidence.setdefault("modbus_unit_id", properties.get("modbus_unit_id") or properties.get("unit_id") or 1)
+    elif endpoint.protocol == "http_local":
+        evidence.setdefault("http_base_url", properties.get("base_url") or (f"http://{endpoint.host}" if endpoint.host else ""))
+        evidence.setdefault("http_host", endpoint.host)
+    return evidence
 
 
 class WriteAdapter(Protocol):
@@ -55,11 +75,24 @@ def build_dispatch_target(session: Session, asset: CanonicalAsset) -> DispatchTa
             .order_by(DeviceCandidate.updated_at.desc())
             .limit(1)
         )
+    endpoint_evidence: dict[str, Any] = {}
+    if device is not None:
+        endpoints = session.scalars(
+            select(ProtocolEndpoint)
+            .where(
+                ProtocolEndpoint.owner_ref == f"device:{device.id}",
+                ProtocolEndpoint.status == "connected",
+            )
+            .order_by(ProtocolEndpoint.updated_at.asc())
+        ).all()
+        for endpoint in endpoints:
+            endpoint_evidence.update(_endpoint_evidence(endpoint))
     return DispatchTarget(
         canonical_asset=asset,
         device=device,
         linked_asset=linked_asset,
         candidate=candidate,
+        endpoint_evidence=endpoint_evidence,
     )
 
 

@@ -19,6 +19,7 @@ from app.db.models import (
     utcnow,
 )
 from app.domain.enums import HemsDispatchStatus
+from app.hems.materialization import materialize_configured_hems_assets
 from app.domain.schemas import LoadControlConstraintRead, LoadControlParticipantRead, OverviewLoadControlRead
 from app.hems.schemas import HemsLoadControlDeviceConfigRead, HemsLoadControlDeviceConfigUpdate
 
@@ -107,6 +108,8 @@ def update_load_control_config(
         config.lpp_share_pct = 100.0
     config.updated_at = utcnow()
     session.add(config)
+    session.flush()
+    materialize_configured_hems_assets(session, site_id=site.id)
     session.add(
         AuditEvent(
             actor=actor,

@@ -20,3 +20,4 @@ node_modules/
 dist/
 build/
 coverage/
+.state-backups/

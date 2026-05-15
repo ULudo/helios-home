@@ -17,6 +17,7 @@ from app.actions.schemas import (
 )
 from app.db.models import AgentTask, AuditEvent, Device, ProtocolDiagnosticRun, ProtocolEndpoint, Site, utcnow
 from app.hems.load_control import update_load_control_config
+from app.hems.materialization import materialize_configured_hems_assets
 from app.hems.schemas import HemsLoadControlDeviceConfigUpdate
 from app.home_graph.service import connection_facets_for_entity, resolve_entity, sync_inventory_to_home_graph
 from app.services.dashboard import remove_device_from_inventory
@@ -247,6 +248,10 @@ def _establish_http_local_connection(context: ActionContext, *, entity_ref: str,
         device.primary_status = "connected" if device.primary_status in {"", "discovered", "visible_only"} else device.primary_status
         context.session.add(device)
         endpoint.status = "connected"
+        endpoint.updated_at = now
+        context.session.add(endpoint)
+        context.session.flush()
+        materialize_configured_hems_assets(context.session, site_id=context.site.id)
     else:
         if device is not None:
             device.status_tags = [tag for tag in (device.status_tags or []) if tag not in {"connected", "http_ready"}]
@@ -329,6 +334,10 @@ def _establish_modbus_connection(
         device.primary_status = "connected" if device.primary_status in {"", "discovered", "visible_only"} else device.primary_status
         context.session.add(device)
         endpoint.status = "connected"
+        endpoint.updated_at = now
+        context.session.add(endpoint)
+        context.session.flush()
+        materialize_configured_hems_assets(context.session, site_id=context.site.id)
     else:
         if device is not None:
             device.status_tags = [tag for tag in (device.status_tags or []) if tag not in {"connected", "modbus_ready"}]

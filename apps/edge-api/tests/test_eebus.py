@@ -19,7 +19,12 @@ from app.services.eebus import (
     build_load_power_limit_payload,
     discover_eebus_site,
 )
-from app.services.eebus_runtime import EebusPeerTrustMaterial, EebusRuntimeManager, _extract_load_power_limit_commands
+from app.services.eebus_runtime import (
+    EebusPeerTrustMaterial,
+    EebusRuntimeManager,
+    _extract_load_power_limit_commands,
+    resume_connected_eebus_runtime,
+)
 
 
 def _fake_ship_service(**overrides):
@@ -733,6 +738,87 @@ def test_eebus_runtime_connects_outbound_to_discovered_ship_endpoint(monkeypatch
         assert state["port"] == 23292
     finally:
         manager.stop()
+
+
+def test_eebus_runtime_server_datagram_event_is_non_fatal():
+    from eebus_sdk.spine import SpineDatagram
+
+    class FakeServer:
+        async def events(self):
+            yield SimpleNamespace(
+                kind="datagram",
+                payload=SpineDatagram(
+                    payload={
+                        "datagram": {
+                            "header": {
+                                "cmdClassifier": "notify",
+                                "addressSource": {"device": "remote"},
+                            },
+                            "payload": {"cmd": []},
+                        }
+                    }
+                ),
+            )
+
+    manager = EebusRuntimeManager()
+    asyncio.run(manager._consume_server_events(FakeServer()))
+
+    events = manager.snapshot().recent_events
+    assert events[-1]["event"] == "server_datagram_received"
+    assert events[-1]["payload"]["data"]["payload"]["datagram"]["header"]["cmdClassifier"] == "notify"
+
+
+def test_eebus_runtime_resumes_persisted_connected_endpoint(tmp_path, monkeypatch):
+    calls: list[dict] = []
+
+    class FakeManager:
+        def snapshot(self):
+            return SimpleNamespace(status="not_started")
+
+        def start_or_update(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(status="listening")
+
+    app = _bootstrap_app(tmp_path, monkeypatch, "eebus-runtime-resume.db")
+    with TestClient(app):
+        pass
+
+    session_factory = get_session_factory()
+    with session_factory() as session:
+        site = session.scalar(select(Site).limit(1))
+        assert site is not None
+        session.add(
+            ProtocolEndpoint(
+                id="endpoint-resume-eebus",
+                site_id=site.id,
+                owner_ref="device:resume-peer",
+                protocol="eebus_ship",
+                host="192.0.2.40",
+                port=23292,
+                service_name="resume-peer._ship._tcp.local",
+                status="observed",
+                properties={
+                    "ski": "f819e215a4f292d803325276767d9e27f67fe108",
+                    "peer_certificate_ski": "f819e215a4f292d803325276767d9e27f67fe108",
+                    "peer_certificate_pem": "-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n",
+                    "path": "/ship/",
+                },
+            )
+        )
+        session.commit()
+
+    fake_manager = FakeManager()
+    monkeypatch.setattr("app.services.eebus_runtime.get_eebus_runtime_manager", lambda: fake_manager)
+    resume_connected_eebus_runtime(
+        session_factory=session_factory,
+        settings=SimpleNamespace(),
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["entity_ref"] == "device:resume-peer"
+    assert calls[0]["endpoint_ref"] == "endpoint-resume-eebus"
+    assert calls[0]["peer"].certificate_ski == "f819e215a4f292d803325276767d9e27f67fe108"
+    assert calls[0]["connection_direction"] == "auto"
 
 
 def test_eebus_runtime_selects_next_available_local_ship_port(monkeypatch):

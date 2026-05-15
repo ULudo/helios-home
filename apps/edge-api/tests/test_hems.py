@@ -6,9 +6,18 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from app.core.config import get_settings
-from app.db.models import Asset, Device, DeviceCandidate, Site
+from app.db.models import Asset, Device, DeviceCandidate, HemsLoadControlDeviceConfig, ProtocolEndpoint, Site
 from app.db.seed import seed_default_site
 from app.db.session import get_engine, get_session_factory, init_database
+from app.domain.enums import HemsDispatchStatus
+from app.hems.load_control import (
+    LPP_USE_CASE,
+    build_constraint_distribution,
+    create_load_control_deliveries,
+    record_load_control_limit,
+    update_native_delivery_statuses_from_plan,
+)
+from app.hems.materialization import materialize_configured_hems_assets
 from app.hems.models import ForecastBundle
 from app.hems.bindings import upsert_system_binding
 from app.hems.service import get_hems_summary, list_hems_assets, run_hems_replan
@@ -42,6 +51,21 @@ def _deterministic_forecast() -> ForecastBundle:
         base_load_kw=[0.9] * steps,
         ambient_temperature_c=[7.0] * 24 + [9.0] * 24 + [11.0] * 24 + [8.0] * 24,
         notes={"source": "test_fixture"},
+    )
+
+
+def _production_limit_forecast() -> ForecastBundle:
+    start = datetime(2026, 3, 10, 12, 0, tzinfo=timezone.utc)
+    steps = 96
+    return ForecastBundle(
+        horizon_start=start,
+        step_minutes=15,
+        import_price_eur_per_kwh=[0.30] * steps,
+        export_price_eur_per_kwh=[0.08] * steps,
+        pv_generation_kw=[4.0] * steps,
+        base_load_kw=[0.4] * steps,
+        ambient_temperature_c=[12.0] * steps,
+        notes={"source": "test_lpp_fixture"},
     )
 
 
@@ -173,6 +197,83 @@ def _add_controllable_load(
     session.add_all([device, asset, candidate])
     session.commit()
     return device, asset, candidate
+
+
+def _add_configured_fronius_modbus_device(session) -> tuple[Device, ProtocolEndpoint, HemsLoadControlDeviceConfig]:
+    site = session.scalar(select(Site).limit(1))
+    assert site is not None
+    device = Device(
+        id="dev-fronius-test",
+        site_id=site.id,
+        name="Fronius Inverter",
+        manufacturer="Fronius",
+        model="Symo GEN24",
+        firmware="",
+        device_type="pv_inverter",
+        primary_status="optimizable",
+        status_tags=["discovered", "connected", "monitorable", "controllable", "optimizable", "modbus_ready"],
+        confidence=0.9,
+        recovery_zone="auto_apply",
+        protocols=["modbus_tcp"],
+        capabilities={
+            "visible": True,
+            "monitorable": True,
+            "controllable": True,
+            "optimizable": True,
+        },
+        telemetry={
+            "power_kw": 2.8,
+            "power_rating_kw": 6.0,
+            "curtailment_supported": True,
+            "curtailment_enabled": True,
+        },
+        telemetry_status="live",
+    )
+    evidence = {
+        "modbus_host": "192.0.2.187",
+        "modbus_port": 502,
+        "modbus_unit_id": 1,
+        "dispatch_profile": "sunspec_immediate_wmax_pct",
+        "dispatch_model_id": 123,
+        "sunspec_model_blocks": [{"model_id": 123, "length": 24, "start_register": 40227}],
+    }
+    candidate = DeviceCandidate(
+        id="cand-fronius-test",
+        site_id=site.id,
+        stable_key=device.id,
+        display_name=device.name,
+        manufacturer=device.manufacturer,
+        model=device.model,
+        firmware=device.firmware,
+        device_type=device.device_type,
+        discovery_sources=["modbus_live"],
+        protocols=["modbus_tcp"],
+        evidence=dict(evidence),
+        classification_confidence=0.9,
+        classification_reasoning="SunSpec inverter telemetry exposed a writable power limit profile.",
+        state="classified",
+        matched_device_id=device.id,
+    )
+    endpoint = ProtocolEndpoint(
+        id="endpoint-fronius-modbus-test",
+        site_id=site.id,
+        owner_ref=f"device:{device.id}",
+        protocol="modbus_tcp",
+        host="192.0.2.187",
+        port=502,
+        service_name="SunSpec Modbus",
+        status="connected",
+        properties=dict(evidence),
+    )
+    config = HemsLoadControlDeviceConfig(
+        site_id=site.id,
+        device_id=device.id,
+        participates_lpp=True,
+        lpp_share_pct=100.0,
+    )
+    session.add_all([device, candidate, endpoint, config])
+    session.commit()
+    return device, endpoint, config
 
 
 def test_site_model_maps_current_discovery_assets_into_canonical_hems_assets(tmp_path, monkeypatch):
@@ -308,6 +409,78 @@ def test_site_model_maps_controllable_smart_appliance_into_dispatchable_load(tmp
         assert controllable_load.command_contract.command_key == "start_stop"
         assert controllable_load.command_contract.value_type == "boolean"
         assert controllable_load.command_contract.validation_state == "native"
+    finally:
+        session.close()
+        get_settings.cache_clear()
+
+
+def test_configured_modbus_device_materializes_as_dispatchable_hems_asset(tmp_path, monkeypatch):
+    monkeypatch.setenv("HELIOS_NATIVE_WRITES_ENABLED", "true")
+    get_settings.cache_clear()
+    session = _build_session(tmp_path, monkeypatch, name="configured-modbus-asset.db")
+    try:
+        device, _, _ = _add_configured_fronius_modbus_device(session)
+
+        materialized = materialize_configured_hems_assets(session)
+        session.commit()
+        site_model = build_site_model(session)
+        asset = next(asset for asset in site_model.assets if asset.device_id == device.id)
+
+        assert materialized
+        assert asset.asset_type == "pv_inverter"
+        assert asset.eligibility == "dispatchable"
+        assert asset.command_contract is not None
+        assert asset.command_contract.adapter_name == "sunspec_immediate_wmax_pct"
+        assert asset.command_contract.command_key == "set_power_kw"
+    finally:
+        session.close()
+        get_settings.cache_clear()
+
+
+def test_lpp_delivery_is_acknowledged_after_materialized_native_dispatch(tmp_path, monkeypatch):
+    monkeypatch.setenv("HELIOS_NATIVE_WRITES_ENABLED", "true")
+    get_settings.cache_clear()
+    session = _build_session(tmp_path, monkeypatch, name="configured-modbus-lpp.db")
+    try:
+        device, _, _ = _add_configured_fronius_modbus_device(session)
+        monkeypatch.setattr(
+            "app.hems.write_adapters.read_sunspec_model_values",
+            lambda host, unit_id, model_block, timeout_seconds: {"WMaxLimPct_SF": -2},
+        )
+        monkeypatch.setattr(
+            "app.hems.write_adapters.write_sunspec_model_points",
+            lambda host, unit_id, model_block, current_values, point_values, timeout_seconds: True,
+        )
+
+        site = session.scalar(select(Site).limit(1))
+        assert site is not None
+        limit = record_load_control_limit(
+            session,
+            site_id=site.id,
+            use_case=LPP_USE_CASE,
+            limit_id=1,
+            direction="export",
+            source="eebus",
+            peer_ski="peer-ski",
+            limit_watts=2000,
+            duration_seconds=300,
+            is_active=True,
+            raw={},
+        )
+        distribution = build_constraint_distribution(session, site_id=site.id, use_case=LPP_USE_CASE, limit_watts=2000)
+        deliveries = create_load_control_deliveries(session, limit=limit, distribution=distribution)
+
+        plan = run_hems_replan(session, triggered_by="test_lpp", forecast_override=_production_limit_forecast())
+        update_native_delivery_statuses_from_plan(session, deliveries, plan)
+        session.commit()
+
+        delivery = deliveries[0]
+        assert delivery.target_device_id == device.id
+        assert delivery.status == "acknowledged"
+        assert any(
+            event.device_id == device.id and event.status == HemsDispatchStatus.APPLIED.value
+            for event in plan.dispatch_events
+        )
     finally:
         session.close()
         get_settings.cache_clear()
