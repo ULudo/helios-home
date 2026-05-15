@@ -1,6 +1,6 @@
 # ☀️ Helios Home
 
-**Helios Home is an agent-first, local-first Home Energy Management System for discovering, commissioning, and safely coordinating energy devices in the home.**
+**Helios Home is an agent-first Home Energy Management System for discovering, commissioning, and coordinating energy devices through guarded local workflows.**
 
 It turns heterogeneous local protocols such as HTTP, mDNS/SSDP, Modbus/SunSpec, and EEBus/SHIP into a canonical, auditable HEMS model. A conversational assistant guides setup, proposes actions, and explains the system, while deterministic backend workflows handle discovery, validation, planning, and guarded dispatch.
 
