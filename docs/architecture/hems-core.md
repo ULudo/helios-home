@@ -108,6 +108,9 @@ Current supported adapters:
 - `telemetry_simulation`
 - `shelly_http_relay`
 - `tasmota_http_power`
+- `sunspec_storage_basic_rate`
+- `sunspec_der_wmax_pct`
+- `sunspec_immediate_wmax_pct`
 
 The adapter layer is:
 

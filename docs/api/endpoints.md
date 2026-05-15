@@ -1,6 +1,8 @@
 # API Endpoints
 
-Base URL: `/api/v1`
+Base URL: `/api/v1` for API routes mounted on the FastAPI router.
+
+`GET /health` is available at the application root (no `/api/v1` prefix).
 
 The current stable frontend-facing API is centered on the Helios assistant workspace.
 
@@ -30,6 +32,51 @@ Returns the device inventory and current site scope used by the advanced runtime
 ### `GET /network/reachable-subnets`
 
 Returns the IPv4 subnets currently reachable from the local host. These values are used to populate the subnet selection in the frontend.
+
+## Device and action support
+
+### `GET /devices/{device_id}/connection-options`
+
+Returns options for connecting and managing a known device, including candidate integration endpoints.
+
+### `GET /connections/state`
+
+Returns current connection status for a specific entity endpoint combination.
+
+Query parameters:
+
+- `entity_ref` (required)
+- `endpoint_ref` (optional)
+- `integration_path` (optional)
+
+### `POST /actions/{action_name}`
+
+Executes a typed frontend/action workflow action.
+
+Request body:
+
+```json
+{
+  "input": { "device_id": "device-123" },
+  "context": {}
+}
+```
+
+Response body:
+
+```json
+{
+  "action_name": "connection.get_state",
+  "actor": "user",
+  "status": "completed",
+  "output": {},
+  "ui_events": []
+}
+```
+
+### `DELETE /devices/{device_id}`
+
+Removes a discovered device and linked discovery graph data from the local runtime.
 
 ## Site configuration
 
@@ -123,13 +170,25 @@ Streams the turn as Server-Sent Events, including:
 - proposal creation events
 - final assistant message
 
-### `POST /agent/proposals/{proposal_id}/confirm`
+### `POST /agent/decision-requests/{decision_request_id}/responses`
 
-Confirms a pending action proposal and applies the associated setup change.
+Confirms or rejects a pending action proposal and applies the associated setup change.
 
-### `POST /agent/proposals/{proposal_id}/reject`
+Request body:
 
-Rejects a pending action proposal and leaves the current setup unchanged.
+```json
+{
+  "decision": "confirm",
+  "comment": ""
+}
+```
+
+`decision` is one of `confirm` or `reject`.
+
+The response contains:
+
+- updated proposal
+- refreshed agent thread
 
 ## HEMS
 
@@ -199,7 +258,7 @@ Runs an EEBus SHIP DNS-SD discovery pass through the standard `eebus-sdk` integr
 
 ### `POST /eebus/load-power-limits/distribute`
 
-Accepts an EEBus LoadControl LPC/LPP limit, maps it into the HEMS grid policy, and replans.
+Accepts an EEBus LoadControl LPC/LPP limit (via `use_case` or `limit_id`), maps it into the HEMS grid policy, and replans.
 
 Example LPC body:
 
@@ -215,5 +274,5 @@ Example LPC body:
 
 Mapping:
 
-- `lpc` / `limitationOfPowerConsumption` / `limit_id: 0` updates `grid_import_limit_kw`
-- `lpp` / `limitationOfPowerProduction` / `limit_id: 1` updates `grid_export_limit_kw`
+- `lpc`, `consume`, `consumption`, `limitationOfPowerConsumption`, `limit_id: 0` updates `grid_import_limit_kw`
+- `lpp`, `produce`, `production`, `limitationOfPowerProduction`, `limit_id: 1` updates `grid_export_limit_kw`

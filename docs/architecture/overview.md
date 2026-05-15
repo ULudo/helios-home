@@ -96,6 +96,9 @@ Current native write support is intentionally narrow and opt-in:
 - telemetry simulation for validated test assets
 - Shelly local HTTP relay control
 - Tasmota local HTTP power control
+- SunSpec Modbus storage-rate control
+- SunSpec Modbus DER active-power limit control
+- SunSpec Modbus immediate active-power limit control
 
 EEBus LoadControl support is handled as a grid-side constraint input:
 
