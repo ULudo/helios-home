@@ -1,180 +1,93 @@
-# Helios Home
+# ☀️ Helios Home
 
-Helios Home is a local-first Home Energy Management System built around an agent-first setup experience. The current frontend milestone is focused on helping a user discover network-reachable devices, confirm what they belong to in the home, and build the setup interactively through conversation.
+**Helios Home is an agent-first, local-first Home Energy Management System for discovering, commissioning, and safely coordinating energy devices in the home.**
 
-The current public milestone is intentionally narrow:
+It turns heterogeneous local protocols such as HTTP, mDNS/SSDP, Modbus/SunSpec, and EEBus/SHIP into a canonical, auditable HEMS model. A conversational assistant guides setup, proposes actions, and explains the system, while deterministic backend workflows handle discovery, validation, planning, and guarded dispatch.
 
-- conversation-first setup workspace
-- streamed activity during discovery and setup turns
-- confirmation-gated setup actions
-- advanced drawer for device inventory and HEMS inspection
-- local-only runtime with no cloud dependency
+Helios is designed around one principle:
 
-The runtime now also contains a first HEMS core with:
+> The agent is the operator. The runtime is the safety-critical lab.
 
-- canonical asset mapping
-- guarded planning eligibility
-- day-ahead / rolling-horizon optimization
-- guarded dispatch, including generic controllable loads
-- audit persistence
+![Helios Home assistant workspace](docs/assets/helios-home-lpc.png)
 
-The stable public UI is now centered on the Helios assistant workspace.
+## Why Helios Home?
 
-## Agent model provider
+Home energy systems are becoming more complex: PV inverters, batteries, wallboxes, heat pumps, smart meters, EEBus devices, Modbus devices, vendor APIs, and local network protocols all need to work together.
 
-Helios now supports a local, provider-neutral model configuration for the assistant runtime.
+Today, much of that integration is still manual, brittle, and installer-heavy.
 
-Current built-in options:
+Helios explores a different architecture: an agent-first HEMS runtime where the assistant helps users and installers discover, understand, bind and explain devices, while deterministic backend workflows enforce safety, provenance and control boundaries.
 
-- development stub
-- OpenAI
-- Anthropic
-- OpenRouter
-- Ollama
-- custom OpenAI-compatible endpoint
-
-Provider credentials are stored only on the local machine in the agent config path and are never returned by the API after saving. The repository does not contain any provider keys or checked-in model configuration.
-
-## EEBus / SHIP support
-
-Helios discovers EEBus SHIP peers as a standard local protocol and translates EEBus LoadControl limits into HEMS planning constraints.
-
-Current EEBus scope:
-
-- `_ship._tcp.local` discovery through the bundled `eebus-sdk` integration
-- visible inventory records for discovered SHIP peers
-- LPC, `limitationOfPowerConsumption`, mapped to `grid_import_limit_kw`
-- LPP, `limitationOfPowerProduction`, mapped to `grid_export_limit_kw`
-- HEMS replanning after active LPC/LPP limits are accepted
-
-The integration uses the Python SDK from `https://github.com/ULudo/eebus-sdk`. EEBus SHIP discovery runs with normal local/live device discovery; `HELIOS_EEBUS_INTERFACE_IP` may be set only when the host has multiple interfaces and automatic interface selection is not sufficient. Trust commissioning, certificate identity management and production-grade EEBus daemon lifecycle remain explicit operational steps.
-
-## Repository layout
+## Architecture
 
 ```text
-apps/
-  edge-api/      FastAPI backend and tests
-  web-ui/        React + TypeScript frontend
-docs/
-  architecture/  Current architecture notes
-  api/           Stable API surface
-infra/
-  compose/       Docker Compose setup
-  docker/        Container images
-scripts/
-  run/test/build helpers for local development
+Local protocols
+HTTP / mDNS / SSDP / Modbus / SunSpec / EEBus
+        │
+        ▼
+Discovery evidence
+        │
+        ▼
+Candidate normalization and reconciliation
+        │
+        ▼
+Local inventory
+Device records / discovery runs / canonical assets
+        │
+        ├──► Agent workspace
+        │     Conversation / proposals / setup profile
+        │
+        └──► HEMS core
+              Canonical assets / planning / guarded dispatch / audit
 ```
 
-## Local development
+## What works today
 
-### Backend
+- Local device discovery via HTTP, mDNS/SSDP, Modbus/SunSpec and EEBus/SHIP
+- Candidate reconciliation across multiple local evidence sources
+- Persistent local inventory in SQLite
+- Conversational setup flow with streamed assistant activity
+- Confirmation-gated setup actions
+- Canonical HEMS asset model
+- Rolling-horizon optimization with CVXPY/HiGHS
+- Guarded dispatch with audit records
+- EEBus LPC/LPP limits mapped into HEMS import/export constraints
 
-Install backend dependencies once:
+## Current boundaries
+
+Helios is currently an experimental local runtime and research prototype, not a production-ready household energy controller.
+
+Not yet included:
+
+- production-grade installer workflows
+- production credential and certificate lifecycle management
+- broad production device actuation coverage
+- cloud sync or multi-user household sync
+- certified safety-critical control behavior
+
+## Quickstart
+
+### Requirements
+
+- Python 3.12+
+- Node.js / npm, or the repository-provided local tooling if available
+- Linux/macOS recommended for local network discovery
+
+### Run backend
 
 ```bash
 ./scripts/setup-backend.sh
-```
-
-```bash
-export HELIOS_MODBUS_LIVE_ENABLED=true
 ./scripts/run-backend.sh
 ```
 
-The backend listens on `http://127.0.0.1:8000`.
+Backend: [http://127.0.0.1:8000](http://127.0.0.1:8000)
 
-Local HTTP discovery, mDNS / SSDP discovery, and EEBus / SHIP discovery are part of the standard local backend discovery policy. Native Modbus probing remains opt-in with `HELIOS_MODBUS_LIVE_ENABLED=true`.
-
-### Frontend
+### Run frontend
 
 ```bash
-./scripts/run-frontend.sh
+cd apps/web-ui
+npm install
+npm run dev
 ```
 
-The frontend listens on `http://127.0.0.1:5173`.
-
-### Tests
-
-```bash
-./scripts/test-backend.sh
-./scripts/build-frontend.sh
-```
-
-## Current product scope
-
-Implemented now:
-
-- local subnet selection based on reachable host routes
-- local HTTP discovery
-- mDNS / SSDP discovery
-- native Modbus / SunSpec probing
-- EEBus / SHIP discovery, with LPC/LPP load-control distribution
-- candidate reconciliation across native live sources
-- device inventory materialization into the local SQLite store
-- agent conversation thread with streaming activity and confirmation proposals
-- setup profile persistence for confirmed systems and unresolved questions
-- advanced drawer with device inventory and HEMS runtime inspection
-- backend HEMS canonical asset model
-- backend HEMS policy, planner, dispatch and audit records
-
-Not in current public UI scope:
-
-- end-user debugging workflows
-- cloud sync
-- shared knowledge base
-- production secret management
-
-## HEMS backend
-
-The first HEMS backend milestone is now available through the API. It is intentionally backend-first and currently targets:
-
-- `PV`
-- `battery`
-- `controllable load`
-- `EV charger`
-- `heat pump`
-
-The execution model is hybrid:
-
-- planning over a configurable horizon
-- guarded dispatch of the current interval
-- fallback to plan-only behavior for assets without validated write paths
-
-Default solver stack:
-
-- `CVXPY`
-- `HiGHS`
-
-Guarded native actuation is enabled for validated local write paths. It can be disabled for diagnostics with:
-
-- `HELIOS_NATIVE_WRITES_ENABLED=false`
-
-Current write adapters:
-
-- telemetry simulation
-- Shelly local HTTP relay control
-- Tasmota local HTTP power control
-- SunSpec Modbus storage rate control
-- SunSpec Modbus DER / immediate active-power limit control
-
-Relevant endpoints:
-
-- `GET /api/v1/hems/summary`
-- `GET /api/v1/hems/assets`
-- `GET /api/v1/hems/plans/latest`
-- `PATCH /api/v1/hems/policy`
-- `POST /api/v1/hems/replan`
-
-## Public-repo hygiene
-
-This repository is prepared for local development first and public publication later:
-
-- no committed local subnet defaults
-- no committed `.env` or secret files
-- no committed local databases, logs or build artifacts
-- generated TypeScript and Python artifacts are ignored
-
-If you want a fresh local state before testing:
-
-```bash
-rm -f helios_home.db helios_home.db-shm helios_home.db-wal
-```
+Frontend: [http://127.0.0.1:5173](http://127.0.0.1:5173)
